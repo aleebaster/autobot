@@ -1,0 +1,45 @@
+{
+  "swapEnabled": true,
+  "activityRepetitions": 2,
+  "ethRange": {
+    "min": 0.00001,
+    "max": 0.00002
+  },
+  "usdcRange": {
+    "min": 500,
+    "max": 1000
+  },
+  "daiRange": {
+    "min": 0.4,
+    "max": 0.6
+  },
+  "uniRange": {
+    "min": 0.01,
+    "max": 0.05
+  },
+  "lpEnabled": true,
+  "lpRepetitions": 2,
+  "lpEthRange": {
+    "min": 0.00001,
+    "max": 0.00002
+  },
+  "shortEnabled": true,
+  "shortRepetitions": 1,
+  "shortEthRange": {
+    "min": 0.00001,
+    "max": 0.00002
+  },
+  "longEnabled": true,
+  "longRepetitions": 1,
+  "longDaiRange": {
+    "min": 0.01,
+    "max": 0.02
+  },
+  "longUniRange": {
+    "min": 0.001,
+    "max": 0.002
+  },
+  "closeEnabled": true,
+  "closeRepetitions": 1,
+  "loopHours": 22
+}
