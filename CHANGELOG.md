@@ -2,6 +2,8 @@
 
 ## 2026-06-02
 
+- Added in-memory side-specific bad-market blacklist and health scoring so reverting markets do not stop full-auto.
+- Added hard swap quote guards so zero-output quotes are skipped before approval or transaction send.
 - Fixed leveraged open target selection to use the Nemesis pool address and added LONG revert diagnostics.
 - Fixed auto-close confirmation so positions are only removed after a confirmed close receipt and chain refresh.
 - Hardened LONG/SHORT opens with strict manager, calldata, and non-zero quote validation plus RSI market debug logs.

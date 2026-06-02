@@ -560,12 +560,14 @@ async function approveToken(wallet, tokenAddress, spender, amount, provider) {
 async function performSwap(wallet, fromToken, toToken, amount, proxyUrl) {
   const provider = getProvider(SEPOLIA_RPC_URL, SEPOLIA_CHAIN_ID, proxyUrl);
   wallet = wallet.connect(provider);
+  await assertContractTarget(provider, NEMESIS_ROUTER, "swap router");
   const router   = new ethers.Contract(NEMESIS_ROUTER, ROUTER_ABI, wallet);
   const deadline  = Math.floor(Date.now() / 1000) + 60 * 20;
   const slippage  = 0.95; 
 
   const label = `${fromToken} ➪  ${toToken}`;
   addLog(`Preparing swap: ${amount} ${fromToken} ➪  ${toToken}`, "wait");
+  addLog(`[ROUTE] swap router=${NEMESIS_ROUTER}`, "info");
 
   const feeParams  = await getFeeParams(provider);
   const gasLimit   = 300000n;
@@ -574,11 +576,14 @@ async function performSwap(wallet, fromToken, toToken, amount, proxyUrl) {
     const tokenInfo  = TOKENS[toToken];
     const path       = [WETH_ADDRESS, tokenInfo.address];
     const amountInWei = ethers.parseEther(amount.toFixed(8));
+    if (amountInWei <= 0n) return addLog("[SKIP] Invalid quote", "warn");
+    addLog(`[SWAP] method=swapExactETHForTokens path=${path.join(" -> ")}`, "info");
 
-    let amountOutMin;
+    let amountOut = 0n;
+    let amountOutMin = 0n;
     try {
       const amounts  = await router.getAmountsOut(amountInWei, path);
-      const amountOut = amounts[1];
+      amountOut = BigInt(amounts[1]);
       amountOutMin   = amountOut * BigInt(Math.floor(slippage * 100)) / 100n;
       addLog(
         `Quote: ${amount} ETH ➪ ${ethers.formatUnits(amountOut, tokenInfo.decimals)} ${toToken}` +
@@ -586,9 +591,10 @@ async function performSwap(wallet, fromToken, toToken, amount, proxyUrl) {
         "info"
       );
     } catch (err) {
-      addLog(`getAmountsOut failed (${label}): ${err.message}. Using amountOutMin=0.`, "warn");
-      amountOutMin = 0n;
+      addLog(`getAmountsOut failed (${label}): ${err.message}.`, "warn");
+      return addLog("[SKIP] Invalid quote", "warn");
     }
+    if (isInvalidQuote(amountOut, amountOutMin)) return addLog("[SKIP] Invalid quote", "warn");
 
     const ethBal = await provider.getBalance(wallet.address);
     const gasCost = (feeParams.maxFeePerGas || feeParams.gasPrice) * gasLimit;
@@ -609,6 +615,8 @@ async function performSwap(wallet, fromToken, toToken, amount, proxyUrl) {
     const tokenInfo  = TOKENS[fromToken];
     const path       = [tokenInfo.address, WETH_ADDRESS];
     const amountInWei = ethers.parseUnits(amount.toFixed(8), tokenInfo.decimals);
+    if (amountInWei <= 0n) return addLog("[SKIP] Invalid quote", "warn");
+    addLog(`[SWAP] method=swapExactTokensForETH path=${path.join(" -> ")}`, "info");
 
     const tokenContract = new ethers.Contract(tokenInfo.address, ERC20_ABI, provider);
     const tokenBal = await tokenContract.balanceOf(wallet.address);
@@ -616,10 +624,11 @@ async function performSwap(wallet, fromToken, toToken, amount, proxyUrl) {
       throw new Error(`Insufficient ${fromToken}: have ${ethers.formatUnits(tokenBal, tokenInfo.decimals)}, need ${ethers.formatUnits(amountInWei, tokenInfo.decimals)}`);
     }
 
-    let amountOutMin;
+    let amountOut = 0n;
+    let amountOutMin = 0n;
     try {
       const amounts  = await router.getAmountsOut(amountInWei, path);
-      const amountOut = amounts[1];
+      amountOut = BigInt(amounts[1]);
       amountOutMin   = amountOut * BigInt(Math.floor(slippage * 100)) / 100n;
       addLog(
         `Quote: ${amount} ${fromToken} ➪ ${ethers.formatEther(amountOut)} ETH` +
@@ -627,9 +636,10 @@ async function performSwap(wallet, fromToken, toToken, amount, proxyUrl) {
         "info"
       );
     } catch (err) {
-      addLog(`getAmountsOut failed (${label}): ${err.message}. Using amountOutMin=0.`, "warn");
-      amountOutMin = 0n;
+      addLog(`getAmountsOut failed (${label}): ${err.message}.`, "warn");
+      return addLog("[SKIP] Invalid quote", "warn");
     }
+    if (isInvalidQuote(amountOut, amountOutMin)) return addLog("[SKIP] Invalid quote", "warn");
 
     await approveToken(wallet, tokenInfo.address, NEMESIS_ROUTER, amountInWei, provider);
 
@@ -702,6 +712,16 @@ function normalizeMarketConfig(market = {}) {
 
 function isValidContractTarget(target) {
   return ethers.isAddress(target) && target !== ZERO_ADDRESS;
+}
+
+async function assertContractTarget(provider, target, label) {
+  if (!isValidContractTarget(target)) throw new Error(`Invalid ${label} address: ${target}`);
+  const code = await provider.getCode(target);
+  if (!code || code === "0x") throw new Error(`Invalid ${label}: no contract code at ${target}`);
+}
+
+function isInvalidQuote(amountOut, amountOutMin) {
+  return amountOut == null || amountOutMin == null || BigInt(amountOut) <= 0n || BigInt(amountOutMin) <= 0n;
 }
 
 function getPositionMarketKey(position) {
@@ -990,6 +1010,8 @@ async function validateAndSendLeveragedTx(wallet, tx, side, provider) {
     addLog(`[${side}] simulateOnly=true, not sending.`, "success");
     return null;
   }
+  if (isOpenTx) await assertContractTarget(provider, tx.to, "leveraged open target");
+  if (isCloseTx) await assertContractTarget(provider, tx.to, "close manager");
   if (isOpenTx) assertUiPayloadMatch(tx, side);
   try {
     await provider.call({ from: wallet.address, to: tx.to, data: tx.data, value: tx.value });
@@ -1391,8 +1413,11 @@ async function discoverAvailableMarkets(provider) {
       const liquidity = await contract.getAvailableLiquidity().catch(() => 0n);
       if (BigInt(liquidity) <= 0n) throw new Error("no leverage liquidity");
       addLog(`[MARKET] ${candidate.symbol} pool=${getShortAddress(pool)} manager=${getShortAddress(manager)} liquidity=${liquidity}`, "info");
-      found.push({ ...candidate, collateralToken: collateral, marketToken, pool, managerAddress: manager, liquidity: liquidity.toString(), isActive: true });
+      const market = { ...candidate, collateralToken: collateral, marketToken, pool, managerAddress: manager, liquidity: liquidity.toString(), isActive: true, health: "WORKING" };
+      setMarketHealth(market, "WORKING");
+      found.push(market);
     } catch (error) {
+      setMarketHealth(candidate, String(error.message || "").includes("pool") ? "NO_POOL" : "REVERTING");
       addLog(`[SKIP] market ${candidate.symbol}: ${error.message}`, "warn");
     }
   }
@@ -1403,20 +1428,20 @@ async function discoverAvailableMarkets(provider) {
 }
 
 async function resolveTradingMarkets(provider) {
-  if (tradingConfig.marketMode === "single") return [normalizeMarketConfig({
+  if (tradingConfig.marketMode === "single") return sortMarketsByHealth([normalizeMarketConfig({
     symbol: "ETH/DAI",
     marketToken: tradingConfig.marketToken,
     collateralToken: tradingConfig.defaultCollateralToken,
     supportsLong: true,
     supportsShort: true,
     rsiSymbol: "ETHUSDT"
-  })];
+  })]);
   const markets = await discoverAvailableMarkets(provider);
   if (tradingConfig.marketMode === "selected") {
     const selected = new Set((tradingConfig.selectedMarkets || []).map(item => String(item).toLowerCase()));
-    return markets.filter(market => selected.has(market.symbol.toLowerCase()) || selected.has(market.marketToken.toLowerCase()) || selected.has(market.collateralToken.toLowerCase()));
+    return sortMarketsByHealth(markets.filter(market => selected.has(market.symbol.toLowerCase()) || selected.has(market.marketToken.toLowerCase()) || selected.has(market.collateralToken.toLowerCase())));
   }
-  return markets;
+  return sortMarketsByHealth(markets);
 }
 
 async function fetchRsi(symbol = "ETHUSDT") {
@@ -1441,6 +1466,59 @@ let closePending = false;
 let lastRsiTradeAt = 0;
 let lastMarketTradeAt = {};
 let dailyTradeCounter = { day: "", count: 0 };
+const BAD_MARKET_COOLDOWN_MS = 60 * 60 * 1000;
+const badMarkets = new Map();
+const marketHealth = new Map();
+
+function getMarketHealthKey(market) {
+  return String(market.symbol || `${market.marketToken || ""}:${market.collateralToken || ""}`).toUpperCase();
+}
+
+function getMarketSideKey(market, side) {
+  return `${getMarketHealthKey(market)}:${String(side).toUpperCase()}`;
+}
+
+function setMarketHealth(market, health) {
+  market.health = health;
+  marketHealth.set(getMarketHealthKey(market), health);
+}
+
+function getMarketHealth(market) {
+  return market.health || marketHealth.get(getMarketHealthKey(market)) || "WORKING";
+}
+
+function blacklistMarketSide(market, side, health = "REVERTING") {
+  const key = getMarketSideKey(market, side);
+  badMarkets.set(key, Date.now());
+  setMarketHealth(market, health);
+  addLog(`[BLACKLIST] ${market.symbol} ${side} reverting`, "warn");
+  addLog("[BLACKLIST] skipping for 60m", "warn");
+}
+
+function isMarketSideBlacklisted(market, side) {
+  const key = getMarketSideKey(market, side);
+  const timestamp = badMarkets.get(key);
+  if (!timestamp) return false;
+  if (Date.now() - timestamp >= BAD_MARKET_COOLDOWN_MS) {
+    badMarkets.delete(key);
+    return false;
+  }
+  addLog(`[BLACKLIST] ${market.symbol} ${side} skipping for 60m`, "warn");
+  return true;
+}
+
+function classifyOpenFailure(error) {
+  const message = String(error?.message || "");
+  const decoded = decodeContractError(error);
+  if (/amountOutMin is zero|quoteOut is zero|Invalid quote|Quote unavailable/i.test(message)) return "ZERO_QUOTE";
+  if (/No leveraged pool|pool not found|MAM_PoolNotFound/i.test(message) || /MAM_PoolNotFound/i.test(decoded)) return "NO_POOL";
+  return "REVERTING";
+}
+
+function sortMarketsByHealth(markets) {
+  const score = { WORKING: 0, ZERO_QUOTE: 1, REVERTING: 2, NO_POOL: 3 };
+  return [...markets].sort((a, b) => (score[getMarketHealth(a)] ?? 0) - (score[getMarketHealth(b)] ?? 0));
+}
 
 function selectAutoSide(rsiValue) {
   if (rsiValue < tradingConfig.rsiLong && tradingConfig.enableLong) return "LONG";
@@ -1574,6 +1652,7 @@ async function runAutoRsiTrading() {
         addLog(`[RSI] ${market.symbol} ${market.rsiSymbol}=${value.toFixed(2)}`, "info");
         const side = selectAutoSide(value);
         if (!side) continue;
+        if (isMarketSideBlacklisted(market, side)) continue;
         const amount = tradingConfig.tradeMode === "walletPercent" ? null : getDistributedAmount(side, markets.length);
         lastRsiTradeAt = now;
         lastMarketTradeAt[key] = now;
@@ -1585,8 +1664,10 @@ async function runAutoRsiTrading() {
             addLog(error.message, "warn");
             continue;
           }
+          const health = classifyOpenFailure(error);
           if (side === "LONG") market.supportsLong = false;
           if (side === "SHORT") market.supportsShort = false;
+          blacklistMarketSide(market, side, health);
           addLog(`[SKIP] ${side} ${market.symbol} unsupported or reverting; skipping side for this run`, "warn");
           addLog(`[RSI] open failed for ${market.symbol}: ${decodeContractError(error)}`, "error");
           continue;
