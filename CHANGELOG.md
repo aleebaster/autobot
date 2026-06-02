@@ -2,6 +2,7 @@
 
 ## 2026-06-02
 
+- Added ENTER submit and ESC cancel keybindings for config popup forms.
 - Added a dedicated `[9] Stop Auto RSI Trading` menu action with persisted stop state.
 - Added `rsiRunning` duplicate-session protection, RUNNING/STOPPED logs, and dynamic Auto RSI status text.
 - Added multi-market trading configuration for single, selected, and all-market RSI modes.

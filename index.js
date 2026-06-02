@@ -2230,6 +2230,7 @@ configForm.on("submit", () => {
   }
 
   saveConfig();
+  addLog("[CONFIG] Saved successfully.", "success");
   addLog(`Config summary: autoTrades=${dailyActivityConfig.activityRepetitions}, LONG=${tradingConfig.longTradeAmount}, SHORT=${tradingConfig.shortTradeAmount}, SWAP=${tradingConfig.swapTradeAmount}, maxOpen=${tradingConfig.maxOpenPositions}, ratio=${tradingConfig.longPercent}/${tradingConfig.shortPercent}, random=${tradingConfig.randomizeAmount} ±${tradingConfig.amountVariancePercent}%`, "info");
   updateStatus();
   configForm.hide();
@@ -2245,21 +2246,16 @@ configForm.on("submit", () => {
   }, 100);
 });
 
-configInput.key(["enter"], () => {
-  if (rangeKeys.includes(configForm.configType)) {
-    screen.focusPush(configInputMax);
-  } else {
-    configForm.submit();
-  }
-});
+function submitCurrentConfigForm() {
+  if (!configForm.visible || isSubmitting) return;
+  configForm.submit();
+}
 
-configInputMax.key(["enter"], () => configForm.submit());
-configSubmitButton.on("press", () => configForm.submit());
-configSubmitButton.on("click", () => { screen.focusPush(configSubmitButton); configForm.submit(); });
-
-configForm.key(["escape"], () => {
+function cancelCurrentConfigForm() {
+  if (!configForm.visible) return;
   configForm.hide();
   dailyActivitySubMenu.show();
+  addLog("[CONFIG] Cancelled.", "warn");
   setTimeout(() => {
     if (dailyActivitySubMenu.visible) {
       screen.focusPush(dailyActivitySubMenu);
@@ -2268,7 +2264,18 @@ configForm.key(["escape"], () => {
       safeRender();
     }
   }, 100);
-});
+}
+
+configInput.key(["enter"], submitCurrentConfigForm);
+
+configInputMax.key(["enter"], submitCurrentConfigForm);
+configForm.key(["enter"], submitCurrentConfigForm);
+configSubmitButton.on("press", submitCurrentConfigForm);
+configSubmitButton.on("click", () => { screen.focusPush(configSubmitButton); submitCurrentConfigForm(); });
+
+configForm.key(["escape"], cancelCurrentConfigForm);
+configInput.key(["escape"], cancelCurrentConfigForm);
+configInputMax.key(["escape"], cancelCurrentConfigForm);
 
 dailyActivitySubMenu.key(["escape"], () => {
   dailyActivitySubMenu.hide();
