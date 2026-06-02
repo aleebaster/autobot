@@ -3,6 +3,8 @@ import chalk from "chalk";
 import figlet from "figlet";
 import { ethers } from "ethers";
 import fs from "fs";
+import axios from "axios";
+import { execSync } from "child_process";
 import { HttpsProxyAgent } from "https-proxy-agent";
 import { SocksProxyAgent } from "socks-proxy-agent";
 
@@ -14,6 +16,12 @@ const WETH_ADDRESS    = "0x7b79995e5f793A07Bc00c21412e50Ecae098E7f9";
 const USDC_ADDRESS    = "0x10279e6333f9d0EE103F4715b8aaEA75BE61464C";
 const DAI_ADDRESS     = "0xd67215fD6c0890493F34aF3C5E4231cE98871fCb";
 const UNI_ADDRESS    = "0x7438eA86A89b7d53aF5264Fb3aBaE1172b046663";
+const EXPECTED_WALLET = "0x315E5193633A962B3F369F9C3833D973D0588cCD";
+const LEVERAGED_FACTORY = "0x3A4A7D9ED3701bB331f6E6040362614ab1D787D3";
+const LEVERAGED_ROUTER = "0x5b23F24b08fa3FAa0Fa555611ACF74c3bAb23550";
+const LEVERAGED_DAI_ADDRESS = "0x8a871311feF28B3d684Fb4F06B964603196BD4E3";
+const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
+const BPS = 10000n;
 
 const CONFIG_FILE = "config.json";
 const isDebug = false;
@@ -23,6 +31,12 @@ const TOKENS = {
   DAI:  { address: DAI_ADDRESS,  decimals: 18, symbol: "DAI"  },
   UNI: { address: UNI_ADDRESS, decimals: 18, symbol: "UNI" }
 };
+
+const MARKET_CANDIDATES = [
+  { symbol: "ETH/DAI", marketToken: WETH_ADDRESS, collateralToken: LEVERAGED_DAI_ADDRESS, supportsLong: true, supportsShort: true, rsiSymbol: "ETHUSDT" },
+  { symbol: "ETH/USDC", marketToken: WETH_ADDRESS, collateralToken: USDC_ADDRESS, supportsLong: true, supportsShort: true, rsiSymbol: "ETHUSDT" },
+  { symbol: "ETH/UNI", marketToken: WETH_ADDRESS, collateralToken: UNI_ADDRESS, supportsLong: true, supportsShort: true, rsiSymbol: "ETHUSDT" }
+];
 
 const SWAP_PAIRS = [
   { from: "ETH",  to: "USDC" },
@@ -42,8 +56,58 @@ const ROUTER_ABI = [
 const ERC20_ABI = [
   "function approve(address spender, uint256 amount) returns (bool)",
   "function allowance(address owner, address spender) view returns (uint256)",
-  "function balanceOf(address account) view returns (uint256)"
+  "function balanceOf(address account) view returns (uint256)",
+  "function decimals() view returns (uint8)",
+  "function symbol() view returns (string)"
 ];
+
+const WETH_ABI = [
+  ...ERC20_ABI,
+  "function deposit() payable",
+  "function withdraw(uint256 wad)"
+];
+
+const POSITION_ABI = [
+  "function openPosition(bool isLong,address collateralToken,uint256 collateralAmount,uint256 borrowAmount,uint256 leverageX10,uint256 amountOutMin,uint256 deadline) returns (uint256 positionId)",
+  "function closePosition(uint256 positionId,uint256 amountOutMin,uint256 deadline)",
+  "function partialClose(uint256 positionId,uint256 closeBps,uint256 amountOutMin,uint256 deadline)",
+  "function getUserPositions(address user) view returns (uint256[])",
+  "function getPosition(uint256 positionId) view returns (bool isLong,address user,address collateralToken,uint256 collateralAmount,uint256 debtAmount,uint256 currentDebt,uint256 healthFactor)",
+  "function getPositionDebt(uint256 positionId) view returns (uint256)",
+  "function PROTOCOL_FEE_BPS() view returns (uint256)",
+  "function LTV_BPS() view returns (uint256)",
+  "function getAvailableLiquidity() view returns (uint256)",
+  "error MAM_InvalidLeverage()",
+  "error MAM_InsufficientLiquidity()",
+  "error MAM_InsufficientCollateral()",
+  "error MAM_InvalidCollateralToken()",
+  "error MAM_Expired()",
+  "error MAM_ZeroAmount()",
+  "error MAM_ZeroBorrow()",
+  "error MAM_ZeroCollateral()",
+  "error MAM_ExceedsLTV()",
+  "error MAM_OracleUnavailable()",
+  "error MAM_ZeroOraclePrice()",
+  "event MAM_PositionCreated(uint256 indexed positionId,address indexed user,bool isLong,address collateralToken,uint256 collateralAmount,uint256 debtAmount)",
+  "event MAM_LoopPositionCreated(uint256 indexed positionId,address indexed user,uint256 leverageX10)",
+  "event MAM_PositionClosed(uint256 indexed positionId,uint256 collateralReturned)",
+  "event MAM_PositionPartiallyClosed(uint256 indexed positionId,uint256 debtRepaid,uint256 collateralConsumed,uint256 collateralReturned,uint256 protocolFee)"
+];
+
+const FACTORY_ABI = [
+  "function getPool(address tokenA,address tokenB) view returns (address)",
+  "function getManager(address pool) view returns (address)"
+];
+
+const POOL_ABI = [
+  "function getReserves() view returns (uint112 reserve0,uint112 reserve1)",
+  "function totalSupply() view returns (uint256)",
+  "function token0() view returns (address)",
+  "function getOraclePrice() view returns (uint256,uint256)",
+  "function swapFeeBps() view returns (uint256)"
+];
+
+const POSITION_IFACE = new ethers.Interface(POSITION_ABI);
 
 let walletInfo = {
   address:      "N/A",
@@ -73,6 +137,7 @@ let isHeaderRendered = false;
 let activeProcesses  = 0;
 
 let dailyActivityConfig = {
+  enableSwaps: true,
   activityRepetitions: 1,
   ethRange:  { min: 0.00001, max: 0.00002 },
   usdcRange: { min: 500,     max: 1000    },
@@ -81,11 +146,65 @@ let dailyActivityConfig = {
   loopHours: 24
 };
 
+let tradingConfig = {
+  enableLong: true,
+  enableShort: true,
+  enableClose: false,
+  simulateOnly: true,
+  firstTxMode: true,
+  defaultCollateralToken: "native",
+  marketToken: WETH_ADDRESS,
+  pairToken: LEVERAGED_DAI_ADDRESS,
+  tradeAmount: "0.01",
+  longTradeAmount: "0.01",
+  shortTradeAmount: "0.01",
+  swapTradeAmount: "0.01",
+  tinyTradeAmount: "0.01",
+  maxTradeAmount: "0.01",
+  leverage: 2,
+  slippageBps: 50,
+  deadlineSeconds: 1200,
+  rsiLong: 30,
+  rsiShort: 70,
+  cooldownSeconds: 300,
+  maxOpenPositions: 1,
+  longPercent: 50,
+  shortPercent: 50,
+  randomizeAmount: false,
+  amountVariancePercent: 0,
+  tradeMode: "fixed",
+  walletPercent: 5,
+  marketMode: "single",
+  selectedMarkets: [],
+  availableMarkets: [],
+  balanceDistribution: "fixed",
+  maxTradesPerPair: 1,
+  maxConcurrentTrades: 1,
+  maxExposurePerMarket: "0.01",
+  maxDailyTrades: 10,
+  maxLossPerMarket: "0",
+  cooldownPerMarket: 300,
+  blacklistMarkets: [],
+  autoClose: false,
+  closePercent: 100,
+  closeManager: "",
+  closePositionId: "",
+  fallbackAmountOutMin: "0",
+  maxArg6Delta: "10",
+  activePositions: [],
+  uiPayloadReference: null,
+  uiLongPayloadReference: null,
+  uiLongTxValueReference: null,
+  uiShortPayloadReference: null,
+  uiShortTxValueReference: null
+};
+
 function loadConfig() {
   try {
     if (fs.existsSync(CONFIG_FILE)) {
       const data = fs.readFileSync(CONFIG_FILE, "utf8");
       const cfg  = JSON.parse(data);
+      dailyActivityConfig.enableSwaps = cfg.enableSwaps !== false;
       dailyActivityConfig.activityRepetitions = Number(cfg.activityRepetitions) || 1;
       dailyActivityConfig.ethRange.min  = Number(cfg.ethRange?.min)  || 0.00001;
       dailyActivityConfig.ethRange.max  = Number(cfg.ethRange?.max)  || 0.00002;
@@ -96,6 +215,57 @@ function loadConfig() {
       dailyActivityConfig.uniRange.min = Number(cfg.uniRange?.min) || 0.01;
       dailyActivityConfig.uniRange.max = Number(cfg.uniRange?.max) || 0.05;
       dailyActivityConfig.loopHours     = Number(cfg.loopHours)      || 24;
+
+      tradingConfig.enableLong = cfg.enableLong !== false;
+      tradingConfig.enableShort = cfg.enableShort !== false;
+      tradingConfig.enableClose = cfg.enableClose === true;
+      tradingConfig.simulateOnly = cfg.simulateOnly !== false;
+      tradingConfig.firstTxMode = cfg.firstTxMode !== false;
+      tradingConfig.defaultCollateralToken = cfg.defaultCollateralToken || tradingConfig.defaultCollateralToken;
+      tradingConfig.marketToken = cfg.marketToken || cfg.pairToken || tradingConfig.marketToken;
+      tradingConfig.pairToken = cfg.pairToken || tradingConfig.pairToken;
+      tradingConfig.tradeAmount = String(cfg.tradeAmount ?? tradingConfig.tradeAmount);
+      tradingConfig.longTradeAmount = String(cfg.longTradeAmount ?? cfg.tradeAmount ?? tradingConfig.longTradeAmount);
+      tradingConfig.shortTradeAmount = String(cfg.shortTradeAmount ?? cfg.tradeAmount ?? tradingConfig.shortTradeAmount);
+      tradingConfig.swapTradeAmount = String(cfg.swapTradeAmount ?? tradingConfig.swapTradeAmount);
+      tradingConfig.tinyTradeAmount = String(cfg.tinyTradeAmount ?? tradingConfig.tinyTradeAmount);
+      tradingConfig.maxTradeAmount = String(cfg.maxTradeAmount ?? tradingConfig.maxTradeAmount);
+      tradingConfig.leverage = Number(cfg.leverage) || tradingConfig.leverage;
+      tradingConfig.slippageBps = Number(cfg.slippageBps) || tradingConfig.slippageBps;
+      tradingConfig.deadlineSeconds = Number(cfg.deadlineSeconds) || tradingConfig.deadlineSeconds;
+      tradingConfig.rsiLong = Number(cfg.rsiLong) || tradingConfig.rsiLong;
+      tradingConfig.rsiShort = Number(cfg.rsiShort) || tradingConfig.rsiShort;
+      tradingConfig.cooldownSeconds = Number(cfg.cooldownSeconds) || tradingConfig.cooldownSeconds;
+      tradingConfig.maxOpenPositions = Number(cfg.maxOpenPositions) || tradingConfig.maxOpenPositions;
+      tradingConfig.longPercent = Number(cfg.longPercent) || tradingConfig.longPercent;
+      tradingConfig.shortPercent = Number(cfg.shortPercent) || tradingConfig.shortPercent;
+      tradingConfig.randomizeAmount = cfg.randomizeAmount === true;
+      tradingConfig.amountVariancePercent = Number(cfg.amountVariancePercent) || 0;
+      tradingConfig.tradeMode = cfg.tradeMode || tradingConfig.tradeMode;
+      tradingConfig.walletPercent = Number(cfg.walletPercent) || tradingConfig.walletPercent;
+      tradingConfig.marketMode = cfg.marketMode || tradingConfig.marketMode;
+      tradingConfig.selectedMarkets = Array.isArray(cfg.selectedMarkets) ? cfg.selectedMarkets : [];
+      tradingConfig.availableMarkets = Array.isArray(cfg.availableMarkets) ? cfg.availableMarkets : [];
+      tradingConfig.balanceDistribution = cfg.balanceDistribution || tradingConfig.balanceDistribution;
+      tradingConfig.maxTradesPerPair = Number(cfg.maxTradesPerPair) || tradingConfig.maxTradesPerPair;
+      tradingConfig.maxConcurrentTrades = Number(cfg.maxConcurrentTrades) || tradingConfig.maxConcurrentTrades;
+      tradingConfig.maxExposurePerMarket = String(cfg.maxExposurePerMarket ?? tradingConfig.maxExposurePerMarket);
+      tradingConfig.maxDailyTrades = Number(cfg.maxDailyTrades) || tradingConfig.maxDailyTrades;
+      tradingConfig.maxLossPerMarket = String(cfg.maxLossPerMarket ?? tradingConfig.maxLossPerMarket);
+      tradingConfig.cooldownPerMarket = Number(cfg.cooldownPerMarket) || tradingConfig.cooldownPerMarket;
+      tradingConfig.blacklistMarkets = Array.isArray(cfg.blacklistMarkets) ? cfg.blacklistMarkets : [];
+      tradingConfig.autoClose = cfg.autoClose === true;
+      tradingConfig.closePercent = Number(cfg.closePercent) || tradingConfig.closePercent;
+      tradingConfig.closeManager = cfg.closeManager || "";
+      tradingConfig.closePositionId = cfg.closePositionId || "";
+      tradingConfig.fallbackAmountOutMin = String(cfg.fallbackAmountOutMin ?? tradingConfig.fallbackAmountOutMin);
+      tradingConfig.maxArg6Delta = String(cfg.maxArg6Delta ?? tradingConfig.maxArg6Delta);
+      tradingConfig.activePositions = Array.isArray(cfg.activePositions) ? cfg.activePositions : [];
+      tradingConfig.uiPayloadReference = Array.isArray(cfg.uiPayloadReference) ? cfg.uiPayloadReference : null;
+      tradingConfig.uiLongPayloadReference = Array.isArray(cfg.uiLongPayloadReference) ? cfg.uiLongPayloadReference : null;
+      tradingConfig.uiLongTxValueReference = cfg.uiLongTxValueReference == null ? null : String(cfg.uiLongTxValueReference);
+      tradingConfig.uiShortPayloadReference = Array.isArray(cfg.uiShortPayloadReference) ? cfg.uiShortPayloadReference : null;
+      tradingConfig.uiShortTxValueReference = cfg.uiShortTxValueReference == null ? null : String(cfg.uiShortTxValueReference);
     } else {
       addLog("No config file found, using default settings.", "info");
     }
@@ -106,7 +276,7 @@ function loadConfig() {
 
 function saveConfig() {
   try {
-    fs.writeFileSync(CONFIG_FILE, JSON.stringify(dailyActivityConfig, null, 2));
+    fs.writeFileSync(CONFIG_FILE, JSON.stringify({ ...dailyActivityConfig, ...tradingConfig }, null, 2));
     addLog("Configuration saved successfully.", "success");
   } catch (error) {
     addLog(`Failed to save config: ${error.message}`, "error");
@@ -159,9 +329,17 @@ function loadAccounts() {
     const data = fs.readFileSync("pk.txt", "utf8");
     accounts = data.split("\n").map(l => l.trim()).filter(l => l).map(privateKey => ({ privateKey }));
     if (accounts.length === 0) throw new Error("No private keys found in pk.txt");
+    const firstWallet = new ethers.Wallet(accounts[0].privateKey);
+    addLog(`Startup active wallet=${firstWallet.address}`, "info");
+    if (firstWallet.address.toLowerCase() !== EXPECTED_WALLET.toLowerCase()) {
+      throw new Error(`Active wallet mismatch. Expected ${EXPECTED_WALLET}, got ${firstWallet.address}`);
+    }
     addLog(`Loaded ${accounts.length} accounts from pk.txt`, "success");
   } catch (error) {
     addLog(`Failed to load accounts: ${error.message}`, "error");
+    if (error.message.startsWith("Active wallet mismatch")) {
+      process.exit(1);
+    }
     accounts = [];
   }
 }
@@ -326,6 +504,30 @@ function getRandomAmount(min, max) {
   return Math.min(min + idx * step, max);
 }
 
+function getTradingAmount(side) {
+  const base = Number(side === "LONG" ? tradingConfig.longTradeAmount : tradingConfig.shortTradeAmount);
+  if (!tradingConfig.randomizeAmount || !Number.isFinite(base)) return String(side === "LONG" ? tradingConfig.longTradeAmount : tradingConfig.shortTradeAmount);
+  const variance = Math.max(0, Number(tradingConfig.amountVariancePercent) || 0) / 100;
+  const min = base * (1 - variance);
+  const max = base * (1 + variance);
+  return (min + Math.random() * (max - min)).toFixed(8).replace(/0+$/, "").replace(/\.$/, "");
+}
+
+async function getWalletPercentTradeAmount(wallet, provider, collateralToken, side) {
+  if (tradingConfig.firstTxMode || tradingConfig.tradeMode !== "walletPercent") return getTradingAmount(side);
+  const percent = Math.max(0, Math.min(100, Number(tradingConfig.walletPercent) || 0));
+  const nativeCollateral = isNativeToken(collateralToken);
+  const normalizedToken = normalizeCollateralToken(collateralToken);
+  const decimals = await getCollateralDecimals(provider, normalizedToken, nativeCollateral);
+  const balance = nativeCollateral
+    ? await provider.getBalance(wallet.address)
+    : await new ethers.Contract(normalizedToken, ERC20_ABI, provider).balanceOf(wallet.address);
+  let amount = balance * BigInt(Math.floor(percent * 100)) / 10000n;
+  const maxAmount = ethers.parseUnits(String(tradingConfig.maxTradeAmount), decimals);
+  if (amount > maxAmount) amount = maxAmount;
+  return ethers.formatUnits(amount, decimals);
+}
+
 async function approveToken(wallet, tokenAddress, spender, amount, provider) {
   const contract = new ethers.Contract(tokenAddress, ERC20_ABI, wallet);
   const allowance = await contract.allowance(wallet.address, spender);
@@ -445,6 +647,726 @@ async function waitForTx(tx, timeoutMs = 120000) {
   return receipt;
 }
 
+function isNativeToken(token) {
+  return !token || token === ZERO_ADDRESS || String(token).toLowerCase() === "native" || String(token).toLowerCase() === "eth";
+}
+
+function normalizeCollateralToken(token) {
+  if (isNativeToken(token)) return WETH_ADDRESS;
+  if (!ethers.isAddress(token)) throw new Error(`Invalid collateral token: ${token}`);
+  return token;
+}
+
+function sortTokenPair(tokenA, tokenB) {
+  return [tokenA, tokenB].sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
+}
+
+function encodeLeverage(leverage) {
+  const lev = Number(leverage);
+  if (!Number.isFinite(lev) || lev <= 0) throw new Error("Invalid leverage");
+  return BigInt(Math.round(lev));
+}
+
+function applySlippage(amount, slippageBps = tradingConfig.slippageBps) {
+  const bps = BigInt(Math.max(0, Number(slippageBps) || 0));
+  if (amount <= 0n || bps >= BPS) return 0n;
+  return amount * (BPS - bps) / BPS;
+}
+
+function normalizeMarketConfig(market = {}) {
+  const collateralToken = market.collateralToken || tradingConfig.defaultCollateralToken;
+  const marketToken = market.marketToken || tradingConfig.marketToken || tradingConfig.pairToken;
+  const symbol = market.symbol || `${getShortAddress(marketToken)}/${getShortAddress(collateralToken)}`;
+  return {
+    ...market,
+    symbol,
+    marketToken,
+    collateralToken,
+    supportsLong: market.supportsLong !== false,
+    supportsShort: market.supportsShort !== false,
+    rsiSymbol: market.rsiSymbol || "ETHUSDT"
+  };
+}
+
+function getPositionMarketKey(position) {
+  return String(position.symbol || `${position.marketToken || ""}:${position.collateralToken || ""}`).toLowerCase();
+}
+
+function countOpenForMarket(market, side = null) {
+  const key = getPositionMarketKey(market);
+  return (tradingConfig.activePositions || []).filter(position => {
+    if (side && position.side !== side) return false;
+    return getPositionMarketKey(position) === key;
+  }).length;
+}
+
+function canOpenMarketSide(market, side) {
+  if (side === "LONG" && !market.supportsLong) return false;
+  if (side === "SHORT" && !market.supportsShort) return false;
+  if (countOpenForMarket(market, side) > 0) return false;
+  if (countOpenForMarket(market) >= tradingConfig.maxTradesPerPair) return false;
+  if ((tradingConfig.activePositions || []).length >= tradingConfig.maxConcurrentTrades) return false;
+  if ((tradingConfig.activePositions || []).length >= tradingConfig.maxOpenPositions) return false;
+  return true;
+}
+
+function feeAdjusted(amount, feeBps = 100n) {
+  if (amount === 0n) return 0n;
+  if (feeBps <= 0n) return amount;
+  if (feeBps >= BPS) return 0n;
+  return amount * (BPS - feeBps) / BPS;
+}
+
+function collateralAsLp({ collateralToken, collateralAmount, reserve0, reserve1, totalSupply, token0, oraclePrice0 }) {
+  const q112 = 1n << 112n;
+  if (collateralAmount === 0n || reserve0 === 0n || reserve1 === 0n || totalSupply === 0n || oraclePrice0 === 0n) return 0n;
+  const collateralValue = collateralToken.toLowerCase() === token0.toLowerCase()
+    ? collateralAmount * oraclePrice0 / q112
+    : collateralAmount;
+  const poolValue = reserve0 * oraclePrice0 / q112 + reserve1;
+  return poolValue === 0n ? 0n : collateralValue * totalSupply / poolValue;
+}
+
+function lpBorrowToExpectedOut({ lpBorrowAmount, collateralToken, reserve0, reserve1, totalSupply, token0, swapFeeBps }) {
+  if (lpBorrowAmount === 0n || reserve0 === 0n || reserve1 === 0n || totalSupply === 0n || swapFeeBps >= BPS) return 0n;
+  const collateralIsToken0 = collateralToken.toLowerCase() === token0.toLowerCase();
+  const amountIn = collateralIsToken0 ? lpBorrowAmount * reserve1 / totalSupply : lpBorrowAmount * reserve0 / totalSupply;
+  const collateralFromLp = collateralIsToken0 ? lpBorrowAmount * reserve0 / totalSupply : lpBorrowAmount * reserve1 / totalSupply;
+  const reserveIn = collateralIsToken0 ? reserve1 : reserve0;
+  const reserveOut = collateralIsToken0 ? reserve0 : reserve1;
+  if (amountIn === 0n || reserveIn <= amountIn || reserveOut <= collateralFromLp) return 0n;
+  const adjustedReserveIn = reserveIn - amountIn;
+  const adjustedReserveOut = reserveOut - collateralFromLp;
+  const amountInWithFee = amountIn * (BPS - swapFeeBps);
+  return amountInWithFee * adjustedReserveOut / (adjustedReserveIn * BPS + amountInWithFee);
+}
+
+async function getLeveragedContext(provider, collateralToken, marketTokenArg = null) {
+  const collateral = normalizeCollateralToken(collateralToken);
+  const marketToken = normalizeCollateralToken(marketTokenArg || tradingConfig.marketToken || tradingConfig.pairToken);
+  const pairToken = marketToken;
+  if (collateral.toLowerCase() === marketToken.toLowerCase()) {
+    throw new Error(`Collateral token and market token are identical: ${collateral}`);
+  }
+  const [tokenA, tokenB] = sortTokenPair(collateral, marketToken);
+  addLog(`marketToken=${marketToken}`, "info");
+  addLog(`collateralToken=${collateral}`, "info");
+  addLog(`pairToken=${pairToken}`, "info");
+  addLog(`poolKey=${tokenA}/${tokenB}`, "info");
+  const factory = new ethers.Contract(LEVERAGED_FACTORY, FACTORY_ABI, provider);
+  const pool = await factory.getPool(tokenA, tokenB);
+  if (!pool || pool === ZERO_ADDRESS) throw new Error(`No leveraged pool for ${collateral}/${pairToken}`);
+  const manager = await factory.getManager(pool);
+  if (!manager || manager === ZERO_ADDRESS) throw new Error(`No leveraged manager for pool ${pool}`);
+  return { collateral, marketToken, pairToken, pool, manager, path: [collateral, marketToken] };
+}
+
+async function getCollateralDecimals(provider, token, nativeCollateral) {
+  if (nativeCollateral) return 18;
+  const erc20 = new ethers.Contract(token, ERC20_ABI, provider);
+  return Number(await erc20.decimals());
+}
+
+async function quoteLeveragedAmountOutMin(provider, { pool, manager, collateralToken, collateralAmount, leverage, isLong, quotePath }) {
+  const encodedLev = Number(leverage);
+  const lev = isLong ? encodedLev : encodedLev / 10;
+  if (!Number.isFinite(lev) || lev <= 1) return 0n;
+  const poolContract = new ethers.Contract(pool, POOL_ABI, provider);
+  const managerContract = new ethers.Contract(manager, POSITION_ABI, provider);
+  const [reserves, totalSupply, token0, oraclePrice, swapFeeBps, availableLiquidity, ltvBps, protocolFeeBps] = await Promise.all([
+    poolContract.getReserves(),
+    poolContract.totalSupply(),
+    poolContract.token0(),
+    poolContract.getOraclePrice(),
+    poolContract.swapFeeBps(),
+    managerContract.getAvailableLiquidity(),
+    managerContract.LTV_BPS(),
+    managerContract.PROTOCOL_FEE_BPS().catch(() => 100n)
+  ]);
+  const reserve0 = BigInt(reserves[0]);
+  const reserve1 = BigInt(reserves[1]);
+  const effectiveCollateral = feeAdjusted(collateralAmount, BigInt(protocolFeeBps));
+  const collateralLp = collateralAsLp({ collateralToken, collateralAmount: effectiveCollateral, reserve0, reserve1, totalSupply, token0, oraclePrice0: BigInt(oraclePrice[0]) });
+  if (collateralLp === 0n) return 0n;
+  let lpBorrowAmount = collateralLp * BigInt(Math.floor(10000 * Math.max(0, lev - 1))) / BPS;
+  const maxByLtv = BigInt(ltvBps) >= BPS ? lpBorrowAmount : collateralLp * BigInt(ltvBps) / (BPS - BigInt(ltvBps));
+  if (lpBorrowAmount > maxByLtv) lpBorrowAmount = maxByLtv;
+  if (lpBorrowAmount > BigInt(availableLiquidity)) lpBorrowAmount = BigInt(availableLiquidity);
+  const amountOutMinRaw = lpBorrowToExpectedOut({ lpBorrowAmount, collateralToken, reserve0, reserve1, totalSupply, token0, swapFeeBps: BigInt(swapFeeBps) });
+  const amountOutMinFinal = applySlippage(amountOutMinRaw);
+  if (!isLong) {
+    addLog(`shortQuoteInput=${lpBorrowAmount}`, "info");
+    addLog(`shortQuoteOutput=${amountOutMinRaw}`, "info");
+    addLog(`quotePath=${(quotePath || []).join(" -> ")}`, "info");
+    addLog(`amountOutMinRaw=${amountOutMinRaw}`, "info");
+    addLog(`amountOutMinFinal=${amountOutMinFinal}`, "info");
+  }
+  return amountOutMinFinal;
+}
+
+async function buildLeveragedTx(provider, isLong, amount, token, leverage, deadline, market = null) {
+  const normalizedMarket = normalizeMarketConfig(market || { collateralToken: token });
+  const nativeCollateral = isNativeToken(token);
+  const context = await getLeveragedContext(provider, token, normalizedMarket.marketToken);
+  const decimals = await getCollateralDecimals(provider, context.collateral, nativeCollateral);
+  const collateralAmount = ethers.parseUnits(String(amount), decimals);
+  addLog(`rawUserAmount=${amount}`, "info");
+  addLog(`tokenDecimals=${decimals}`, "info");
+  addLog(`scaledCollateralAmount=${collateralAmount}`, "info");
+  const encodedLeverage = encodeLeverage(leverage);
+  const amountOutMin = await quoteLeveragedAmountOutMin(provider, {
+    pool: context.pool,
+    manager: context.manager,
+    collateralToken: context.collateral,
+    collateralAmount,
+    leverage,
+    isLong,
+    quotePath: context.path
+  }).catch(error => {
+    addLog(`Leveraged quote failed: ${error.message}. Using fallback amountOutMin=${tradingConfig.fallbackAmountOutMin}`, "warn");
+    return BigInt(tradingConfig.fallbackAmountOutMin || "0");
+  });
+  const data = POSITION_IFACE.encodeFunctionData("openPosition", [isLong, context.collateral, collateralAmount, 0n, encodedLeverage, amountOutMin, BigInt(deadline)]);
+  return { to: context.manager, data, value: 0n, nativeCollateral, collateralToken: context.collateral, marketToken: context.marketToken, symbol: normalizedMarket.symbol, collateralAmount, leverage: encodedLeverage, amountOutMin };
+}
+
+function buildLongTx(amount, token = tradingConfig.defaultCollateralToken, leverage = tradingConfig.leverage, deadline = Math.floor(Date.now() / 1000) + tradingConfig.deadlineSeconds, providerArg, market = null) {
+  return buildLeveragedTx(providerArg, true, amount, token, leverage, deadline, market);
+}
+
+function buildShortTx(amount, token = tradingConfig.defaultCollateralToken, leverage = tradingConfig.leverage, deadline = Math.floor(Date.now() / 1000) + tradingConfig.deadlineSeconds, providerArg, market = null) {
+  return buildLeveragedTx(providerArg, false, amount, token, leverage, deadline, market);
+}
+
+function buildCloseTx(position) {
+  const closeBps = BigInt(Math.round(Number(position.closePercent ?? tradingConfig.closePercent) * 100));
+  const deadline = BigInt(position.deadline ?? Math.floor(Date.now() / 1000) + tradingConfig.deadlineSeconds);
+  const amountOutMin = BigInt(position.amountOutMin ?? tradingConfig.fallbackAmountOutMin ?? "0");
+  if (closeBps >= BPS) return POSITION_IFACE.encodeFunctionData("closePosition", [BigInt(position.positionId), amountOutMin, deadline]);
+  return POSITION_IFACE.encodeFunctionData("partialClose", [BigInt(position.positionId), closeBps, amountOutMin, deadline]);
+}
+
+async function ensureLeveragedApproval(wallet, token, spender, amount, nativeCollateral, provider) {
+  if (nativeCollateral) {
+    const weth = new ethers.Contract(WETH_ADDRESS, WETH_ABI, wallet);
+    const wethBalance = await weth.balanceOf(wallet.address);
+    if (wethBalance < amount) {
+      const missing = amount - wethBalance;
+      addLog(`Native ETH collateral: wrapping ${ethers.formatEther(missing)} ETH to WETH before open.`, "warn");
+      if (tradingConfig.simulateOnly) {
+        addLog(`simulateOnly WETH deposit value=${missing}`, "warn");
+      } else {
+        const feeParams = await getFeeParams(provider);
+        const nonce = await getNextNonce(provider, wallet.address, SEPOLIA_CHAIN_ID);
+        const wrapTx = await weth.deposit({ value: missing, ...feeParams, gasLimit: 100000n, nonce });
+        addLog(`WETH wrap txHash=${wrapTx.hash}`, "warn");
+        await waitForTx(wrapTx);
+        addLog("WETH wrap confirmed.", "success");
+      }
+    } else {
+      addLog("WETH balance sufficient for native ETH collateral.", "info");
+    }
+  }
+  const contract = new ethers.Contract(token, ERC20_ABI, wallet);
+  const allowance = await contract.allowance(wallet.address, spender);
+  if (allowance >= amount) return addLog("Leveraged allowance sufficient.", "info");
+  if (tradingConfig.simulateOnly) return addLog(`simulateOnly approve ${getShortAddress(spender)} for ${getShortAddress(token)}`, "warn");
+  const feeParams = await getFeeParams(provider);
+  const nonce = await getNextNonce(provider, wallet.address, SEPOLIA_CHAIN_ID);
+  const tx = await contract.approve(spender, ethers.MaxUint256, { ...feeParams, gasLimit: 100000n, nonce });
+  addLog(`Leveraged approve txHash=${tx.hash}`, "warn");
+  const receipt = await waitForTx(tx);
+  if (receipt.status === 0) throw new Error("Leveraged approve reverted");
+}
+
+async function validateAndSendLeveragedTx(wallet, tx, side, provider) {
+  const isOpenTx = tx.data.slice(0, 10) === "0xfa2b1dfd";
+  if (isOpenTx) {
+    const decoded = POSITION_IFACE.decodeFunctionData("openPosition", tx.data);
+    addLog(`[${side}] arg1 side=${decoded.isLong ? 1 : 0}`, "warn");
+    addLog(`[${side}] arg2 token=${decoded.collateralToken}`, "warn");
+    addLog(`[${side}] arg3 collateral=${decoded.collateralAmount}`, "warn");
+    addLog(`[${side}] arg4 borrow=${decoded.borrowAmount}`, "warn");
+    addLog(`[${side}] arg5 leverage=${decoded.leverageX10}`, "warn");
+    addLog(`[${side}] arg6 amountOutMin=${decoded.amountOutMin}`, "warn");
+    addLog(`[${side}] arg7 deadline=${decoded.deadline}`, "warn");
+    addLog(`[${side}] tx.value=${tx.value}`, "warn");
+    logUiPayloadDiff(tx, side);
+  }
+
+  const network = await provider.getNetwork();
+  const ethBalance = await provider.getBalance(wallet.address);
+  addLog(`wallet.address=${wallet.address}`, "info");
+  addLog(`config.chainId=${SEPOLIA_CHAIN_ID} provider.chainId=${network.chainId}`, "info");
+  addLog(`RPC=${SEPOLIA_RPC_URL}`, "info");
+  addLog(`ETH balance=${ethers.formatEther(ethBalance)}`, "info");
+  if (isOpenTx) {
+    const maxAmount = ethers.parseEther(String(tradingConfig.maxTradeAmount));
+    if (tx.nativeCollateral) {
+      if (tx.collateralAmount > maxAmount) throw new Error(`Trade exceeds maxTradeAmount: ${ethers.formatEther(tx.collateralAmount)} > ${tradingConfig.maxTradeAmount}`);
+      const weth = new ethers.Contract(WETH_ADDRESS, ERC20_ABI, provider);
+      const wethBalance = await weth.balanceOf(wallet.address);
+      const missing = wethBalance >= tx.collateralAmount ? 0n : tx.collateralAmount - wethBalance;
+      addLog(`WETH balance=${ethers.formatEther(wethBalance)} missingWrap=${ethers.formatEther(missing)}`, "info");
+      if (ethBalance < missing) throw new Error(`Insufficient ETH for WETH wrap: have ${ethers.formatEther(ethBalance)}, need ${ethers.formatEther(missing)}`);
+    } else {
+      const erc20 = new ethers.Contract(tx.collateralToken, ERC20_ABI, provider);
+      const decimals = Number(await erc20.decimals());
+      const erc20MaxAmount = ethers.parseUnits(String(tradingConfig.maxTradeAmount), decimals);
+      if (tx.collateralAmount > erc20MaxAmount) throw new Error(`Trade exceeds maxTradeAmount: ${ethers.formatUnits(tx.collateralAmount, decimals)} > ${tradingConfig.maxTradeAmount}`);
+      const tokenBal = await erc20.balanceOf(wallet.address);
+      if (tokenBal < tx.collateralAmount) throw new Error(`Insufficient collateral token balance`);
+    }
+  }
+  addLog(`[${side}] to=${tx.to} value=${tx.value} amountOutMin=${tx.amountOutMin ?? "n/a"} leverage=${tx.leverage ?? "n/a"}`, "warn");
+  addLog(`[${side}] data=${tx.data}`, "debug");
+  if (tradingConfig.simulateOnly) return addLog(`[${side}] simulateOnly=true, not sending.`, "success");
+  if (isOpenTx) assertUiPayloadMatch(tx, side);
+  try {
+    await provider.call({ from: wallet.address, to: tx.to, data: tx.data, value: tx.value });
+  } catch (error) {
+    addLog(`[${side}] provider.call revert/error: ${decodeContractError(error)}`, "error");
+    throw error;
+  }
+  let gasEstimate;
+  try {
+    gasEstimate = await provider.estimateGas({ from: wallet.address, to: tx.to, data: tx.data, value: tx.value });
+  } catch (error) {
+    addLog(`[${side}] estimateGas revert/error: ${decodeContractError(error)}`, "error");
+    throw error;
+  }
+  const feeParams = await getFeeParams(provider);
+  const nonce = await getNextNonce(provider, wallet.address, SEPOLIA_CHAIN_ID);
+  let sent;
+  try {
+    sent = await wallet.sendTransaction({ to: tx.to, data: tx.data, value: tx.value, gasLimit: gasEstimate + gasEstimate / 5n, nonce, ...feeParams });
+  } catch (error) {
+    addLog(`[${side}] sendTransaction error: ${decodeContractError(error)}`, "error");
+    throw error;
+  }
+  addLog(`[${side}] txHash=${sent.hash}`, "warn");
+  addLog(`[${side}] Sending transaction...`, "warn");
+  const receipt = await waitForTx(sent);
+  if (receipt.status === 0) throw new Error(`${side} transaction reverted`);
+  for (const log of receipt.logs) {
+    try {
+      const parsed = POSITION_IFACE.parseLog(log);
+      if (parsed?.name === "MAM_PositionCreated" || parsed?.name === "MAM_LoopPositionCreated") {
+        tradingConfig.closeManager = tx.to;
+        tradingConfig.closePositionId = parsed.args.positionId.toString();
+        tradingConfig.enableClose = true;
+        tradingConfig.activePositions = (tradingConfig.activePositions || []).filter(p => String(p.positionId) !== tradingConfig.closePositionId);
+        tradingConfig.activePositions.push({
+          side,
+          positionId: tradingConfig.closePositionId,
+          managerAddress: tx.to,
+          symbol: tx.symbol || side,
+          marketToken: tx.marketToken || tradingConfig.marketToken,
+          collateralToken: tx.collateralToken,
+          closeTarget: tx.to,
+          txHash: sent.hash,
+          openedAt: Math.floor(Date.now() / 1000)
+        });
+        saveConfig();
+        addLog(`[${side}] active positionId=${tradingConfig.closePositionId} manager=${getShortAddress(tx.to)}`, "success");
+      }
+      if (parsed?.name === "MAM_PositionClosed" || parsed?.name === "MAM_PositionPartiallyClosed") {
+        addLog(`[${side}] positionId=${parsed.args.positionId.toString()} close event confirmed`, "success");
+      }
+    } catch {}
+  }
+  addLog(`[${side}] receipt status=${receipt.status} block=${receipt.blockNumber}`, "success");
+  if (side === "LONG" || side === "SHORT") {
+    addLog(`${side} opened`, "success");
+  } else {
+    addLog(`${side} confirmed`, "success");
+  }
+  addLog(`[${side}] Verify position in UI after indexer refresh.`, "success");
+}
+
+function decodeContractError(error) {
+  const data = error?.data || error?.info?.error?.data || error?.error?.data;
+  if (data) {
+    try {
+      const parsed = POSITION_IFACE.parseError(data);
+      return `${parsed.name}(${parsed.args.map(String).join(",")})`;
+    } catch {
+      return `${error.reason || error.shortMessage || error.message} data=${data}`;
+    }
+  }
+  return error.reason || error.shortMessage || error.message;
+}
+
+async function openLeveragedPosition(side, market = null, amountOverride = null) {
+  const normalizedMarket = normalizeMarketConfig(market || {});
+  if (side === "LONG" && !tradingConfig.enableLong) throw new Error("LONG disabled in config");
+  if (side === "SHORT" && !tradingConfig.enableShort) throw new Error("SHORT disabled in config");
+  if (!canOpenMarketSide(normalizedMarket, side)) throw new Error(`[SKIP] ${side} duplicate or limit reached for ${normalizedMarket.symbol}`);
+  if ((tradingConfig.activePositions || []).length >= tradingConfig.maxOpenPositions) throw new Error(`Max open positions reached (${tradingConfig.maxOpenPositions})`);
+  if (accounts.length === 0) throw new Error("No account loaded");
+  const accountIndex = tradingConfig.firstTxMode ? 0 : selectedWalletIndex;
+  const proxyUrl = proxies[accountIndex % proxies.length] || null;
+  const provider = getProvider(SEPOLIA_RPC_URL, SEPOLIA_CHAIN_ID, proxyUrl);
+  const wallet = new ethers.Wallet(accounts[accountIndex].privateKey, provider);
+  const amount = amountOverride || (tradingConfig.firstTxMode ? tradingConfig.tinyTradeAmount : await getWalletPercentTradeAmount(wallet, provider, normalizedMarket.collateralToken, side));
+  addLog(`[OPEN] ${side} ${normalizedMarket.symbol} amount=${amount}`, "warn");
+  const tx = side === "LONG"
+    ? await buildLongTx(amount, normalizedMarket.collateralToken, tradingConfig.leverage, undefined, provider, normalizedMarket)
+    : await buildShortTx(amount, normalizedMarket.collateralToken, tradingConfig.leverage, undefined, provider, normalizedMarket);
+  await ensureLeveragedApproval(wallet, tx.collateralToken, tx.to, tx.collateralAmount, tx.nativeCollateral, provider);
+  await validateAndSendLeveragedTx(wallet, tx, side, provider);
+}
+
+async function logLongShortPayloadDelta(provider) {
+  const amount = tradingConfig.firstTxMode ? tradingConfig.tinyTradeAmount : tradingConfig.tradeAmount;
+  const deadline = Math.floor(Date.now() / 1000) + tradingConfig.deadlineSeconds;
+  const longTx = await buildLongTx(amount, tradingConfig.defaultCollateralToken, tradingConfig.leverage, deadline, provider);
+  const shortTx = await buildShortTx(amount, tradingConfig.defaultCollateralToken, tradingConfig.leverage, deadline, provider);
+  const longDecoded = POSITION_IFACE.decodeFunctionData("openPosition", longTx.data);
+  const shortDecoded = POSITION_IFACE.decodeFunctionData("openPosition", shortTx.data);
+  const fields = ["isLong", "collateralToken", "collateralAmount", "borrowAmount", "leverageX10", "amountOutMin", "deadline"];
+  addLog("LONG payload vs SHORT payload delta", "warn");
+  for (const field of fields) {
+    addLog(`${field}: LONG=${longDecoded[field]} SHORT=${shortDecoded[field]}`, "warn");
+  }
+  addLog(`tx.value: LONG=${longTx.value} SHORT=${shortTx.value}`, "warn");
+}
+
+function logUiPayloadDiff(tx, side) {
+  const sideReference = side === "LONG" ? tradingConfig.uiLongPayloadReference : tradingConfig.uiShortPayloadReference;
+  const sideTxValueReference = side === "LONG" ? tradingConfig.uiLongTxValueReference : tradingConfig.uiShortTxValueReference;
+  const reference = sideReference || tradingConfig.uiPayloadReference;
+  if (!reference) return;
+  try {
+    const ui = reference;
+    const bot = POSITION_IFACE.decodeFunctionData("openPosition", tx.data);
+    const botFields = [
+      bot.isLong,
+      bot.collateralToken,
+      bot.collateralAmount,
+      bot.borrowAmount,
+      bot.leverageX10,
+      bot.amountOutMin,
+      bot.deadline
+    ];
+    const names = ["arg1", "arg2", "arg3", "arg4", "arg5", "arg6", "arg7"];
+    const labels = ["side", "token", "collateral", "borrow", "leverage", "amountOutMin", "deadline"];
+    addLog(`[${side}] UI payload vs BOT payload strict diff`, "warn");
+    for (let i = 0; i < names.length; i++) {
+      const uiValue = String(ui[i]);
+      const botValue = String(botFields[i]);
+      let match = uiValue.toLowerCase() === botValue.toLowerCase();
+      let status = match ? "MATCH" : "DIFF";
+      if (i === 5 && !match) {
+        const uiNum = Number(uiValue);
+        const botNum = Number(botValue);
+        const drift = Number.isFinite(uiNum) && uiNum > 0 && Number.isFinite(botNum) ? Math.abs(botNum - uiNum) / uiNum : Infinity;
+        if (drift <= 0.02) {
+          match = true;
+          status = "MATCH (within tolerance)";
+        }
+      }
+      addLog(`[${side}] UI ${names[i]} ${labels[i]}: ${uiValue}`, match ? "info" : "warn");
+      addLog(`[${side}] BOT ${names[i]} ${labels[i]}: ${botValue}`, match ? "info" : "warn");
+      addLog(`[${side}] ${status}`, match ? "info" : "warn");
+    }
+    const uiTxValue = sideTxValueReference == null ? null : String(sideTxValueReference);
+    const botTxValue = String(tx.value);
+    const valueMatch = uiTxValue != null && uiTxValue.toLowerCase() === botTxValue.toLowerCase();
+    addLog(`[${side}] UI tx.value: ${uiTxValue ?? "<not provided>"}`, uiTxValue == null || valueMatch ? "info" : "warn");
+    addLog(`[${side}] BOT tx.value: ${botTxValue}`, uiTxValue == null || valueMatch ? "info" : "warn");
+    addLog(`[${side}] ${uiTxValue == null ? "TX.VALUE REFERENCE MISSING" : valueMatch ? "MATCH" : "DIFF"}`, uiTxValue == null || valueMatch ? "info" : "warn");
+  } catch (error) {
+    addLog(`UI payload diff failed: ${error.message}`, "error");
+  }
+}
+
+function assertUiPayloadMatch(tx, side) {
+  const sideReference = side === "LONG" ? tradingConfig.uiLongPayloadReference : tradingConfig.uiShortPayloadReference;
+  const sideTxValueReference = side === "LONG" ? tradingConfig.uiLongTxValueReference : tradingConfig.uiShortTxValueReference;
+  const reference = sideReference || tradingConfig.uiPayloadReference;
+  if (!reference) return;
+
+  const bot = POSITION_IFACE.decodeFunctionData("openPosition", tx.data);
+  const botFields = [
+    bot.isLong,
+    bot.collateralToken,
+    bot.collateralAmount,
+    bot.borrowAmount,
+    bot.leverageX10,
+    bot.amountOutMin,
+    bot.deadline
+  ];
+
+  const mismatches = [];
+  for (let i = 0; i < 5; i++) {
+    if (String(reference[i]).toLowerCase() !== String(botFields[i]).toLowerCase()) {
+      mismatches.push(`arg${i + 1}: UI=${reference[i]} BOT=${botFields[i]}`);
+    }
+  }
+
+  const uiArg6 = Number(reference[5]);
+  const botArg6 = Number(botFields[5]);
+  if (!Number.isFinite(uiArg6) || uiArg6 <= 0 || !Number.isFinite(botArg6)) {
+    mismatches.push(`arg6: invalid tolerance values UI=${reference[5]} BOT=${botFields[5]}`);
+  } else {
+    const drift = Math.abs(botArg6 - uiArg6) / uiArg6;
+    if (drift > 0.02) {
+      mismatches.push(`arg6: UI=${reference[5]} BOT=${botFields[5]} drift=${(drift * 100).toFixed(4)}%`);
+    } else {
+      addLog(`[${side}] MATCH (within tolerance) arg6 UI=${reference[5]} BOT=${botFields[5]} drift=${(drift * 100).toFixed(4)}%`, "success");
+    }
+  }
+
+  if (sideTxValueReference != null && String(sideTxValueReference).toLowerCase() !== String(tx.value).toLowerCase()) {
+    mismatches.push(`tx.value: UI=${sideTxValueReference} BOT=${tx.value}`);
+  }
+
+  if (mismatches.length > 0) {
+    throw new Error(`UI payload mismatch; aborting live ${side}: ${mismatches.join(" | ")}`);
+  }
+
+  addLog(`[${side}] UI args vs BOT args: FULL MATCH for args 1-5, arg6 within tolerance, and tx.value. arg7 deadline may differ.`, "success");
+}
+
+async function closeLeveragedPosition() {
+  if (!tradingConfig.enableClose) throw new Error("Close disabled in config");
+  const provider = getProvider(SEPOLIA_RPC_URL, SEPOLIA_CHAIN_ID, proxies[selectedWalletIndex % proxies.length] || null);
+  const wallet = new ethers.Wallet(accounts[selectedWalletIndex].privateKey, provider);
+  addLog("[CLOSE] searching active positions...", "warn");
+  const positions = await discoverActivePositions(wallet, provider);
+  if (positions.length === 0) throw new Error("No active positions found");
+  const selected = await choosePositionToClose(positions);
+  const selectedPositions = Array.isArray(selected) ? selected : [selected];
+  for (const position of selectedPositions) {
+    addLog(`[CLOSE] found ${position.side}`, "warn");
+    addLog(`[CLOSE] managerAddress=${position.managerAddress}`, "warn");
+    addLog(`[CLOSE] target=${position.closeTarget || position.managerAddress}`, "warn");
+    if (!position.closeTarget && !position.managerAddress) throw new Error("Close target unavailable after discovery");
+    const data = buildCloseTx({ positionId: position.positionId, closePercent: tradingConfig.closePercent });
+    addLog(`[CLOSE] sending close tx positionId=${position.positionId}...`, "warn");
+    await validateAndSendLeveragedTx(wallet, { to: position.closeTarget || position.managerAddress, data, value: 0n }, "CLOSE", provider);
+    tradingConfig.activePositions = (tradingConfig.activePositions || []).filter(p => String(p.positionId) !== String(position.positionId));
+    if (String(tradingConfig.closePositionId) === String(position.positionId)) tradingConfig.closePositionId = "";
+  }
+  saveConfig();
+  addLog(`[CLOSE] closed ${selectedPositions.length} position(s)`, "success");
+}
+
+function choosePositionToClose(positions) {
+  if (positions.length === 1) return Promise.resolve(positions[0]);
+  addLog("[CLOSE] multiple positions found. Select Position To Close.", "warn");
+  return new Promise((resolve) => {
+    const closeLong = positions.filter(p => p.side === "LONG");
+    const closeShort = positions.filter(p => p.side === "SHORT");
+    const bulkItems = [
+      closeLong.length ? `[ALL] Close All LONG (${closeLong.length})` : null,
+      closeShort.length ? `[ALL] Close All SHORT (${closeShort.length})` : null,
+      `[ALL] Close All Positions (${positions.length})`
+    ].filter(Boolean);
+    const positionItems = positions.map((p, i) => `[${i + 1}] ${p.side} ${p.symbol || getShortAddress(p.collateralToken)} size:${p.size} id:${p.positionId}`);
+    const items = [...bulkItems, ...positionItems];
+    const picker = blessed.list({
+      label: " Select Position To Close ",
+      top: "center",
+      left: "center",
+      width: "60%",
+      height: Math.min(positions.length + 4, 12),
+      border: { type: "line" },
+      keys: true,
+      mouse: true,
+      items,
+      style: { selected: { bg: "magenta", fg: "black" }, border: { fg: "yellow" } }
+    });
+    screen.append(picker);
+    picker.focus();
+    picker.on("select", (_, index) => {
+      screen.remove(picker);
+      safeRender();
+      const selectedText = items[index];
+      if (selectedText.includes("Close All LONG")) return resolve(closeLong);
+      if (selectedText.includes("Close All SHORT")) return resolve(closeShort);
+      if (selectedText.includes("Close All Positions")) return resolve(positions);
+      resolve(positions[index - bulkItems.length]);
+    });
+    picker.key(["escape"], () => {
+      screen.remove(picker);
+      safeRender();
+      resolve(positions[0]);
+    });
+    safeRender();
+  });
+}
+
+async function discoverActivePositions(wallet, provider) {
+  const tracked = Array.isArray(tradingConfig.activePositions) ? tradingConfig.activePositions : [];
+  const managers = new Set(tracked.map(p => p.managerAddress || p.closeTarget).filter(Boolean));
+  if (tradingConfig.closeManager) managers.add(tradingConfig.closeManager);
+  if (managers.size === 0) {
+    const context = await getLeveragedContext(provider, tradingConfig.defaultCollateralToken);
+    managers.add(context.manager);
+  }
+  const found = [];
+  for (const manager of managers) {
+    try {
+      const contract = new ethers.Contract(manager, POSITION_ABI, provider);
+      let ids = [];
+      try { ids = (await contract.getUserPositions(wallet.address)).map(x => x.toString()); } catch {}
+      if (tradingConfig.closePositionId) ids.push(String(tradingConfig.closePositionId));
+      for (const trackedPosition of tracked.filter(p => (p.managerAddress || p.closeTarget || "").toLowerCase() === manager.toLowerCase())) ids.push(String(trackedPosition.positionId));
+      ids = [...new Set(ids.filter(Boolean))];
+      for (const id of ids) {
+        try {
+          const position = await contract.getPosition(id);
+          const user = String(position.user || position[1]);
+          if (user.toLowerCase() !== wallet.address.toLowerCase()) continue;
+          const currentDebt = BigInt(position.currentDebt ?? position[5] ?? 0n);
+          const collateralAmount = BigInt(position.collateralAmount ?? position[3] ?? 0n);
+          if (collateralAmount === 0n && currentDebt === 0n) continue;
+          const isLong = Boolean(position.isLong ?? position[0]);
+          const side = isLong ? "LONG" : "SHORT";
+          addLog(`[CLOSE] found ${side} positionId=${id} size=${collateralAmount} debt=${currentDebt}`, "warn");
+          const trackedMeta = tracked.find(p => String(p.positionId) === String(id)) || {};
+          found.push({ side, positionId: id, managerAddress: manager, closeTarget: manager, symbol: trackedMeta.symbol, marketToken: trackedMeta.marketToken, collateralToken: position.collateralToken || position[2], size: collateralAmount.toString() });
+        } catch {}
+      }
+    } catch {}
+  }
+  return found;
+}
+
+async function discoverAvailableMarkets(provider) {
+  const factory = new ethers.Contract(LEVERAGED_FACTORY, FACTORY_ABI, provider);
+  const configured = Array.isArray(tradingConfig.availableMarkets) && tradingConfig.availableMarkets.length > 0
+    ? tradingConfig.availableMarkets
+    : MARKET_CANDIDATES;
+  const blacklist = new Set((tradingConfig.blacklistMarkets || []).map(item => String(item).toLowerCase()));
+  const found = [];
+  for (const candidate of configured.map(normalizeMarketConfig)) {
+    const key = candidate.symbol.toLowerCase();
+    if (blacklist.has(key) || blacklist.has(String(candidate.marketToken).toLowerCase()) || blacklist.has(String(candidate.collateralToken).toLowerCase())) {
+      addLog(`[SKIP] blacklisted market ${candidate.symbol}`, "warn");
+      continue;
+    }
+    try {
+      const collateral = normalizeCollateralToken(candidate.collateralToken);
+      const marketToken = normalizeCollateralToken(candidate.marketToken);
+      if (collateral.toLowerCase() === marketToken.toLowerCase()) throw new Error("collateral equals market token");
+      const [tokenA, tokenB] = sortTokenPair(collateral, marketToken);
+      const pool = await factory.getPool(tokenA, tokenB);
+      if (!pool || pool === ZERO_ADDRESS) throw new Error("pool not found");
+      const manager = await factory.getManager(pool);
+      if (!manager || manager === ZERO_ADDRESS) throw new Error("manager not found");
+      const contract = new ethers.Contract(manager, POSITION_ABI, provider);
+      const liquidity = await contract.getAvailableLiquidity().catch(() => 0n);
+      if (BigInt(liquidity) <= 0n) throw new Error("no leverage liquidity");
+      found.push({ ...candidate, collateralToken: collateral, marketToken, pool, managerAddress: manager, liquidity: liquidity.toString(), isActive: true });
+    } catch (error) {
+      addLog(`[SKIP] market ${candidate.symbol}: ${error.message}`, "warn");
+    }
+  }
+  tradingConfig.availableMarkets = found;
+  saveConfig();
+  addLog(`[MARKET] Loaded ${found.length} active markets`, "success");
+  return found;
+}
+
+async function resolveTradingMarkets(provider) {
+  if (tradingConfig.marketMode === "single") return [normalizeMarketConfig({
+    symbol: "ETH/DAI",
+    marketToken: tradingConfig.marketToken,
+    collateralToken: tradingConfig.defaultCollateralToken,
+    supportsLong: true,
+    supportsShort: true,
+    rsiSymbol: "ETHUSDT"
+  })];
+  const markets = await discoverAvailableMarkets(provider);
+  if (tradingConfig.marketMode === "selected") {
+    const selected = new Set((tradingConfig.selectedMarkets || []).map(item => String(item).toLowerCase()));
+    return markets.filter(market => selected.has(market.symbol.toLowerCase()) || selected.has(market.marketToken.toLowerCase()) || selected.has(market.collateralToken.toLowerCase()));
+  }
+  return markets;
+}
+
+async function fetchRsi(symbol = "ETHUSDT") {
+  const response = await axios.get(`https://api.binance.com/api/v3/klines?symbol=${encodeURIComponent(symbol)}&interval=1m&limit=50`);
+  const closes = response.data.map(item => parseFloat(item[4]));
+  let gains = 0, losses = 0;
+  for (let i = 1; i < closes.length; i++) {
+    const delta = closes[i] - closes[i - 1];
+    if (delta >= 0) gains += delta; else losses -= delta;
+  }
+  if (losses === 0) return 100;
+  const rs = gains / losses;
+  return 100 - 100 / (1 + rs);
+}
+
+let rsiTradingInterval = null;
+let lastRsiTradeAt = 0;
+let lastMarketTradeAt = {};
+let dailyTradeCounter = { day: "", count: 0 };
+
+function markDailyTrade() {
+  const day = new Date().toISOString().slice(0, 10);
+  if (dailyTradeCounter.day !== day) dailyTradeCounter = { day, count: 0 };
+  dailyTradeCounter.count += 1;
+}
+
+function dailyTradeLimitReached() {
+  const day = new Date().toISOString().slice(0, 10);
+  if (dailyTradeCounter.day !== day) dailyTradeCounter = { day, count: 0 };
+  return dailyTradeCounter.count >= tradingConfig.maxDailyTrades;
+}
+
+function getDistributedAmount(side, marketsCount) {
+  const base = tradingConfig.firstTxMode ? tradingConfig.tinyTradeAmount : getTradingAmount(side);
+  if (tradingConfig.balanceDistribution !== "equal" || marketsCount <= 1) return base;
+  const value = Number(base) / marketsCount;
+  return value.toFixed(8).replace(/0+$/, "").replace(/\.$/, "");
+}
+
+async function runAutoRsiTrading() {
+  if (rsiTradingInterval) return addLog("Auto RSI trading already running.", "warn");
+  addLog(`[RSI] Starting Auto RSI Trading mode=${tradingConfig.marketMode}.`, "info");
+  rsiTradingInterval = setInterval(async () => {
+    try {
+      const now = Date.now();
+      if (now - lastRsiTradeAt < tradingConfig.cooldownSeconds * 1000) return;
+      if (dailyTradeLimitReached()) return addLog(`[SKIP] maxDailyTrades reached (${tradingConfig.maxDailyTrades})`, "warn");
+      const provider = getProvider(SEPOLIA_RPC_URL, SEPOLIA_CHAIN_ID, proxies[selectedWalletIndex % proxies.length] || null);
+      const markets = await resolveTradingMarkets(provider);
+      if (markets.length === 0) return addLog("[MARKET] no active markets available", "warn");
+      for (const market of markets) {
+        if (dailyTradeLimitReached()) break;
+        const key = getPositionMarketKey(market);
+        if (now - (lastMarketTradeAt[key] || 0) < tradingConfig.cooldownPerMarket * 1000) {
+          addLog(`[SKIP] cooldown ${market.symbol}`, "warn");
+          continue;
+        }
+        const value = await fetchRsi(market.rsiSymbol);
+        addLog(`[RSI] ${market.symbol} ${market.rsiSymbol}=${value.toFixed(2)}`, "info");
+        let side = null;
+        if (value < tradingConfig.rsiLong && tradingConfig.enableLong) side = "LONG";
+        if (value > tradingConfig.rsiShort && tradingConfig.enableShort) side = "SHORT";
+        if (!side) continue;
+        if (!canOpenMarketSide(market, side)) {
+          addLog(`[SKIP] ${side} ${market.symbol} duplicate or limit reached`, "warn");
+          continue;
+        }
+        const amount = tradingConfig.tradeMode === "walletPercent" ? null : getDistributedAmount(side, markets.length);
+        lastRsiTradeAt = now;
+        lastMarketTradeAt[key] = now;
+        await openLeveragedPosition(side, market, amount);
+        markDailyTrade();
+      }
+    } catch (error) {
+      addLog(`Auto RSI trading failed: ${error.message}. Stopping RSI mode.`, "error");
+      clearInterval(rsiTradingInterval);
+      rsiTradingInterval = null;
+    }
+  }, 60000);
+}
+
 function getSwapAmount(pair) {
   switch (pair.from) {
     case "ETH":  return getRandomAmount(dailyActivityConfig.ethRange.min,  dailyActivityConfig.ethRange.max);
@@ -456,6 +1378,11 @@ function getSwapAmount(pair) {
 }
 
 async function runDailyActivity() {
+  if (!dailyActivityConfig.enableSwaps) {
+    addLog("Swap farming is disabled by enableSwaps=false.", "warn");
+    return;
+  }
+
   if (accounts.length === 0) {
     addLog("No valid accounts found.", "error");
     return;
@@ -652,8 +1579,8 @@ const menuBox = blessed.list({
     item: { fg: "white" }
   },
   items:   isCycleRunning
-    ? ["Stop Activity", "Set Manual Config", "Clear Logs", "Refresh", "Exit"]
-    : ["Start Auto Daily Activity", "Set Manual Config", "Clear Logs", "Refresh", "Exit"],
+    ? ["[1] Stop Activity", "[2] Open LONG Now", "[3] Open SHORT Now", "[4] Close Position", "[5] Auto RSI Trading", "[6] Set Manual Config", "[7] Refresh Wallet", "[8] Exit"]
+    : ["[1] Start Auto Daily Activity", "[2] Open LONG Now", "[3] Open SHORT Now", "[4] Close Position", "[5] Auto RSI Trading", "[6] Set Manual Config", "[7] Refresh Wallet", "[8] Exit"],
   padding: { left: 1, top: 1 }
 });
 
@@ -675,6 +1602,16 @@ const dailyActivitySubMenu = blessed.list({
   },
   items:  [
     "Set Swap Repetitions",
+    "Number of Auto Trades",
+    "Trade Amounts",
+    "Max Open Positions",
+    "Long/Short Ratio",
+    "Randomize Trade Size",
+    "Trade Mode",
+    "Market Mode",
+    "Selected Markets",
+    "Trade Distribution",
+    "Safety Limits",
     "Set ETH Range",
     "Set USDC Range",
     "Set DAI Range",
@@ -882,12 +1819,48 @@ function updateMenu() {
   try {
     menuBox.setItems(
       isCycleRunning
-        ? ["Stop Activity", "Set Manual Config", "Clear Logs", "Refresh", "Exit"]
-        : ["Start Auto Daily Activity", "Set Manual Config", "Clear Logs", "Refresh", "Exit"]
+        ? ["[1] Stop Activity", "[2] Open LONG Now", "[3] Open SHORT Now", "[4] Close Position", "[5] Auto RSI Trading", "[6] Set Manual Config", "[7] Refresh Wallet", "[8] Exit"]
+        : ["[1] Start Auto Daily Activity", "[2] Open LONG Now", "[3] Open SHORT Now", "[4] Close Position", "[5] Auto RSI Trading", "[6] Set Manual Config", "[7] Refresh Wallet", "[8] Exit"]
     );
     safeRender();
   } catch (error) {
     addLog(`Menu update failed: ${error.message}`, "error");
+  }
+}
+
+function runGit(command) {
+  return execSync(command, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+}
+
+function startupGitSync() {
+  try {
+    if (!fs.existsSync(".git")) return;
+    const configBackup = fs.existsSync(CONFIG_FILE) ? fs.readFileSync(CONFIG_FILE, "utf8") : null;
+    const branch = runGit("git branch --show-current");
+    if (branch !== "nemesis-autobot") {
+      addLog(`[SKIP] git sync branch=${branch}; expected nemesis-autobot`, "warn");
+      return;
+    }
+    const status = runGit("git status --porcelain");
+    let stashed = false;
+    if (status) {
+      runGit("git stash push -m startup-sync -- . :(exclude)config.json :(exclude)wallets/** :(exclude)pk.txt :(exclude).env");
+      stashed = true;
+      addLog("[TX] stashed local code changes before git pull", "warn");
+    }
+    runGit("git pull origin nemesis-autobot");
+    addLog("[TX] git pull origin nemesis-autobot complete", "success");
+    if (stashed) {
+      try {
+        runGit("git stash pop");
+        addLog("[TX] restored stashed local code changes", "success");
+      } catch (error) {
+        addLog(`[SKIP] git stash pop needs manual review: ${error.message}`, "error");
+      }
+    }
+    if (configBackup != null && !fs.existsSync(CONFIG_FILE)) fs.writeFileSync(CONFIG_FILE, configBackup);
+  } catch (error) {
+    addLog(`[SKIP] startup git sync failed: ${error.message}`, "warn");
   }
 }
 
@@ -912,6 +1885,7 @@ logBox.on("blur", () => {
 menuBox.on("select", async (item) => {
   const action = item.getText();
   switch (action) {
+    case "[1] Start Auto Daily Activity":
     case "Start Auto Daily Activity":
       if (isCycleRunning) {
         addLog("Cycle is still running. Stop the current cycle first.", "error");
@@ -920,6 +1894,7 @@ menuBox.on("select", async (item) => {
       }
       break;
 
+    case "[1] Stop Activity":
     case "Stop Activity":
       shouldStop = true;
       if (dailyActivityInterval) {
@@ -955,6 +1930,32 @@ menuBox.on("select", async (item) => {
       }
       break;
 
+    case "[2] Open LONG Now":
+      try { await openLeveragedPosition("LONG"); }
+      catch (error) {
+        addLog(`Open LONG failed: ${error.message}`, "error");
+        try { await logLongShortPayloadDelta(getProvider(SEPOLIA_RPC_URL, SEPOLIA_CHAIN_ID, proxies[selectedWalletIndex % proxies.length] || null)); } catch {}
+      }
+      break;
+
+    case "[3] Open SHORT Now":
+      try { await openLeveragedPosition("SHORT"); }
+      catch (error) {
+        addLog(`Open SHORT failed: ${error.message}`, "error");
+        try { await logLongShortPayloadDelta(getProvider(SEPOLIA_RPC_URL, SEPOLIA_CHAIN_ID, proxies[selectedWalletIndex % proxies.length] || null)); } catch {}
+      }
+      break;
+
+    case "[4] Close Position":
+      try { await closeLeveragedPosition(); }
+      catch (error) { addLog(`Close position failed: ${error.message}`, "error"); }
+      break;
+
+    case "[5] Auto RSI Trading":
+      await runAutoRsiTrading();
+      break;
+
+    case "[6] Set Manual Config":
     case "Set Manual Config":
       menuBox.hide();
       dailyActivitySubMenu.show();
@@ -972,13 +1973,16 @@ menuBox.on("select", async (item) => {
       clearTransactionLogs();
       break;
 
+    case "[7] Refresh Wallet":
     case "Refresh":
       await updateWallets();
       addLog("Data refreshed.", "success");
       break;
 
+    case "[8] Exit":
     case "Exit":
       clearInterval(statusInterval);
+      if (rsiTradingInterval) clearInterval(rsiTradingInterval);
       process.exit(0);
   }
 });
@@ -988,6 +1992,16 @@ dailyActivitySubMenu.on("select", (item) => {
 
   const rangeTypes = {
     "Set Swap Repetitions": { type: "activityRepetitions", label: " Enter Swap Repetitions ",    hasRange: false, val: () => dailyActivityConfig.activityRepetitions.toString() },
+    "Number of Auto Trades": { type: "activityRepetitions", label: " Enter Number of Auto Trades ", hasRange: false, val: () => dailyActivityConfig.activityRepetitions.toString() },
+    "Trade Amounts": { type: "tradeAmounts", label: " Enter long,short,swap Amounts ", hasRange: false, val: () => `${tradingConfig.longTradeAmount},${tradingConfig.shortTradeAmount},${tradingConfig.swapTradeAmount}` },
+    "Max Open Positions": { type: "maxOpenPositions", label: " Enter Max Open Positions ", hasRange: false, val: () => tradingConfig.maxOpenPositions.toString() },
+    "Long/Short Ratio": { type: "longShortRatio", label: " Enter Long/Short Ratio (70/30) ", hasRange: false, val: () => `${tradingConfig.longPercent}/${tradingConfig.shortPercent}` },
+    "Randomize Trade Size": { type: "randomizeTradeSize", label: " Randomize: true/false + Variance % ", hasRange: true, minVal: () => String(tradingConfig.randomizeAmount), maxVal: () => String(tradingConfig.amountVariancePercent) },
+    "Trade Mode": { type: "tradeMode", label: " fixed or walletPercent,percent ", hasRange: false, val: () => `${tradingConfig.tradeMode},${tradingConfig.walletPercent}` },
+    "Market Mode": { type: "marketMode", label: " single, all, or selected ", hasRange: false, val: () => tradingConfig.marketMode },
+    "Selected Markets": { type: "selectedMarkets", label: " Symbols comma-separated ", hasRange: false, val: () => tradingConfig.selectedMarkets.join(",") },
+    "Trade Distribution": { type: "tradeDistribution", label: " fixed/equal,maxPerPair,maxConcurrent ", hasRange: false, val: () => `${tradingConfig.balanceDistribution},${tradingConfig.maxTradesPerPair},${tradingConfig.maxConcurrentTrades}` },
+    "Safety Limits": { type: "safetyLimits", label: " daily,cooldown,blacklistCSV ", hasRange: false, val: () => `${tradingConfig.maxDailyTrades},${tradingConfig.cooldownPerMarket},${tradingConfig.blacklistMarkets.join("|")}` },
     "Set ETH Range":        { type: "ethRange",            label: " Enter ETH Range (e.g. 0.00001)", hasRange: true, minVal: () => dailyActivityConfig.ethRange.min.toString(),  maxVal: () => dailyActivityConfig.ethRange.max.toString()  },
     "Set USDC Range":       { type: "usdcRange",           label: " Enter USDC Range (e.g. 500)",    hasRange: true, minVal: () => dailyActivityConfig.usdcRange.min.toString(), maxVal: () => dailyActivityConfig.usdcRange.max.toString() },
     "Set DAI Range":        { type: "daiRange",            label: " Enter DAI Range (e.g. 0.5)",     hasRange: true, minVal: () => dailyActivityConfig.daiRange.min.toString(),  maxVal: () => dailyActivityConfig.daiRange.max.toString()  },
@@ -1048,19 +2062,23 @@ configForm.on("submit", () => {
   let value, maxValue;
 
   try {
-    value = ["activityRepetitions", "loopHours"].includes(configForm.configType)
+    if (["tradeAmounts", "longShortRatio", "randomizeTradeSize", "tradeMode", "marketMode", "selectedMarkets", "tradeDistribution", "safetyLimits"].includes(configForm.configType)) {
+      value = inputValue;
+    } else {
+      value = ["activityRepetitions", "loopHours", "maxOpenPositions"].includes(configForm.configType)
       ? parseInt(inputValue)
       : parseFloat(inputValue);
+    }
 
-    if (rangeKeys.includes(configForm.configType)) {
+    if (rangeKeys.includes(configForm.configType) || configForm.configType === "randomizeTradeSize") {
       maxValue = parseFloat(configInputMax.getValue().trim());
-      if (isNaN(maxValue) || maxValue <= 0) {
+      if (configForm.configType !== "randomizeTradeSize" && (isNaN(maxValue) || maxValue <= 0)) {
         addLog("Invalid Max value. Please enter a positive number.", "error");
         configInputMax.clearValue(); screen.focusPush(configInputMax); safeRender();
         isSubmitting = false; return;
       }
     }
-    if (isNaN(value) || value <= 0) {
+    if (!["tradeAmounts", "longShortRatio", "randomizeTradeSize", "tradeMode", "marketMode", "selectedMarkets", "tradeDistribution", "safetyLimits"].includes(configForm.configType) && (isNaN(value) || value <= 0)) {
       addLog("Invalid input. Please enter a positive number.", "error");
       configInput.clearValue(); screen.focusPush(configInput); safeRender();
       isSubmitting = false; return;
@@ -1079,6 +2097,72 @@ configForm.on("submit", () => {
   if (configForm.configType === "activityRepetitions") {
     dailyActivityConfig.activityRepetitions = Math.floor(value);
     addLog(`Swap Repetitions set to ${dailyActivityConfig.activityRepetitions}x`, "success");
+  } else if (configForm.configType === "tradeAmounts") {
+    const [longAmount, shortAmount, swapAmount] = String(value).split(",").map(v => v.trim());
+    if (!longAmount || !shortAmount || !swapAmount) {
+      addLog("Use format: long,short,swap", "error");
+      isSubmitting = false; return;
+    }
+    tradingConfig.longTradeAmount = longAmount;
+    tradingConfig.shortTradeAmount = shortAmount;
+    tradingConfig.swapTradeAmount = swapAmount;
+    tradingConfig.tradeAmount = longAmount;
+    tradingConfig.tinyTradeAmount = longAmount;
+    tradingConfig.maxTradeAmount = longAmount;
+    addLog(`Trade amounts set LONG=${longAmount}, SHORT=${shortAmount}, SWAP=${swapAmount}`, "success");
+  } else if (configForm.configType === "maxOpenPositions") {
+    tradingConfig.maxOpenPositions = Math.floor(value);
+    addLog(`Max Open Positions set to ${tradingConfig.maxOpenPositions}`, "success");
+  } else if (configForm.configType === "longShortRatio") {
+    const [longPct, shortPct] = String(value).split("/").map(v => Number(v.trim()));
+    if (!Number.isFinite(longPct) || !Number.isFinite(shortPct) || longPct < 0 || shortPct < 0 || longPct + shortPct !== 100) {
+      addLog("Use ratio format like 70/30 and total must equal 100.", "error");
+      isSubmitting = false; return;
+    }
+    tradingConfig.longPercent = longPct;
+    tradingConfig.shortPercent = shortPct;
+    addLog(`Long/Short Ratio set to ${longPct}/${shortPct}`, "success");
+  } else if (configForm.configType === "randomizeTradeSize") {
+    const normalized = String(value).toLowerCase();
+    tradingConfig.randomizeAmount = ["true", "yes", "1", "on"].includes(normalized);
+    tradingConfig.amountVariancePercent = Number(maxValue) || 0;
+    addLog(`Randomize Trade Size=${tradingConfig.randomizeAmount}, variance=${tradingConfig.amountVariancePercent}%`, "success");
+  } else if (configForm.configType === "tradeMode") {
+    const [mode, percent] = String(value).split(",").map(v => v.trim());
+    if (!["fixed", "walletPercent"].includes(mode)) {
+      addLog("Trade Mode must be fixed or walletPercent.", "error");
+      isSubmitting = false; return;
+    }
+    tradingConfig.tradeMode = mode;
+    tradingConfig.walletPercent = Number(percent) || tradingConfig.walletPercent;
+    addLog(`Trade Mode=${tradingConfig.tradeMode}, walletPercent=${tradingConfig.walletPercent}%`, "success");
+  } else if (configForm.configType === "marketMode") {
+    const mode = String(value).trim();
+    if (!["single", "all", "selected"].includes(mode)) {
+      addLog("Market Mode must be single, all, or selected.", "error");
+      isSubmitting = false; return;
+    }
+    tradingConfig.marketMode = mode;
+    addLog(`Market Mode=${tradingConfig.marketMode}`, "success");
+  } else if (configForm.configType === "selectedMarkets") {
+    tradingConfig.selectedMarkets = String(value).split(",").map(v => v.trim()).filter(Boolean);
+    addLog(`Selected Markets=${tradingConfig.selectedMarkets.join(",") || "none"}`, "success");
+  } else if (configForm.configType === "tradeDistribution") {
+    const [distribution, maxPerPair, maxConcurrent] = String(value).split(",").map(v => v.trim());
+    if (!["fixed", "equal"].includes(distribution)) {
+      addLog("Distribution must be fixed or equal.", "error");
+      isSubmitting = false; return;
+    }
+    tradingConfig.balanceDistribution = distribution;
+    tradingConfig.maxTradesPerPair = Math.max(1, Number(maxPerPair) || tradingConfig.maxTradesPerPair);
+    tradingConfig.maxConcurrentTrades = Math.max(1, Number(maxConcurrent) || tradingConfig.maxConcurrentTrades);
+    addLog(`Distribution=${distribution}, maxPerPair=${tradingConfig.maxTradesPerPair}, maxConcurrent=${tradingConfig.maxConcurrentTrades}`, "success");
+  } else if (configForm.configType === "safetyLimits") {
+    const [daily, cooldown, blacklist] = String(value).split(",").map(v => v.trim());
+    tradingConfig.maxDailyTrades = Math.max(1, Number(daily) || tradingConfig.maxDailyTrades);
+    tradingConfig.cooldownPerMarket = Math.max(0, Number(cooldown) || tradingConfig.cooldownPerMarket);
+    tradingConfig.blacklistMarkets = (blacklist || "").split("|").map(v => v.trim()).filter(Boolean);
+    addLog(`Safety daily=${tradingConfig.maxDailyTrades}, cooldown=${tradingConfig.cooldownPerMarket}s, blacklist=${tradingConfig.blacklistMarkets.join("|") || "none"}`, "success");
   } else if (configForm.configType === "loopHours") {
     dailyActivityConfig.loopHours = value;
     addLog(`Loop Daily set to ${value} hours`, "success");
@@ -1094,6 +2178,7 @@ configForm.on("submit", () => {
   }
 
   saveConfig();
+  addLog(`Config summary: autoTrades=${dailyActivityConfig.activityRepetitions}, LONG=${tradingConfig.longTradeAmount}, SHORT=${tradingConfig.shortTradeAmount}, SWAP=${tradingConfig.swapTradeAmount}, maxOpen=${tradingConfig.maxOpenPositions}, ratio=${tradingConfig.longPercent}/${tradingConfig.shortPercent}, random=${tradingConfig.randomizeAmount} ±${tradingConfig.amountVariancePercent}%`, "info");
   updateStatus();
   configForm.hide();
   dailyActivitySubMenu.show();
@@ -1155,6 +2240,7 @@ screen.key(["escape", "q", "C-c"], () => {
 
 async function initialize() {
   try {
+    startupGitSync();
     loadConfig();
     loadAccounts();
     loadProxies();

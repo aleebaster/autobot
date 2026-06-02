@@ -1,0 +1,5 @@
+.env
+pk.txt
+wallets/
+node_modules/
+npm-debug.log*

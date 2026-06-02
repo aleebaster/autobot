@@ -1,45 +1,79 @@
 {
-  "swapEnabled": true,
-  "activityRepetitions": 2,
+  "enableSwaps": true,
+  "activityRepetitions": 300,
   "ethRange": {
     "min": 0.00001,
-    "max": 0.00002
+    "max": 0.0001
   },
   "usdcRange": {
-    "min": 500,
+    "min": 100,
     "max": 1000
   },
   "daiRange": {
-    "min": 0.4,
+    "min": 0.3,
     "max": 0.6
   },
   "uniRange": {
     "min": 0.01,
     "max": 0.05
   },
-  "lpEnabled": true,
-  "lpRepetitions": 2,
-  "lpEthRange": {
-    "min": 0.00001,
-    "max": 0.00002
-  },
-  "shortEnabled": true,
-  "shortRepetitions": 1,
-  "shortEthRange": {
-    "min": 0.00001,
-    "max": 0.00002
-  },
-  "longEnabled": true,
-  "longRepetitions": 1,
-  "longDaiRange": {
-    "min": 0.01,
-    "max": 0.02
-  },
-  "longUniRange": {
-    "min": 0.001,
-    "max": 0.002
-  },
-  "closeEnabled": true,
-  "closeRepetitions": 1,
-  "loopHours": 22
+  "loopHours": 3,
+  "enableLong": true,
+  "enableShort": true,
+  "enableClose": true,
+  "simulateOnly": false,
+  "firstTxMode": true,
+  "defaultCollateralToken": "0x8a871311feF28B3d684Fb4F06B964603196BD4E3",
+  "marketToken": "0x7b79995e5f793A07Bc00c21412e50Ecae098E7f9",
+  "pairToken": "0x7b79995e5f793A07Bc00c21412e50Ecae098E7f9",
+  "tradeAmount": "0.333216",
+  "longTradeAmount": "0.333216",
+  "shortTradeAmount": "0.333216",
+  "swapTradeAmount": "0.01",
+  "tinyTradeAmount": "0.333216",
+  "maxTradeAmount": "0.333216",
+  "leverage": 20,
+  "slippageBps": 50,
+  "deadlineSeconds": 1200,
+  "rsiLong": 30,
+  "rsiShort": 70,
+  "cooldownSeconds": 300,
+  "maxOpenPositions": 1,
+  "longPercent": 50,
+  "shortPercent": 50,
+  "randomizeAmount": false,
+  "amountVariancePercent": 0,
+  "tradeMode": "fixed",
+  "walletPercent": 5,
+  "marketMode": "single",
+  "selectedMarkets": [],
+  "availableMarkets": [],
+  "balanceDistribution": "fixed",
+  "maxTradesPerPair": 1,
+  "maxConcurrentTrades": 1,
+  "maxExposurePerMarket": "0.333216",
+  "maxDailyTrades": 10,
+  "maxLossPerMarket": "0",
+  "cooldownPerMarket": 300,
+  "blacklistMarkets": [],
+  "autoClose": false,
+  "closePercent": 100,
+  "closeManager": "0x87dbB2A051A50a9fC82736bd98e570E81dE67A37",
+  "closePositionId": "3339",
+  "fallbackAmountOutMin": "0",
+  "maxArg6Delta": "10",
+  "activePositions": [],
+  "uiPayloadReference": null,
+  "uiLongPayloadReference": null,
+  "uiLongTxValueReference": null,
+  "uiShortPayloadReference": [
+    false,
+    "0x8a871311fef28b3d684fb4f06b964603196bd4e3",
+    "333216",
+    "0",
+    "20",
+    "161249",
+    "1780402415"
+  ],
+  "uiShortTxValueReference": "0"
 }
