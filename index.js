@@ -714,6 +714,27 @@ function canOpenMarketSide(market, side) {
   return true;
 }
 
+async function syncActivePositionsFromChain(wallet, provider) {
+  addLog("[SYNC] refreshing positions from chain...", "warn");
+  const cached = Array.isArray(tradingConfig.activePositions) ? tradingConfig.activePositions : [];
+  const live = await discoverActivePositions(wallet, provider);
+  const liveIds = new Set(live.map(position => String(position.positionId)));
+  for (const cachedPosition of cached) {
+    if (!liveIds.has(String(cachedPosition.positionId))) {
+      addLog("[SYNC] removed stale cached position", "warn");
+    }
+  }
+  tradingConfig.activePositions = live.map(position => {
+    const cachedPosition = cached.find(item => String(item.positionId) === String(position.positionId)) || {};
+    return { ...cachedPosition, ...position };
+  });
+  if (tradingConfig.activePositions.length === 0) {
+    tradingConfig.closePositionId = "";
+  }
+  saveConfig();
+  return tradingConfig.activePositions;
+}
+
 function feeAdjusted(amount, feeBps = 100n) {
   if (amount === 0n) return 0n;
   if (feeBps <= 0n) return amount;
@@ -942,16 +963,19 @@ async function validateAndSendLeveragedTx(wallet, tx, side, provider) {
   const feeParams = await getFeeParams(provider);
   const nonce = await getNextNonce(provider, wallet.address, SEPOLIA_CHAIN_ID);
   let sent;
+  if (isOpenTx) addLog("[OPEN] sending openPosition tx...", "warn");
   try {
     sent = await wallet.sendTransaction({ to: tx.to, data: tx.data, value: tx.value, gasLimit: gasEstimate + gasEstimate / 5n, nonce, ...feeParams });
   } catch (error) {
     addLog(`[${side}] sendTransaction error: ${decodeContractError(error)}`, "error");
     throw error;
   }
+  if (isOpenTx) addLog(`[OPEN] tx hash=${sent.hash}`, "warn");
   addLog(`[${side}] txHash=${sent.hash}`, "warn");
   addLog(`[${side}] Sending transaction...`, "warn");
   const receipt = await waitForTx(sent);
   if (receipt.status === 0) throw new Error(`${side} transaction reverted`);
+  if (isOpenTx) addLog("[OPEN] confirmed", "success");
   for (const log of receipt.logs) {
     try {
       const parsed = POSITION_IFACE.parseLog(log);
@@ -975,7 +999,11 @@ async function validateAndSendLeveragedTx(wallet, tx, side, provider) {
         addLog(`[${side}] active positionId=${tradingConfig.closePositionId} manager=${getShortAddress(tx.to)}`, "success");
       }
       if (parsed?.name === "MAM_PositionClosed" || parsed?.name === "MAM_PositionPartiallyClosed") {
-        addLog(`[${side}] positionId=${parsed.args.positionId.toString()} close event confirmed`, "success");
+        const closedPositionId = parsed.args.positionId.toString();
+        tradingConfig.activePositions = (tradingConfig.activePositions || []).filter(p => String(p.positionId) !== closedPositionId);
+        if (String(tradingConfig.closePositionId) === closedPositionId) tradingConfig.closePositionId = "";
+        saveConfig();
+        addLog(`[${side}] positionId=${closedPositionId} close event confirmed`, "success");
       }
     } catch {}
   }
@@ -1005,13 +1033,14 @@ async function openLeveragedPosition(side, market = null, amountOverride = null)
   const normalizedMarket = normalizeMarketConfig(market || {});
   if (side === "LONG" && !tradingConfig.enableLong) throw new Error("LONG disabled in config");
   if (side === "SHORT" && !tradingConfig.enableShort) throw new Error("SHORT disabled in config");
-  if (!canOpenMarketSide(normalizedMarket, side)) throw new Error(`[SKIP] ${side} duplicate or limit reached for ${normalizedMarket.symbol}`);
-  if ((tradingConfig.activePositions || []).length >= tradingConfig.maxOpenPositions) throw new Error(`Max open positions reached (${tradingConfig.maxOpenPositions})`);
   if (accounts.length === 0) throw new Error("No account loaded");
   const accountIndex = tradingConfig.firstTxMode ? 0 : selectedWalletIndex;
   const proxyUrl = proxies[accountIndex % proxies.length] || null;
   const provider = getProvider(SEPOLIA_RPC_URL, SEPOLIA_CHAIN_ID, proxyUrl);
   const wallet = new ethers.Wallet(accounts[accountIndex].privateKey, provider);
+  await syncActivePositionsFromChain(wallet, provider);
+  if (!canOpenMarketSide(normalizedMarket, side)) throw new Error(`[SKIP] ${side} duplicate or limit reached for ${normalizedMarket.symbol}`);
+  addLog("[OPEN] duplicate check passed", "success");
   const amount = amountOverride || (tradingConfig.firstTxMode ? tradingConfig.tinyTradeAmount : await getWalletPercentTradeAmount(wallet, provider, normalizedMarket.collateralToken, side));
   addLog(`[OPEN] ${side} ${normalizedMarket.symbol} amount=${amount}`, "warn");
   const tx = side === "LONG"
@@ -1450,15 +1479,19 @@ async function runAutoRsiTrading() {
         addLog(`[RSI] ${market.symbol} ${market.rsiSymbol}=${value.toFixed(2)}`, "info");
         const side = selectAutoSide(value);
         if (!side) continue;
-        if (!canOpenMarketSide(market, side)) {
-          addLog(`[SKIP] ${side} ${market.symbol} duplicate or limit reached`, "warn");
-          continue;
-        }
         const amount = tradingConfig.tradeMode === "walletPercent" ? null : getDistributedAmount(side, markets.length);
         lastRsiTradeAt = now;
         lastMarketTradeAt[key] = now;
         addLog(`[AUTO] Opening ${side}...`, "warn");
-        await openLeveragedPosition(side, market, amount);
+        try {
+          await openLeveragedPosition(side, market, amount);
+        } catch (error) {
+          if (String(error.message || "").startsWith("[SKIP]")) {
+            addLog(error.message, "warn");
+            continue;
+          }
+          throw error;
+        }
         if (shouldStopAutoRsiTrading()) return;
         markDailyTrade();
       }

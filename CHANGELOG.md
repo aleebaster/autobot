@@ -2,6 +2,7 @@
 
 ## 2026-06-02
 
+- Fixed full-auto open blocking by syncing positions from chain before duplicate checks and pruning stale cached positions.
 - Refactored `[1]` into `Start Full Auto Trading` for master swaps, RSI trading, ratio-based opens, auto-close monitoring, and persisted resume state.
 - Added ENTER submit and ESC cancel keybindings for config popup forms.
 - Added a dedicated `[9] Stop Auto RSI Trading` menu action with persisted stop state.
