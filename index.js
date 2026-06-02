@@ -911,6 +911,7 @@ async function ensureLeveragedApproval(wallet, token, spender, amount, nativeCol
 
 async function validateAndSendLeveragedTx(wallet, tx, side, provider) {
   const isOpenTx = tx.data.slice(0, 10) === "0xfa2b1dfd";
+  const isCloseTx = tx.data.slice(0, 10) === "0xb35648d7" || tx.data.slice(0, 10) === "0xdc439ba7";
   if (isOpenTx) {
     if (!isValidContractTarget(tx.to)) throw new Error("Invalid openPosition target/manager");
     if (tx.amountOutMin == null || BigInt(tx.amountOutMin) <= 0n) throw new Error("Refusing openPosition: amountOutMin is zero");
@@ -929,6 +930,17 @@ async function validateAndSendLeveragedTx(wallet, tx, side, provider) {
     addLog(`[RSI] target=${tx.to}`, "info");
     addLog(`[RSI] calldata=${tx.data}`, "debug");
     logUiPayloadDiff(tx, side);
+  }
+  if (isCloseTx) {
+    if (!isValidContractTarget(tx.to)) throw new Error("Invalid close target/manager");
+    const decodedClose = POSITION_IFACE.decodeFunctionData(tx.data.slice(0, 10) === "0xb35648d7" ? "closePosition" : "partialClose", tx.data);
+    addLog(`[CLOSE] manager=${tx.manager || tx.to}`, "warn");
+    addLog(`[CLOSE] target=${tx.to}`, "warn");
+    addLog(`[CLOSE] calldata=${tx.data}`, "debug");
+    addLog(`[CLOSE] arg1 positionId=${decodedClose.positionId}`, "warn");
+    if (tx.data.slice(0, 10) === "0xdc439ba7") addLog(`[CLOSE] arg2 closeBps=${decodedClose.closeBps}`, "warn");
+    addLog(`[CLOSE] amountOutMin=${decodedClose.amountOutMin}`, "warn");
+    addLog(`[CLOSE] deadline=${decodedClose.deadline}`, "warn");
   }
 
   const network = await provider.getNetwork();
@@ -957,7 +969,10 @@ async function validateAndSendLeveragedTx(wallet, tx, side, provider) {
   }
   addLog(`[${side}] to=${tx.to} value=${tx.value} amountOutMin=${tx.amountOutMin ?? "n/a"} leverage=${tx.leverage ?? "n/a"}`, "warn");
   addLog(`[${side}] data=${tx.data}`, "debug");
-  if (tradingConfig.simulateOnly) return addLog(`[${side}] simulateOnly=true, not sending.`, "success");
+  if (tradingConfig.simulateOnly) {
+    addLog(`[${side}] simulateOnly=true, not sending.`, "success");
+    return null;
+  }
   if (isOpenTx) assertUiPayloadMatch(tx, side);
   try {
     await provider.call({ from: wallet.address, to: tx.to, data: tx.data, value: tx.value });
@@ -984,12 +999,14 @@ async function validateAndSendLeveragedTx(wallet, tx, side, provider) {
   }
   if (isOpenTx) addLog(`[OPEN] tx hash=${sent.hash}`, "warn");
   if (isOpenTx) addLog(`[RSI] tx hash=${sent.hash}`, "warn");
+  if (isCloseTx) addLog(`[CLOSE] tx hash=${sent.hash}`, "warn");
   addLog(`[${side}] txHash=${sent.hash}`, "warn");
   addLog(`[${side}] Sending transaction...`, "warn");
   const receipt = await waitForTx(sent);
   if (receipt.status === 0) throw new Error(`${side} transaction reverted`);
   if (isOpenTx) addLog("[OPEN] confirmed", "success");
   if (isOpenTx) addLog(`[RSI] receipt status=${receipt.status}`, "success");
+  if (isCloseTx) addLog(`[CLOSE] receipt status=${receipt.status}`, "success");
   for (const log of receipt.logs) {
     try {
       const parsed = POSITION_IFACE.parseLog(log);
@@ -1028,6 +1045,7 @@ async function validateAndSendLeveragedTx(wallet, tx, side, provider) {
     addLog(`${side} confirmed`, "success");
   }
   addLog(`[${side}] Verify position in UI after indexer refresh.`, "success");
+  return { sent, receipt };
 }
 
 function decodeContractError(error) {
@@ -1047,6 +1065,7 @@ async function openLeveragedPosition(side, market = null, amountOverride = null)
   const normalizedMarket = normalizeMarketConfig(market || {});
   if (side === "LONG" && !tradingConfig.enableLong) throw new Error("LONG disabled in config");
   if (side === "SHORT" && !tradingConfig.enableShort) throw new Error("SHORT disabled in config");
+  if (closePending) throw new Error("[SKIP] close pending; waiting before opening new position");
   if (accounts.length === 0) throw new Error("No account loaded");
   const accountIndex = tradingConfig.firstTxMode ? 0 : selectedWalletIndex;
   const proxyUrl = proxies[accountIndex % proxies.length] || null;
@@ -1176,6 +1195,50 @@ function assertUiPayloadMatch(tx, side) {
   addLog(`[${side}] UI args vs BOT args: FULL MATCH for args 1-5, arg6 within tolerance, and tx.value. arg7 deadline may differ.`, "success");
 }
 
+async function positionStillActiveOnChain(wallet, provider, position) {
+  try {
+    const manager = position.closeTarget || position.managerAddress;
+    if (!isValidContractTarget(manager)) return false;
+    const contract = new ethers.Contract(manager, POSITION_ABI, provider);
+    const current = await contract.getPosition(position.positionId);
+    const user = String(current.user || current[1] || "");
+    if (user.toLowerCase() !== wallet.address.toLowerCase()) return false;
+    const currentDebt = BigInt(current.currentDebt ?? current[5] ?? 0n);
+    const collateralAmount = BigInt(current.collateralAmount ?? current[3] ?? 0n);
+    return collateralAmount > 0n || currentDebt > 0n;
+  } catch {
+    return false;
+  }
+}
+
+async function sendCloseAndConfirm(wallet, provider, position) {
+  if (closePending) throw new Error("Close already pending");
+  closePending = true;
+  try {
+    const target = position.closeTarget || position.managerAddress;
+    if (!isValidContractTarget(target)) throw new Error("Close target unavailable after discovery");
+    const data = buildCloseTx({ positionId: position.positionId, closePercent: tradingConfig.closePercent });
+    addLog(`[CLOSE] manager=${position.managerAddress || target}`, "warn");
+    addLog(`[CLOSE] target=${target}`, "warn");
+    addLog(`[CLOSE] calldata=${data}`, "debug");
+    addLog(`[CLOSE] sending close tx positionId=${position.positionId}...`, "warn");
+    const result = await validateAndSendLeveragedTx(wallet, { to: target, manager: position.managerAddress || target, data, value: 0n }, "CLOSE", provider);
+    if (!result || result.receipt?.status !== 1) throw new Error("Close transaction did not confirm with status=1");
+    addLog("[SYNC] refreshing positions from chain...", "warn");
+    await new Promise(resolve => setTimeout(resolve, 3000));
+    const stillActive = await positionStillActiveOnChain(wallet, provider, position);
+    if (stillActive) throw new Error(`Close tx confirmed but positionId=${position.positionId} still active on-chain`);
+    tradingConfig.activePositions = (tradingConfig.activePositions || []).filter(p => String(p.positionId) !== String(position.positionId));
+    if (String(tradingConfig.closePositionId) === String(position.positionId)) tradingConfig.closePositionId = "";
+    saveConfig();
+    await syncActivePositionsFromChain(wallet, provider);
+    addLog("position closed", "success");
+    return result;
+  } finally {
+    closePending = false;
+  }
+}
+
 async function closeLeveragedPosition() {
   if (!tradingConfig.enableClose) throw new Error("Close disabled in config");
   const provider = getProvider(SEPOLIA_RPC_URL, SEPOLIA_CHAIN_ID, proxies[selectedWalletIndex % proxies.length] || null);
@@ -1189,12 +1252,7 @@ async function closeLeveragedPosition() {
     addLog(`[CLOSE] found ${position.side}`, "warn");
     addLog(`[CLOSE] managerAddress=${position.managerAddress}`, "warn");
     addLog(`[CLOSE] target=${position.closeTarget || position.managerAddress}`, "warn");
-    if (!position.closeTarget && !position.managerAddress) throw new Error("Close target unavailable after discovery");
-    const data = buildCloseTx({ positionId: position.positionId, closePercent: tradingConfig.closePercent });
-    addLog(`[CLOSE] sending close tx positionId=${position.positionId}...`, "warn");
-    await validateAndSendLeveragedTx(wallet, { to: position.closeTarget || position.managerAddress, data, value: 0n }, "CLOSE", provider);
-    tradingConfig.activePositions = (tradingConfig.activePositions || []).filter(p => String(p.positionId) !== String(position.positionId));
-    if (String(tradingConfig.closePositionId) === String(position.positionId)) tradingConfig.closePositionId = "";
+    await sendCloseAndConfirm(wallet, provider, position);
   }
   saveConfig();
   addLog(`[CLOSE] closed ${selectedPositions.length} position(s)`, "success");
@@ -1356,6 +1414,7 @@ let rsiRunning = false;
 let fullAutoRunning = false;
 let autoCloseInterval = null;
 let dailyActivityPromise = null;
+let closePending = false;
 let lastRsiTradeAt = 0;
 let lastMarketTradeAt = {};
 let dailyTradeCounter = { day: "", count: 0 };
@@ -1401,15 +1460,11 @@ async function closeAutoPosition(position) {
   const provider = getProvider(SEPOLIA_RPC_URL, SEPOLIA_CHAIN_ID, proxies[selectedWalletIndex % proxies.length] || null);
   const wallet = new ethers.Wallet(accounts[selectedWalletIndex].privateKey, provider);
   addLog(`[AUTO] Closing position... id=${position.positionId} side=${position.side}`, "warn");
-  const data = buildCloseTx({ positionId: position.positionId, closePercent: tradingConfig.closePercent });
-  await validateAndSendLeveragedTx(wallet, { to: position.closeTarget || position.managerAddress, data, value: 0n }, "CLOSE", provider);
-  tradingConfig.activePositions = (tradingConfig.activePositions || []).filter(p => String(p.positionId) !== String(position.positionId));
-  if (String(tradingConfig.closePositionId) === String(position.positionId)) tradingConfig.closePositionId = "";
-  saveConfig();
+  await sendCloseAndConfirm(wallet, provider, position);
 }
 
 async function runAutoCloseCycle() {
-  if (!fullAutoRunning || accounts.length === 0) return;
+  if (!fullAutoRunning || closePending || accounts.length === 0) return;
   try {
     const provider = getProvider(SEPOLIA_RPC_URL, SEPOLIA_CHAIN_ID, proxies[selectedWalletIndex % proxies.length] || null);
     const wallet = new ethers.Wallet(accounts[selectedWalletIndex].privateKey, provider);
