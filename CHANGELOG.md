@@ -2,6 +2,7 @@
 
 ## 2026-06-02
 
+- Refactored `[1]` into `Start Full Auto Trading` for master swaps, RSI trading, ratio-based opens, auto-close monitoring, and persisted resume state.
 - Added ENTER submit and ESC cancel keybindings for config popup forms.
 - Added a dedicated `[9] Stop Auto RSI Trading` menu action with persisted stop state.
 - Added `rsiRunning` duplicate-session protection, RUNNING/STOPPED logs, and dynamic Auto RSI status text.

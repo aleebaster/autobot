@@ -76,5 +76,6 @@
     "1780402415"
   ],
   "uiShortTxValueReference": "0",
-  "autoRSIEnabled": false
+  "autoRSIEnabled": false,
+  "fullAutoEnabled": false
 }
