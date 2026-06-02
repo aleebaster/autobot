@@ -664,8 +664,24 @@ async function waitForTx(tx, timeoutMs = 120000) {
   const timeoutPromise = new Promise((_, reject) =>
     setTimeout(() => reject(new Error("Transaction confirmation timed out")), timeoutMs)
   );
-  const receipt = await Promise.race([tx.wait(), timeoutPromise]);
-  if (receipt.status === 0) throw new Error("Transaction reverted");
+  let receipt;
+  try {
+    receipt = await Promise.race([tx.wait(), timeoutPromise]);
+  } catch (error) {
+    receipt = error?.receipt || error?.transactionReceipt;
+    if (receipt) {
+      addLog(`[FAIL] tx hash=${receipt.hash || tx.hash}`, "error");
+      addLog(`[FAIL] receipt status=${receipt.status}`, "error");
+      addLog(`[FAIL] gasUsed=${receipt.gasUsed}`, "error");
+    }
+    throw error;
+  }
+  if (receipt.status !== 1) {
+    addLog(`[FAIL] tx hash=${receipt.hash || tx.hash}`, "error");
+    addLog(`[FAIL] receipt status=${receipt.status}`, "error");
+    addLog(`[FAIL] gasUsed=${receipt.gasUsed}`, "error");
+    throw new Error("Transaction reverted");
+  }
   return receipt;
 }
 
@@ -1043,50 +1059,53 @@ async function validateAndSendLeveragedTx(wallet, tx, side, provider) {
   addLog(`[${side}] txHash=${sent.hash}`, "warn");
   addLog(`[${side}] Sending transaction...`, "warn");
   const receipt = await waitForTx(sent);
-  if (receipt.status === 0) throw new Error(`${side} transaction reverted`);
-  if (isOpenTx) addLog("[OPEN] confirmed", "success");
+  if (receipt.status !== 1) throw new Error(`${side} transaction reverted`);
   if (isOpenTx) addLog(`[RSI] receipt status=${receipt.status}`, "success");
   if (isOpenTx && side === "LONG") addLog(`[LONG] receipt status=${receipt.status}`, "success");
   if (isCloseTx) addLog(`[CLOSE] receipt status=${receipt.status}`, "success");
+  let openedPositionId = null;
   for (const log of receipt.logs) {
     try {
       const parsed = POSITION_IFACE.parseLog(log);
       if (parsed?.name === "MAM_PositionCreated" || parsed?.name === "MAM_LoopPositionCreated") {
-        tradingConfig.closeManager = tx.to;
-        tradingConfig.closePositionId = parsed.args.positionId.toString();
-        tradingConfig.enableClose = true;
-        tradingConfig.activePositions = (tradingConfig.activePositions || []).filter(p => String(p.positionId) !== tradingConfig.closePositionId);
-        tradingConfig.activePositions.push({
-          side,
-          positionId: tradingConfig.closePositionId,
-          managerAddress: tx.manager || tx.to,
-          symbol: tx.symbol || side,
-          marketToken: tx.marketToken || tradingConfig.marketToken,
-          collateralToken: tx.collateralToken,
-          closeTarget: tx.manager || tx.to,
-          openTarget: tx.to,
-          txHash: sent.hash,
-          openedAt: Math.floor(Date.now() / 1000)
-        });
-        saveConfig();
-        addLog(`[${side}] active positionId=${tradingConfig.closePositionId} manager=${getShortAddress(tx.to)}`, "success");
+        openedPositionId = parsed.args.positionId.toString();
       }
       if (parsed?.name === "MAM_PositionClosed" || parsed?.name === "MAM_PositionPartiallyClosed") {
         const closedPositionId = parsed.args.positionId.toString();
-        tradingConfig.activePositions = (tradingConfig.activePositions || []).filter(p => String(p.positionId) !== closedPositionId);
-        if (String(tradingConfig.closePositionId) === closedPositionId) tradingConfig.closePositionId = "";
-        saveConfig();
         addLog(`[${side}] positionId=${closedPositionId} close event confirmed`, "success");
       }
     } catch {}
   }
+  if (isOpenTx) {
+    if (!openedPositionId) throw new Error(`${side} receipt confirmed but no PositionCreated event was found`);
+    await waitForOpenPositionOnChain(wallet, provider, tx, side, openedPositionId);
+    tradingConfig.closeManager = tx.manager || tx.to;
+    tradingConfig.closePositionId = openedPositionId;
+    tradingConfig.enableClose = true;
+    tradingConfig.activePositions = (tradingConfig.activePositions || []).filter(p => String(p.positionId) !== openedPositionId);
+    tradingConfig.activePositions.push({
+      side,
+      positionId: openedPositionId,
+      managerAddress: tx.manager || tx.to,
+      symbol: tx.symbol || side,
+      marketToken: tx.marketToken || tradingConfig.marketToken,
+      collateralToken: tx.collateralToken,
+      closeTarget: tx.manager || tx.to,
+      openTarget: tx.to,
+      txHash: sent.hash,
+      openedAt: Math.floor(Date.now() / 1000)
+    });
+    saveConfig();
+    addLog("[OPEN] confirmed", "success");
+    addLog(`[${side}] active positionId=${openedPositionId} manager=${getShortAddress(tx.manager || tx.to)}`, "success");
+  }
   addLog(`[${side}] receipt status=${receipt.status} block=${receipt.blockNumber}`, "success");
   if (side === "LONG" || side === "SHORT") {
-    addLog(`${side} opened`, "success");
+    if (isOpenTx) addLog(`[SUCCESS] ${side} opened`, "success");
   } else {
     addLog(`${side} confirmed`, "success");
   }
-  addLog(`[${side}] Verify position in UI after indexer refresh.`, "success");
+  if (isOpenTx) addLog(`[${side}] on-chain position verified; check Nemesis UI after indexer refresh.`, "success");
   return { sent, receipt };
 }
 
@@ -1103,6 +1122,38 @@ function decodeContractError(error) {
     }
   }
   return error.reason || error.shortMessage || error.message;
+}
+
+async function getVerifiedPosition(wallet, provider, manager, positionId) {
+  if (!isValidContractTarget(manager) || !positionId) return null;
+  try {
+    const contract = new ethers.Contract(manager, POSITION_ABI, provider);
+    const position = await contract.getPosition(positionId);
+    const user = String(position.user || position[1] || "");
+    if (user.toLowerCase() !== wallet.address.toLowerCase()) return null;
+    const collateralAmount = BigInt(position.collateralAmount ?? position[3] ?? 0n);
+    const currentDebt = BigInt(position.currentDebt ?? position[5] ?? 0n);
+    if (collateralAmount === 0n && currentDebt === 0n) return null;
+    return position;
+  } catch {
+    return null;
+  }
+}
+
+async function waitForOpenPositionOnChain(wallet, provider, tx, side, positionId) {
+  addLog("[SYNC] refreshing positions from chain...", "warn");
+  const manager = tx.manager || tx.to;
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    const position = await getVerifiedPosition(wallet, provider, manager, positionId);
+    if (position) {
+      const isLong = Boolean(position.isLong ?? position[0]);
+      if ((side === "LONG" && !isLong) || (side === "SHORT" && isLong)) throw new Error(`Position side mismatch for positionId=${positionId}`);
+      addLog(`[SUCCESS] ${side} position verified on-chain positionId=${positionId}`, "success");
+      return position;
+    }
+    await new Promise(resolve => setTimeout(resolve, 2000));
+  }
+  throw new Error(`${side} receipt confirmed but positionId=${positionId} was not active on-chain`);
 }
 
 async function openLeveragedPosition(side, market = null, amountOverride = null) {
@@ -1245,6 +1296,10 @@ async function positionStillActiveOnChain(wallet, provider, position) {
     const manager = position.closeTarget || position.managerAddress;
     if (!isValidContractTarget(manager)) return false;
     const contract = new ethers.Contract(manager, POSITION_ABI, provider);
+    try {
+      const ids = (await contract.getUserPositions(wallet.address)).map(value => String(value));
+      if (!ids.includes(String(position.positionId))) return false;
+    } catch {}
     const current = await contract.getPosition(position.positionId);
     const user = String(current.user || current[1] || "");
     if (user.toLowerCase() !== wallet.address.toLowerCase()) return false;
@@ -1254,6 +1309,19 @@ async function positionStillActiveOnChain(wallet, provider, position) {
   } catch {
     return false;
   }
+}
+
+async function waitForClosedPositionOnChain(wallet, provider, position) {
+  addLog("[SYNC] refreshing positions from chain...", "warn");
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    const stillActive = await positionStillActiveOnChain(wallet, provider, position);
+    if (!stillActive) {
+      addLog(`[SUCCESS] positionId=${position.positionId} closed on-chain`, "success");
+      return;
+    }
+    await new Promise(resolve => setTimeout(resolve, 2000));
+  }
+  throw new Error(`Close tx confirmed but positionId=${position.positionId} still active on-chain`);
 }
 
 async function sendCloseAndConfirm(wallet, provider, position) {
@@ -1269,10 +1337,7 @@ async function sendCloseAndConfirm(wallet, provider, position) {
     addLog(`[CLOSE] sending close tx positionId=${position.positionId}...`, "warn");
     const result = await validateAndSendLeveragedTx(wallet, { to: target, manager: position.managerAddress || target, data, value: 0n }, "CLOSE", provider);
     if (!result || result.receipt?.status !== 1) throw new Error("Close transaction did not confirm with status=1");
-    addLog("[SYNC] refreshing positions from chain...", "warn");
-    await new Promise(resolve => setTimeout(resolve, 3000));
-    const stillActive = await positionStillActiveOnChain(wallet, provider, position);
-    if (stillActive) throw new Error(`Close tx confirmed but positionId=${position.positionId} still active on-chain`);
+    await waitForClosedPositionOnChain(wallet, provider, position);
     tradingConfig.activePositions = (tradingConfig.activePositions || []).filter(p => String(p.positionId) !== String(position.positionId));
     if (String(tradingConfig.closePositionId) === String(position.positionId)) tradingConfig.closePositionId = "";
     saveConfig();

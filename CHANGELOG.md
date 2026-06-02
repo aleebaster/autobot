@@ -2,6 +2,7 @@
 
 ## 2026-06-02
 
+- Removed false open/close success by requiring receipt status plus refreshed on-chain position verification before state updates.
 - Added in-memory side-specific bad-market blacklist and health scoring so reverting markets do not stop full-auto.
 - Added hard swap quote guards so zero-output quotes are skipped before approval or transaction send.
 - Fixed leveraged open target selection to use the Nemesis pool address and added LONG revert diagnostics.
