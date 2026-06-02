@@ -2,6 +2,7 @@
 
 ## 2026-06-02
 
+- Hardened LONG/SHORT opens with strict manager, calldata, and non-zero quote validation plus RSI market debug logs.
 - Fixed full-auto open blocking by syncing positions from chain before duplicate checks and pruning stale cached positions.
 - Refactored `[1]` into `Start Full Auto Trading` for master swaps, RSI trading, ratio-based opens, auto-close monitoring, and persisted resume state.
 - Added ENTER submit and ESC cancel keybindings for config popup forms.

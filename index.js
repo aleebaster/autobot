@@ -692,6 +692,10 @@ function normalizeMarketConfig(market = {}) {
   };
 }
 
+function isValidContractTarget(target) {
+  return ethers.isAddress(target) && target !== ZERO_ADDRESS;
+}
+
 function getPositionMarketKey(position) {
   return String(position.symbol || `${position.marketToken || ""}:${position.collateralToken || ""}`).toLowerCase();
 }
@@ -780,9 +784,9 @@ async function getLeveragedContext(provider, collateralToken, marketTokenArg = n
   addLog(`poolKey=${tokenA}/${tokenB}`, "info");
   const factory = new ethers.Contract(LEVERAGED_FACTORY, FACTORY_ABI, provider);
   const pool = await factory.getPool(tokenA, tokenB);
-  if (!pool || pool === ZERO_ADDRESS) throw new Error(`No leveraged pool for ${collateral}/${pairToken}`);
+  if (!isValidContractTarget(pool)) throw new Error(`No leveraged pool for ${collateral}/${pairToken}`);
   const manager = await factory.getManager(pool);
-  if (!manager || manager === ZERO_ADDRESS) throw new Error(`No leveraged manager for pool ${pool}`);
+  if (!isValidContractTarget(manager)) throw new Error(`No leveraged manager for pool ${pool}`);
   return { collateral, marketToken, pairToken, pool, manager, path: [collateral, marketToken] };
 }
 
@@ -812,13 +816,14 @@ async function quoteLeveragedAmountOutMin(provider, { pool, manager, collateralT
   const reserve1 = BigInt(reserves[1]);
   const effectiveCollateral = feeAdjusted(collateralAmount, BigInt(protocolFeeBps));
   const collateralLp = collateralAsLp({ collateralToken, collateralAmount: effectiveCollateral, reserve0, reserve1, totalSupply, token0, oraclePrice0: BigInt(oraclePrice[0]) });
-  if (collateralLp === 0n) return 0n;
+  if (collateralLp === 0n) throw new Error("Leveraged quoteOut is zero");
   let lpBorrowAmount = collateralLp * BigInt(Math.floor(10000 * Math.max(0, lev - 1))) / BPS;
   const maxByLtv = BigInt(ltvBps) >= BPS ? lpBorrowAmount : collateralLp * BigInt(ltvBps) / (BPS - BigInt(ltvBps));
   if (lpBorrowAmount > maxByLtv) lpBorrowAmount = maxByLtv;
   if (lpBorrowAmount > BigInt(availableLiquidity)) lpBorrowAmount = BigInt(availableLiquidity);
   const amountOutMinRaw = lpBorrowToExpectedOut({ lpBorrowAmount, collateralToken, reserve0, reserve1, totalSupply, token0, swapFeeBps: BigInt(swapFeeBps) });
   const amountOutMinFinal = applySlippage(amountOutMinRaw);
+  if (amountOutMinRaw <= 0n || amountOutMinFinal <= 0n) throw new Error("Leveraged amountOutMin is zero");
   if (!isLong) {
     addLog(`shortQuoteInput=${lpBorrowAmount}`, "info");
     addLog(`shortQuoteOutput=${amountOutMinRaw}`, "info");
@@ -848,11 +853,11 @@ async function buildLeveragedTx(provider, isLong, amount, token, leverage, deadl
     isLong,
     quotePath: context.path
   }).catch(error => {
-    addLog(`Leveraged quote failed: ${error.message}. Using fallback amountOutMin=${tradingConfig.fallbackAmountOutMin}`, "warn");
-    return BigInt(tradingConfig.fallbackAmountOutMin || "0");
+    throw new Error(`Leveraged quote failed: ${error.message}`);
   });
+  if (amountOutMin <= 0n) throw new Error("Leveraged amountOutMin is zero");
   const data = POSITION_IFACE.encodeFunctionData("openPosition", [isLong, context.collateral, collateralAmount, 0n, encodedLeverage, amountOutMin, BigInt(deadline)]);
-  return { to: context.manager, data, value: 0n, nativeCollateral, collateralToken: context.collateral, marketToken: context.marketToken, symbol: normalizedMarket.symbol, collateralAmount, leverage: encodedLeverage, amountOutMin };
+  return { to: context.manager, manager: context.manager, pool: context.pool, data, value: 0n, nativeCollateral, collateralToken: context.collateral, marketToken: context.marketToken, symbol: normalizedMarket.symbol, collateralAmount, leverage: encodedLeverage, amountOutMin };
 }
 
 function buildLongTx(amount, token = tradingConfig.defaultCollateralToken, leverage = tradingConfig.leverage, deadline = Math.floor(Date.now() / 1000) + tradingConfig.deadlineSeconds, providerArg, market = null) {
@@ -907,6 +912,9 @@ async function ensureLeveragedApproval(wallet, token, spender, amount, nativeCol
 async function validateAndSendLeveragedTx(wallet, tx, side, provider) {
   const isOpenTx = tx.data.slice(0, 10) === "0xfa2b1dfd";
   if (isOpenTx) {
+    if (!isValidContractTarget(tx.to)) throw new Error("Invalid openPosition target/manager");
+    if (tx.amountOutMin == null || BigInt(tx.amountOutMin) <= 0n) throw new Error("Refusing openPosition: amountOutMin is zero");
+    if (tx.collateralAmount == null || BigInt(tx.collateralAmount) <= 0n) throw new Error("Refusing openPosition: collateral amount is zero");
     const decoded = POSITION_IFACE.decodeFunctionData("openPosition", tx.data);
     addLog(`[${side}] arg1 side=${decoded.isLong ? 1 : 0}`, "warn");
     addLog(`[${side}] arg2 token=${decoded.collateralToken}`, "warn");
@@ -916,6 +924,10 @@ async function validateAndSendLeveragedTx(wallet, tx, side, provider) {
     addLog(`[${side}] arg6 amountOutMin=${decoded.amountOutMin}`, "warn");
     addLog(`[${side}] arg7 deadline=${decoded.deadline}`, "warn");
     addLog(`[${side}] tx.value=${tx.value}`, "warn");
+    addLog(`[RSI] market=${tx.symbol || "unknown"}`, "info");
+    addLog(`[RSI] manager=${tx.manager || tx.to}`, "info");
+    addLog(`[RSI] target=${tx.to}`, "info");
+    addLog(`[RSI] calldata=${tx.data}`, "debug");
     logUiPayloadDiff(tx, side);
   }
 
@@ -971,11 +983,13 @@ async function validateAndSendLeveragedTx(wallet, tx, side, provider) {
     throw error;
   }
   if (isOpenTx) addLog(`[OPEN] tx hash=${sent.hash}`, "warn");
+  if (isOpenTx) addLog(`[RSI] tx hash=${sent.hash}`, "warn");
   addLog(`[${side}] txHash=${sent.hash}`, "warn");
   addLog(`[${side}] Sending transaction...`, "warn");
   const receipt = await waitForTx(sent);
   if (receipt.status === 0) throw new Error(`${side} transaction reverted`);
   if (isOpenTx) addLog("[OPEN] confirmed", "success");
+  if (isOpenTx) addLog(`[RSI] receipt status=${receipt.status}`, "success");
   for (const log of receipt.logs) {
     try {
       const parsed = POSITION_IFACE.parseLog(log);
@@ -1270,13 +1284,15 @@ async function discoverActivePositions(wallet, provider) {
 
 async function discoverAvailableMarkets(provider) {
   const factory = new ethers.Contract(LEVERAGED_FACTORY, FACTORY_ABI, provider);
-  const configured = Array.isArray(tradingConfig.availableMarkets) && tradingConfig.availableMarkets.length > 0
-    ? tradingConfig.availableMarkets
-    : MARKET_CANDIDATES;
+  const configured = [...MARKET_CANDIDATES, ...(Array.isArray(tradingConfig.availableMarkets) ? tradingConfig.availableMarkets : [])];
   const blacklist = new Set((tradingConfig.blacklistMarkets || []).map(item => String(item).toLowerCase()));
   const found = [];
+  const seen = new Set();
   for (const candidate of configured.map(normalizeMarketConfig)) {
     const key = candidate.symbol.toLowerCase();
+    const marketKey = `${String(candidate.marketToken).toLowerCase()}:${String(candidate.collateralToken).toLowerCase()}`;
+    if (seen.has(marketKey)) continue;
+    seen.add(marketKey);
     if (blacklist.has(key) || blacklist.has(String(candidate.marketToken).toLowerCase()) || blacklist.has(String(candidate.collateralToken).toLowerCase())) {
       addLog(`[SKIP] blacklisted market ${candidate.symbol}`, "warn");
       continue;
@@ -1287,12 +1303,13 @@ async function discoverAvailableMarkets(provider) {
       if (collateral.toLowerCase() === marketToken.toLowerCase()) throw new Error("collateral equals market token");
       const [tokenA, tokenB] = sortTokenPair(collateral, marketToken);
       const pool = await factory.getPool(tokenA, tokenB);
-      if (!pool || pool === ZERO_ADDRESS) throw new Error("pool not found");
+      if (!isValidContractTarget(pool)) throw new Error("pool not found");
       const manager = await factory.getManager(pool);
-      if (!manager || manager === ZERO_ADDRESS) throw new Error("manager not found");
+      if (!isValidContractTarget(manager)) throw new Error("manager not found");
       const contract = new ethers.Contract(manager, POSITION_ABI, provider);
       const liquidity = await contract.getAvailableLiquidity().catch(() => 0n);
       if (BigInt(liquidity) <= 0n) throw new Error("no leverage liquidity");
+      addLog(`[MARKET] ${candidate.symbol} pool=${getShortAddress(pool)} manager=${getShortAddress(manager)} liquidity=${liquidity}`, "info");
       found.push({ ...candidate, collateralToken: collateral, marketToken, pool, managerAddress: manager, liquidity: liquidity.toString(), isActive: true });
     } catch (error) {
       addLog(`[SKIP] market ${candidate.symbol}: ${error.message}`, "warn");
@@ -1490,7 +1507,8 @@ async function runAutoRsiTrading() {
             addLog(error.message, "warn");
             continue;
           }
-          throw error;
+          addLog(`[RSI] open failed for ${market.symbol}: ${decodeContractError(error)}`, "error");
+          continue;
         }
         if (shouldStopAutoRsiTrading()) return;
         markDailyTrade();
