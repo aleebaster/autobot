@@ -2,6 +2,8 @@
 
 ## 2026-06-02
 
+- Added a dedicated `[9] Stop Auto RSI Trading` menu action with persisted stop state.
+- Added `rsiRunning` duplicate-session protection, RUNNING/STOPPED logs, and dynamic Auto RSI status text.
 - Added multi-market trading configuration for single, selected, and all-market RSI modes.
 - Added market discovery from Nemesis leveraged factory pools with inactive/broken market skips.
 - Added per-market duplicate prevention, cooldowns, daily trade limits, and concurrent trade limits.

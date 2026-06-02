@@ -196,7 +196,8 @@ let tradingConfig = {
   uiLongPayloadReference: null,
   uiLongTxValueReference: null,
   uiShortPayloadReference: null,
-  uiShortTxValueReference: null
+  uiShortTxValueReference: null,
+  autoRSIEnabled: false
 };
 
 function loadConfig() {
@@ -266,6 +267,7 @@ function loadConfig() {
       tradingConfig.uiLongTxValueReference = cfg.uiLongTxValueReference == null ? null : String(cfg.uiLongTxValueReference);
       tradingConfig.uiShortPayloadReference = Array.isArray(cfg.uiShortPayloadReference) ? cfg.uiShortPayloadReference : null;
       tradingConfig.uiShortTxValueReference = cfg.uiShortTxValueReference == null ? null : String(cfg.uiShortTxValueReference);
+      tradingConfig.autoRSIEnabled = cfg.autoRSIEnabled === true;
     } else {
       addLog("No config file found, using default settings.", "info");
     }
@@ -1302,9 +1304,41 @@ async function fetchRsi(symbol = "ETHUSDT") {
 }
 
 let rsiTradingInterval = null;
+let rsiRunning = false;
 let lastRsiTradeAt = 0;
 let lastMarketTradeAt = {};
 let dailyTradeCounter = { day: "", count: 0 };
+
+function finishAutoRsiTrading() {
+  if (rsiTradingInterval) clearInterval(rsiTradingInterval);
+  rsiTradingInterval = null;
+  rsiRunning = false;
+  tradingConfig.autoRSIEnabled = false;
+  saveConfig();
+  updateStatus();
+  addLog("[RSI] Status=STOPPED", "success");
+  addLog("[RSI] Auto RSI stopped.", "success");
+}
+
+function requestStopAutoRsiTrading() {
+  if (!rsiRunning && !rsiTradingInterval) {
+    addLog("[RSI] Auto RSI stopped.", "warn");
+    return;
+  }
+  rsiRunning = false;
+  tradingConfig.autoRSIEnabled = false;
+  saveConfig();
+  updateStatus();
+  addLog("[RSI] Stop signal sent...", "warn");
+  addLog("[RSI] Waiting current iteration to finish...", "warn");
+}
+
+function shouldStopAutoRsiTrading() {
+  if (rsiRunning) return false;
+  addLog("[RSI] Stop requested.", "warn");
+  finishAutoRsiTrading();
+  return true;
+}
 
 function markDailyTrade() {
   const day = new Date().toISOString().slice(0, 10);
@@ -1326,17 +1360,25 @@ function getDistributedAmount(side, marketsCount) {
 }
 
 async function runAutoRsiTrading() {
-  if (rsiTradingInterval) return addLog("Auto RSI trading already running.", "warn");
-  addLog(`[RSI] Starting Auto RSI Trading mode=${tradingConfig.marketMode}.`, "info");
+  if (rsiRunning || rsiTradingInterval) return addLog("[RSI] Auto RSI already running.", "warn");
+  rsiRunning = true;
+  tradingConfig.autoRSIEnabled = true;
+  saveConfig();
+  updateStatus();
+  addLog(`[RSI] Starting Auto RSI Trading mode=${tradingConfig.marketMode}`, "info");
+  addLog("[RSI] Status=RUNNING", "success");
   rsiTradingInterval = setInterval(async () => {
     try {
+      if (shouldStopAutoRsiTrading()) return;
       const now = Date.now();
       if (now - lastRsiTradeAt < tradingConfig.cooldownSeconds * 1000) return;
       if (dailyTradeLimitReached()) return addLog(`[SKIP] maxDailyTrades reached (${tradingConfig.maxDailyTrades})`, "warn");
+      if (shouldStopAutoRsiTrading()) return;
       const provider = getProvider(SEPOLIA_RPC_URL, SEPOLIA_CHAIN_ID, proxies[selectedWalletIndex % proxies.length] || null);
       const markets = await resolveTradingMarkets(provider);
       if (markets.length === 0) return addLog("[MARKET] no active markets available", "warn");
       for (const market of markets) {
+        if (shouldStopAutoRsiTrading()) return;
         if (dailyTradeLimitReached()) break;
         const key = getPositionMarketKey(market);
         if (now - (lastMarketTradeAt[key] || 0) < tradingConfig.cooldownPerMarket * 1000) {
@@ -1344,6 +1386,7 @@ async function runAutoRsiTrading() {
           continue;
         }
         const value = await fetchRsi(market.rsiSymbol);
+        if (shouldStopAutoRsiTrading()) return;
         addLog(`[RSI] ${market.symbol} ${market.rsiSymbol}=${value.toFixed(2)}`, "info");
         let side = null;
         if (value < tradingConfig.rsiLong && tradingConfig.enableLong) side = "LONG";
@@ -1357,12 +1400,12 @@ async function runAutoRsiTrading() {
         lastRsiTradeAt = now;
         lastMarketTradeAt[key] = now;
         await openLeveragedPosition(side, market, amount);
+        if (shouldStopAutoRsiTrading()) return;
         markDailyTrade();
       }
     } catch (error) {
       addLog(`Auto RSI trading failed: ${error.message}. Stopping RSI mode.`, "error");
-      clearInterval(rsiTradingInterval);
-      rsiTradingInterval = null;
+      finishAutoRsiTrading();
     }
   }, 60000);
 }
@@ -1579,8 +1622,8 @@ const menuBox = blessed.list({
     item: { fg: "white" }
   },
   items:   isCycleRunning
-    ? ["[1] Stop Activity", "[2] Open LONG Now", "[3] Open SHORT Now", "[4] Close Position", "[5] Auto RSI Trading", "[6] Set Manual Config", "[7] Refresh Wallet", "[8] Exit"]
-    : ["[1] Start Auto Daily Activity", "[2] Open LONG Now", "[3] Open SHORT Now", "[4] Close Position", "[5] Auto RSI Trading", "[6] Set Manual Config", "[7] Refresh Wallet", "[8] Exit"],
+    ? ["[1] Stop Activity", "[2] Open LONG Now", "[3] Open SHORT Now", "[4] Close Position", "[5] Auto RSI Trading", "[6] Set Manual Config", "[7] Refresh Wallet", "[8] Exit", "[9] Stop Auto RSI Trading"]
+    : ["[1] Start Auto Daily Activity", "[2] Open LONG Now", "[3] Open SHORT Now", "[4] Close Position", "[5] Auto RSI Trading", "[6] Set Manual Config", "[7] Refresh Wallet", "[8] Exit", "[9] Stop Auto RSI Trading"],
   padding: { left: 1, top: 1 }
 });
 
@@ -1760,6 +1803,8 @@ function updateStatus() {
     const isProcessing = activityRunning || (isCycleRunning && dailyActivityInterval !== null);
     const status = activityRunning
       ? `${loadingSpinner[spinnerIndex]} ${chalk.yellowBright("Running")}`
+      : rsiRunning
+      ? chalk.yellowBright("Auto RSI Running")
       : isCycleRunning && dailyActivityInterval !== null
       ? `${loadingSpinner[spinnerIndex]} ${chalk.yellowBright("Waiting next cycle")}`
       : chalk.green("Idle");
@@ -1770,7 +1815,7 @@ function updateStatus() {
       `Loop: ${dailyActivityConfig.loopHours}h | NEMESIS TESTNET AUTO BOT`
     );
 
-    if (isProcessing) {
+    if (isProcessing || rsiRunning) {
       if (blinkCounter % 1 === 0) {
         statusBox.style.border.fg = borderBlinkColors[borderBlinkIndex];
         borderBlinkIndex = (borderBlinkIndex + 1) % borderBlinkColors.length;
@@ -1819,8 +1864,8 @@ function updateMenu() {
   try {
     menuBox.setItems(
       isCycleRunning
-        ? ["[1] Stop Activity", "[2] Open LONG Now", "[3] Open SHORT Now", "[4] Close Position", "[5] Auto RSI Trading", "[6] Set Manual Config", "[7] Refresh Wallet", "[8] Exit"]
-        : ["[1] Start Auto Daily Activity", "[2] Open LONG Now", "[3] Open SHORT Now", "[4] Close Position", "[5] Auto RSI Trading", "[6] Set Manual Config", "[7] Refresh Wallet", "[8] Exit"]
+        ? ["[1] Stop Activity", "[2] Open LONG Now", "[3] Open SHORT Now", "[4] Close Position", "[5] Auto RSI Trading", "[6] Set Manual Config", "[7] Refresh Wallet", "[8] Exit", "[9] Stop Auto RSI Trading"]
+        : ["[1] Start Auto Daily Activity", "[2] Open LONG Now", "[3] Open SHORT Now", "[4] Close Position", "[5] Auto RSI Trading", "[6] Set Manual Config", "[7] Refresh Wallet", "[8] Exit", "[9] Stop Auto RSI Trading"]
     );
     safeRender();
   } catch (error) {
@@ -1955,6 +2000,10 @@ menuBox.on("select", async (item) => {
       await runAutoRsiTrading();
       break;
 
+    case "[9] Stop Auto RSI Trading":
+      requestStopAutoRsiTrading();
+      break;
+
     case "[6] Set Manual Config":
     case "Set Manual Config":
       menuBox.hide();
@@ -1983,6 +2032,9 @@ menuBox.on("select", async (item) => {
     case "Exit":
       clearInterval(statusInterval);
       if (rsiTradingInterval) clearInterval(rsiTradingInterval);
+      rsiRunning = false;
+      tradingConfig.autoRSIEnabled = false;
+      saveConfig();
       process.exit(0);
   }
 });
@@ -2235,6 +2287,10 @@ dailyActivitySubMenu.key(["escape"], () => {
 screen.key(["escape", "q", "C-c"], () => {
   addLog("Exiting application", "info");
   clearInterval(statusInterval);
+  if (rsiTradingInterval) clearInterval(rsiTradingInterval);
+  rsiRunning = false;
+  tradingConfig.autoRSIEnabled = false;
+  saveConfig();
   process.exit(0);
 });
 
@@ -2242,6 +2298,11 @@ async function initialize() {
   try {
     startupGitSync();
     loadConfig();
+    if (tradingConfig.autoRSIEnabled) {
+      addLog("[RSI] Previous session detected but auto restart disabled.", "warn");
+      tradingConfig.autoRSIEnabled = false;
+      saveConfig();
+    }
     loadAccounts();
     loadProxies();
     updateStatus();
