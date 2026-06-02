@@ -842,7 +842,7 @@ async function getCollateralDecimals(provider, token, nativeCollateral) {
 
 async function quoteLeveragedAmountOutMin(provider, { pool, manager, collateralToken, collateralAmount, leverage, isLong, quotePath }) {
   const encodedLev = Number(leverage);
-  const lev = isLong ? encodedLev : encodedLev / 10;
+  const lev = encodedLev / 10;
   if (!Number.isFinite(lev) || lev <= 1) return 0n;
   const poolContract = new ethers.Contract(pool, POOL_ABI, provider);
   const managerContract = new ethers.Contract(manager, POSITION_ABI, provider);
@@ -901,7 +901,7 @@ async function buildLeveragedTx(provider, isLong, amount, token, leverage, deadl
   });
   if (amountOutMin <= 0n) throw new Error("Leveraged amountOutMin is zero");
   const data = POSITION_IFACE.encodeFunctionData("openPosition", [isLong, context.collateral, collateralAmount, 0n, encodedLeverage, amountOutMin, BigInt(deadline)]);
-  return { to: context.pool, manager: context.manager, pool: context.pool, data, value: 0n, nativeCollateral, collateralToken: context.collateral, marketToken: context.marketToken, symbol: normalizedMarket.symbol, collateralAmount, leverage: encodedLeverage, amountOutMin };
+  return { to: context.manager, manager: context.manager, pool: context.pool, data, value: 0n, nativeCollateral, collateralToken: context.collateral, marketToken: context.marketToken, symbol: normalizedMarket.symbol, collateralAmount, leverage: encodedLeverage, amountOutMin };
 }
 
 function buildLongTx(amount, token = tradingConfig.defaultCollateralToken, leverage = tradingConfig.leverage, deadline = Math.floor(Date.now() / 1000) + tradingConfig.deadlineSeconds, providerArg, market = null) {
@@ -958,7 +958,7 @@ async function validateAndSendLeveragedTx(wallet, tx, side, provider) {
   const isCloseTx = tx.data.slice(0, 10) === "0xb35648d7" || tx.data.slice(0, 10) === "0xdc439ba7";
   if (isOpenTx) {
     if (!isValidContractTarget(tx.to)) throw new Error("Invalid openPosition target/manager");
-    if (String(tx.to).toLowerCase() === NEMESIS_ROUTER.toLowerCase()) throw new Error("Invalid openPosition target: swap router selected instead of leveraged pool");
+    if (String(tx.to).toLowerCase() === NEMESIS_ROUTER.toLowerCase()) throw new Error("Invalid openPosition target: swap router selected instead of leveraged manager");
     if (tx.amountOutMin == null || BigInt(tx.amountOutMin) <= 0n) throw new Error("Refusing openPosition: amountOutMin is zero");
     if (tx.collateralAmount == null || BigInt(tx.collateralAmount) <= 0n) throw new Error("Refusing openPosition: collateral amount is zero");
     const decoded = POSITION_IFACE.decodeFunctionData("openPosition", tx.data);

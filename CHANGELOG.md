@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-06-03
+
+- Fixed leveraged open routing to send `openPosition` to the manager contract; Sepolia preflight proved the pool target reverts while the same calldata succeeds on the manager.
+- Fixed LONG quote calculation so `amountOutMin` uses the contract's leverage scale consistently with SHORT; the previous LONG quote exceeded the contract's real output threshold and reverted with selector `0x499ad952`.
+- Verified live LONG and SHORT open/close receipts on Sepolia with manager target, runtime-scaled quotes, and zeroed `getPosition` state after close.
+
 ## 2026-06-02
 
 - Removed false open/close success by requiring receipt status plus refreshed on-chain position verification before state updates.
