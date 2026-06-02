@@ -86,6 +86,14 @@ const POSITION_ABI = [
   "error MAM_ZeroBorrow()",
   "error MAM_ZeroCollateral()",
   "error MAM_ExceedsLTV()",
+  "error MAM_Forbidden()",
+  "error MAM_InvalidCollateralValue()",
+  "error MAM_PoolNotFound()",
+  "error MAM_CloseAmountTooSmall()",
+  "error MAM_InvalidCloseBps()",
+  "error MAM_InvalidPosition()",
+  "error MAM_NotLiquidatable()",
+  "error MAM_NotOwner()",
   "error MAM_OracleUnavailable()",
   "error MAM_ZeroOraclePrice()",
   "event MAM_PositionCreated(uint256 indexed positionId,address indexed user,bool isLong,address collateralToken,uint256 collateralAmount,uint256 debtAmount)",
@@ -857,7 +865,7 @@ async function buildLeveragedTx(provider, isLong, amount, token, leverage, deadl
   });
   if (amountOutMin <= 0n) throw new Error("Leveraged amountOutMin is zero");
   const data = POSITION_IFACE.encodeFunctionData("openPosition", [isLong, context.collateral, collateralAmount, 0n, encodedLeverage, amountOutMin, BigInt(deadline)]);
-  return { to: context.manager, manager: context.manager, pool: context.pool, data, value: 0n, nativeCollateral, collateralToken: context.collateral, marketToken: context.marketToken, symbol: normalizedMarket.symbol, collateralAmount, leverage: encodedLeverage, amountOutMin };
+  return { to: context.pool, manager: context.manager, pool: context.pool, data, value: 0n, nativeCollateral, collateralToken: context.collateral, marketToken: context.marketToken, symbol: normalizedMarket.symbol, collateralAmount, leverage: encodedLeverage, amountOutMin };
 }
 
 function buildLongTx(amount, token = tradingConfig.defaultCollateralToken, leverage = tradingConfig.leverage, deadline = Math.floor(Date.now() / 1000) + tradingConfig.deadlineSeconds, providerArg, market = null) {
@@ -914,6 +922,7 @@ async function validateAndSendLeveragedTx(wallet, tx, side, provider) {
   const isCloseTx = tx.data.slice(0, 10) === "0xb35648d7" || tx.data.slice(0, 10) === "0xdc439ba7";
   if (isOpenTx) {
     if (!isValidContractTarget(tx.to)) throw new Error("Invalid openPosition target/manager");
+    if (String(tx.to).toLowerCase() === NEMESIS_ROUTER.toLowerCase()) throw new Error("Invalid openPosition target: swap router selected instead of leveraged pool");
     if (tx.amountOutMin == null || BigInt(tx.amountOutMin) <= 0n) throw new Error("Refusing openPosition: amountOutMin is zero");
     if (tx.collateralAmount == null || BigInt(tx.collateralAmount) <= 0n) throw new Error("Refusing openPosition: collateral amount is zero");
     const decoded = POSITION_IFACE.decodeFunctionData("openPosition", tx.data);
@@ -929,6 +938,14 @@ async function validateAndSendLeveragedTx(wallet, tx, side, provider) {
     addLog(`[RSI] manager=${tx.manager || tx.to}`, "info");
     addLog(`[RSI] target=${tx.to}`, "info");
     addLog(`[RSI] calldata=${tx.data}`, "debug");
+    if (side === "LONG") {
+      addLog(`[LONG] manager=${tx.manager || tx.to}`, "warn");
+      addLog(`[LONG] target=${tx.to}`, "warn");
+      addLog(`[LONG] calldata=${tx.data}`, "debug");
+      addLog(`[LONG] quote=${tx.amountOutMin}`, "warn");
+      addLog(`[LONG] amountOutMin=${tx.amountOutMin}`, "warn");
+      addLog(`[LONG] leverage=${tx.leverage}`, "warn");
+    }
     logUiPayloadDiff(tx, side);
   }
   if (isCloseTx) {
@@ -999,6 +1016,7 @@ async function validateAndSendLeveragedTx(wallet, tx, side, provider) {
   }
   if (isOpenTx) addLog(`[OPEN] tx hash=${sent.hash}`, "warn");
   if (isOpenTx) addLog(`[RSI] tx hash=${sent.hash}`, "warn");
+  if (isOpenTx && side === "LONG") addLog(`[LONG] tx hash=${sent.hash}`, "warn");
   if (isCloseTx) addLog(`[CLOSE] tx hash=${sent.hash}`, "warn");
   addLog(`[${side}] txHash=${sent.hash}`, "warn");
   addLog(`[${side}] Sending transaction...`, "warn");
@@ -1006,6 +1024,7 @@ async function validateAndSendLeveragedTx(wallet, tx, side, provider) {
   if (receipt.status === 0) throw new Error(`${side} transaction reverted`);
   if (isOpenTx) addLog("[OPEN] confirmed", "success");
   if (isOpenTx) addLog(`[RSI] receipt status=${receipt.status}`, "success");
+  if (isOpenTx && side === "LONG") addLog(`[LONG] receipt status=${receipt.status}`, "success");
   if (isCloseTx) addLog(`[CLOSE] receipt status=${receipt.status}`, "success");
   for (const log of receipt.logs) {
     try {
@@ -1018,11 +1037,12 @@ async function validateAndSendLeveragedTx(wallet, tx, side, provider) {
         tradingConfig.activePositions.push({
           side,
           positionId: tradingConfig.closePositionId,
-          managerAddress: tx.to,
+          managerAddress: tx.manager || tx.to,
           symbol: tx.symbol || side,
           marketToken: tx.marketToken || tradingConfig.marketToken,
           collateralToken: tx.collateralToken,
-          closeTarget: tx.to,
+          closeTarget: tx.manager || tx.to,
+          openTarget: tx.to,
           txHash: sent.hash,
           openedAt: Math.floor(Date.now() / 1000)
         });
@@ -1055,6 +1075,8 @@ function decodeContractError(error) {
       const parsed = POSITION_IFACE.parseError(data);
       return `${parsed.name}(${parsed.args.map(String).join(",")})`;
     } catch {
+      const selector = String(data).slice(0, 10);
+      if (selector === "0x499ad952") return "Unknown Nemesis custom error selector 0x499ad952";
       return `${error.reason || error.shortMessage || error.message} data=${data}`;
     }
   }
@@ -1095,6 +1117,7 @@ async function logLongShortPayloadDelta(provider) {
   for (const field of fields) {
     addLog(`${field}: LONG=${longDecoded[field]} SHORT=${shortDecoded[field]}`, "warn");
   }
+  addLog(`target: LONG=${longTx.to} SHORT=${shortTx.to}`, "warn");
   addLog(`tx.value: LONG=${longTx.value} SHORT=${shortTx.value}`, "warn");
 }
 
@@ -1562,6 +1585,9 @@ async function runAutoRsiTrading() {
             addLog(error.message, "warn");
             continue;
           }
+          if (side === "LONG") market.supportsLong = false;
+          if (side === "SHORT") market.supportsShort = false;
+          addLog(`[SKIP] ${side} ${market.symbol} unsupported or reverting; skipping side for this run`, "warn");
           addLog(`[RSI] open failed for ${market.symbol}: ${decodeContractError(error)}`, "error");
           continue;
         }

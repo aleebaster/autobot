@@ -2,6 +2,7 @@
 
 ## 2026-06-02
 
+- Fixed leveraged open target selection to use the Nemesis pool address and added LONG revert diagnostics.
 - Fixed auto-close confirmation so positions are only removed after a confirmed close receipt and chain refresh.
 - Hardened LONG/SHORT opens with strict manager, calldata, and non-zero quote validation plus RSI market debug logs.
 - Fixed full-auto open blocking by syncing positions from chain before duplicate checks and pruning stale cached positions.
