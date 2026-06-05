@@ -7,6 +7,8 @@ import axios from "axios";
 import { execSync } from "child_process";
 import { HttpsProxyAgent } from "https-proxy-agent";
 import { SocksProxyAgent } from "socks-proxy-agent";
+import { DEFAULT_LP_CONFIG, loadLpConfig, serializeLpConfig } from "./lpConfig.js";
+import { LpManager } from "./lpManager.js";
 
 const SEPOLIA_RPC_URL = "https://ethereum-sepolia-rpc.publicnode.com/";
 const SEPOLIA_CHAIN_ID = 11155111;
@@ -209,6 +211,9 @@ let tradingConfig = {
   fullAutoEnabled: false
 };
 
+let lpConfig = { ...DEFAULT_LP_CONFIG };
+let lpManager = null;
+
 function loadConfig() {
   try {
     if (fs.existsSync(CONFIG_FILE)) {
@@ -245,7 +250,7 @@ function loadConfig() {
       tradingConfig.deadlineSeconds = Number(cfg.deadlineSeconds) || tradingConfig.deadlineSeconds;
       tradingConfig.rsiLong = Number(cfg.rsiLong) || tradingConfig.rsiLong;
       tradingConfig.rsiShort = Number(cfg.rsiShort) || tradingConfig.rsiShort;
-      tradingConfig.cooldownSeconds = Number(cfg.cooldownSeconds) || tradingConfig.cooldownSeconds;
+      tradingConfig.cooldownSeconds = cfg.cooldownSeconds == null ? tradingConfig.cooldownSeconds : Number(cfg.cooldownSeconds);
       tradingConfig.maxOpenPositions = Number(cfg.maxOpenPositions) || tradingConfig.maxOpenPositions;
       tradingConfig.longPercent = Number(cfg.longPercent) || tradingConfig.longPercent;
       tradingConfig.shortPercent = Number(cfg.shortPercent) || tradingConfig.shortPercent;
@@ -262,7 +267,7 @@ function loadConfig() {
       tradingConfig.maxExposurePerMarket = String(cfg.maxExposurePerMarket ?? tradingConfig.maxExposurePerMarket);
       tradingConfig.maxDailyTrades = Number(cfg.maxDailyTrades) || tradingConfig.maxDailyTrades;
       tradingConfig.maxLossPerMarket = String(cfg.maxLossPerMarket ?? tradingConfig.maxLossPerMarket);
-      tradingConfig.cooldownPerMarket = Number(cfg.cooldownPerMarket) || tradingConfig.cooldownPerMarket;
+      tradingConfig.cooldownPerMarket = cfg.cooldownPerMarket == null ? tradingConfig.cooldownPerMarket : Number(cfg.cooldownPerMarket);
       tradingConfig.blacklistMarkets = Array.isArray(cfg.blacklistMarkets) ? cfg.blacklistMarkets : [];
       tradingConfig.autoClose = cfg.autoClose === true;
       tradingConfig.closePercent = Number(cfg.closePercent) || tradingConfig.closePercent;
@@ -278,6 +283,7 @@ function loadConfig() {
       tradingConfig.uiShortTxValueReference = cfg.uiShortTxValueReference == null ? null : String(cfg.uiShortTxValueReference);
       tradingConfig.autoRSIEnabled = cfg.autoRSIEnabled === true;
       tradingConfig.fullAutoEnabled = cfg.fullAutoEnabled === true;
+      lpConfig = loadLpConfig(cfg);
     } else {
       addLog("No config file found, using default settings.", "info");
     }
@@ -288,7 +294,7 @@ function loadConfig() {
 
 function saveConfig() {
   try {
-    fs.writeFileSync(CONFIG_FILE, JSON.stringify({ ...dailyActivityConfig, ...tradingConfig }, null, 2));
+    fs.writeFileSync(CONFIG_FILE, JSON.stringify({ ...dailyActivityConfig, ...tradingConfig, ...serializeLpConfig(lpConfig) }, null, 2));
     addLog("Configuration saved successfully.", "success");
   } catch (error) {
     addLog(`Failed to save config: ${error.message}`, "error");
@@ -1963,8 +1969,8 @@ const menuBox = blessed.list({
     item: { fg: "white" }
   },
   items:   fullAutoRunning || isCycleRunning
-    ? ["[1] Stop Full Auto Trading", "[2] Open LONG Now", "[3] Open SHORT Now", "[4] Close Position", "[5] Auto RSI Trading", "[6] Set Manual Config", "[7] Refresh Wallet", "[8] Exit", "[9] Stop Auto RSI Trading"]
-    : ["[1] Start Full Auto Trading", "[2] Open LONG Now", "[3] Open SHORT Now", "[4] Close Position", "[5] Auto RSI Trading", "[6] Set Manual Config", "[7] Refresh Wallet", "[8] Exit", "[9] Stop Auto RSI Trading"],
+    ? ["[1] Stop Full Auto Trading", "[2] Open LONG Now", "[3] Open SHORT Now", "[4] Close Position", "[5] Auto RSI Trading", "[6] Set Manual Config", "[7] Refresh Wallet", "[8] Exit", "[9] Stop Auto RSI Trading", "[10] Liquidity Pool Mode"]
+    : ["[1] Start Full Auto Trading", "[2] Open LONG Now", "[3] Open SHORT Now", "[4] Close Position", "[5] Auto RSI Trading", "[6] Set Manual Config", "[7] Refresh Wallet", "[8] Exit", "[9] Stop Auto RSI Trading", "[10] Liquidity Pool Mode"],
   padding: { left: 1, top: 1 }
 });
 
@@ -2003,6 +2009,27 @@ const dailyActivitySubMenu = blessed.list({
     "Set Loop Daily",
     "Back to Main Menu"
   ],
+  padding: { left: 1, top: 1 },
+  hidden:  true
+});
+
+const lpSubMenu = blessed.list({
+  label:  " Liquidity Pool Mode ",
+  top:    "44%",
+  left:   0,
+  width:  "40%",
+  height: "56%",
+  keys:   true,
+  vi:     true,
+  mouse:  true,
+  border: { type: "line" },
+  style:  {
+    fg: "white", bg: "default",
+    border: { fg: "green" },
+    selected: { bg: "green", fg: "black" },
+    item: { fg: "white" }
+  },
+  items:  ["[1] Add Liquidity", "[2] Remove Liquidity", "[3] Auto LP Cycle", "[4] LP Config", "[5] LP Status", "[6] Back"],
   padding: { left: 1, top: 1 },
   hidden:  true
 });
@@ -2085,6 +2112,7 @@ screen.append(walletBox);
 screen.append(logBox);
 screen.append(menuBox);
 screen.append(dailyActivitySubMenu);
+screen.append(lpSubMenu);
 screen.append(configForm);
 
 let renderQueue  = [];
@@ -2133,6 +2161,10 @@ function adjustLayout() {
     dailyActivitySubMenu.width = menuBox.width;
     dailyActivitySubMenu.height= menuBox.height;
     dailyActivitySubMenu.left  = menuBox.left;
+    lpSubMenu.top   = menuBox.top;
+    lpSubMenu.width = menuBox.width;
+    lpSubMenu.height= menuBox.height;
+    lpSubMenu.left  = menuBox.left;
     configForm.width  = Math.floor(W * 0.3);
     configForm.height = Math.floor(H * 0.4);
   }
@@ -2207,8 +2239,8 @@ function updateMenu() {
   try {
     menuBox.setItems(
       fullAutoRunning || isCycleRunning
-        ? ["[1] Stop Full Auto Trading", "[2] Open LONG Now", "[3] Open SHORT Now", "[4] Close Position", "[5] Auto RSI Trading", "[6] Set Manual Config", "[7] Refresh Wallet", "[8] Exit", "[9] Stop Auto RSI Trading"]
-        : ["[1] Start Full Auto Trading", "[2] Open LONG Now", "[3] Open SHORT Now", "[4] Close Position", "[5] Auto RSI Trading", "[6] Set Manual Config", "[7] Refresh Wallet", "[8] Exit", "[9] Stop Auto RSI Trading"]
+        ? ["[1] Stop Full Auto Trading", "[2] Open LONG Now", "[3] Open SHORT Now", "[4] Close Position", "[5] Auto RSI Trading", "[6] Set Manual Config", "[7] Refresh Wallet", "[8] Exit", "[9] Stop Auto RSI Trading", "[10] Liquidity Pool Mode"]
+        : ["[1] Start Full Auto Trading", "[2] Open LONG Now", "[3] Open SHORT Now", "[4] Close Position", "[5] Auto RSI Trading", "[6] Set Manual Config", "[7] Refresh Wallet", "[8] Exit", "[9] Stop Auto RSI Trading", "[10] Liquidity Pool Mode"]
     );
     safeRender();
   } catch (error) {
@@ -2251,12 +2283,52 @@ function stopFullAutoTrading() {
   addLog("[AUTO] Full auto trading stopped.", "success");
 }
 
+function getLpManager() {
+  if (!lpManager) {
+    lpManager = new LpManager({
+      accounts,
+      proxies,
+      selectedWalletIndex,
+      getConfig: () => lpConfig,
+      getProvider,
+      getFeeParams,
+      getNextNonce,
+      sleep,
+      log: addLog,
+      rpcUrl: SEPOLIA_RPC_URL,
+      chainId: SEPOLIA_CHAIN_ID,
+      routerAddress: LEVERAGED_ROUTER,
+      daiAddress: LEVERAGED_DAI_ADDRESS
+    });
+  }
+  lpManager.deps.accounts = accounts;
+  lpManager.deps.proxies = proxies;
+  lpManager.deps.selectedWalletIndex = selectedWalletIndex;
+  return lpManager;
+}
+
+function showMainMenuFrom(subMenu) {
+  subMenu.hide();
+  menuBox.show();
+  setTimeout(() => {
+    if (menuBox.visible) {
+      screen.focusPush(menuBox);
+      menuBox.style.border.fg = "cyan";
+      dailyActivitySubMenu.style.border.fg = "blue";
+      lpSubMenu.style.border.fg = "green";
+      logBox.style.border.fg = "magenta";
+      safeRender();
+    }
+  }, 100);
+}
+
 function runGit(command) {
   return execSync(command, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 }
 
 function startupGitSync() {
   try {
+    if (process.env.NEMESIS_SKIP_GIT_SYNC === "1") return;
     if (!fs.existsSync(".git")) return;
     const configBackup = fs.existsSync(CONFIG_FILE) ? fs.readFileSync(CONFIG_FILE, "utf8") : null;
     const branch = runGit("git branch --show-current");
@@ -2297,6 +2369,7 @@ logBox.on("click", () => {
   logBox.style.border.fg = "yellow";
   menuBox.style.border.fg = "red";
   dailyActivitySubMenu.style.border.fg = "blue";
+  lpSubMenu.style.border.fg = "green";
   safeRender();
 });
 
@@ -2354,11 +2427,27 @@ menuBox.on("select", async (item) => {
     case "[6] Set Manual Config":
     case "Set Manual Config":
       menuBox.hide();
+      lpSubMenu.hide();
       dailyActivitySubMenu.show();
       setTimeout(() => {
         if (dailyActivitySubMenu.visible) {
           screen.focusPush(dailyActivitySubMenu);
           dailyActivitySubMenu.style.border.fg = "yellow";
+          logBox.style.border.fg = "magenta";
+          safeRender();
+        }
+      }, 100);
+      break;
+
+    case "[10] Liquidity Pool Mode":
+    case "Liquidity Pool Mode":
+      menuBox.hide();
+      dailyActivitySubMenu.hide();
+      lpSubMenu.show();
+      setTimeout(() => {
+        if (lpSubMenu.visible) {
+          screen.focusPush(lpSubMenu);
+          lpSubMenu.style.border.fg = "yellow";
           logBox.style.border.fg = "magenta";
           safeRender();
         }
@@ -2386,6 +2475,47 @@ menuBox.on("select", async (item) => {
       tradingConfig.fullAutoEnabled = false;
       saveConfig();
       process.exit(0);
+  }
+});
+
+lpSubMenu.on("select", async (item) => {
+  const action = item.getText();
+  try {
+    switch (action) {
+      case "[1] Add Liquidity":
+        await getLpManager().addLiquidity();
+        break;
+      case "[2] Remove Liquidity":
+        await getLpManager().removeLiquidity();
+        break;
+      case "[3] Auto LP Cycle":
+        getLpManager().autoCycle().catch(error => addLog(`[LP] Auto LP Cycle failed: ${error.message}`, "error"));
+        break;
+      case "[4] LP Config":
+        configForm.configType = "lpConfig";
+        configForm.setLabel(" lpEnabled,pair,eth,dai,wait,cooldown,slippage,cycles ");
+        minLabel.hide(); maxLabel.hide();
+        configInput.setValue(`${lpConfig.lpEnabled},${lpConfig.lpPair},${lpConfig.lpEthAmount},${lpConfig.lpDaiAmount},${lpConfig.lpWaitMinutes},${lpConfig.lpCooldownMinutes},${lpConfig.lpSlippage},${lpConfig.lpCycles}`);
+        configInputMax.setValue(""); configInputMax.hide();
+        lpSubMenu.hide();
+        configForm.show();
+        setTimeout(() => {
+          if (configForm.visible) {
+            screen.focusPush(configInput);
+            configInput.clearValue();
+            safeRender();
+          }
+        }, 100);
+        break;
+      case "[5] LP Status":
+        await getLpManager().status();
+        break;
+      case "[6] Back":
+        showMainMenuFrom(lpSubMenu);
+        break;
+    }
+  } catch (error) {
+    addLog(`[LP] ${action} failed: ${error.message}`, "error");
   }
 });
 
@@ -2464,7 +2594,7 @@ configForm.on("submit", () => {
   let value, maxValue;
 
   try {
-    if (["tradeAmounts", "longShortRatio", "randomizeTradeSize", "tradeMode", "marketMode", "selectedMarkets", "tradeDistribution", "safetyLimits"].includes(configForm.configType)) {
+    if (["tradeAmounts", "longShortRatio", "randomizeTradeSize", "tradeMode", "marketMode", "selectedMarkets", "tradeDistribution", "safetyLimits", "lpConfig"].includes(configForm.configType)) {
       value = inputValue;
     } else {
       value = ["activityRepetitions", "loopHours", "maxOpenPositions"].includes(configForm.configType)
@@ -2480,7 +2610,7 @@ configForm.on("submit", () => {
         isSubmitting = false; return;
       }
     }
-    if (!["tradeAmounts", "longShortRatio", "randomizeTradeSize", "tradeMode", "marketMode", "selectedMarkets", "tradeDistribution", "safetyLimits"].includes(configForm.configType) && (isNaN(value) || value <= 0)) {
+    if (!["tradeAmounts", "longShortRatio", "randomizeTradeSize", "tradeMode", "marketMode", "selectedMarkets", "tradeDistribution", "safetyLimits", "lpConfig"].includes(configForm.configType) && (isNaN(value) || value <= 0)) {
       addLog("Invalid input. Please enter a positive number.", "error");
       configInput.clearValue(); screen.focusPush(configInput); safeRender();
       isSubmitting = false; return;
@@ -2562,9 +2692,30 @@ configForm.on("submit", () => {
   } else if (configForm.configType === "safetyLimits") {
     const [daily, cooldown, blacklist] = String(value).split(",").map(v => v.trim());
     tradingConfig.maxDailyTrades = Math.max(1, Number(daily) || tradingConfig.maxDailyTrades);
-    tradingConfig.cooldownPerMarket = Math.max(0, Number(cooldown) || tradingConfig.cooldownPerMarket);
+    tradingConfig.cooldownPerMarket = Math.max(0, cooldown === undefined || cooldown === "" ? tradingConfig.cooldownPerMarket : Number(cooldown));
     tradingConfig.blacklistMarkets = (blacklist || "").split("|").map(v => v.trim()).filter(Boolean);
     addLog(`Safety daily=${tradingConfig.maxDailyTrades}, cooldown=${tradingConfig.cooldownPerMarket}s, blacklist=${tradingConfig.blacklistMarkets.join("|") || "none"}`, "success");
+  } else if (configForm.configType === "lpConfig") {
+    const [enabled, pair, ethAmount, daiAmount, waitMinutes, cooldownMinutes, slippage, cycles] = String(value).split(",").map(v => v.trim());
+    if (!ethAmount || !daiAmount || !waitMinutes || !cooldownMinutes || !slippage || !cycles) {
+      addLog("Use LP format: enabled,pair,eth,dai,wait,cooldown,slippage,cycles", "error");
+      isSubmitting = false; return;
+    }
+    if ((pair || "ETH/DAI") !== "ETH/DAI") {
+      addLog("LP pair currently supports ETH/DAI only.", "error");
+      isSubmitting = false; return;
+    }
+    lpConfig = loadLpConfig({
+      lpEnabled: ["true", "yes", "1", "on"].includes(String(enabled).toLowerCase()),
+      lpPair: pair || "ETH/DAI",
+      lpEthAmount: ethAmount,
+      lpDaiAmount: daiAmount,
+      lpWaitMinutes: Number(waitMinutes),
+      lpCooldownMinutes: Number(cooldownMinutes),
+      lpSlippage: Number(slippage),
+      lpCycles: Number(cycles)
+    });
+    addLog(`LP Config saved enabled=${lpConfig.lpEnabled}, pair=${lpConfig.lpPair}, ETH=${lpConfig.lpEthAmount}, DAI=${lpConfig.lpDaiAmount}, wait=${lpConfig.lpWaitMinutes}m, cooldown=${lpConfig.lpCooldownMinutes}m, slippage=${lpConfig.lpSlippage}%, cycles=${lpConfig.lpCycles}`, "success");
   } else if (configForm.configType === "loopHours") {
     dailyActivityConfig.loopHours = value;
     addLog(`Loop Daily set to ${value} hours`, "success");
@@ -2584,9 +2735,15 @@ configForm.on("submit", () => {
   addLog(`Config summary: autoTrades=${dailyActivityConfig.activityRepetitions}, LONG=${tradingConfig.longTradeAmount}, SHORT=${tradingConfig.shortTradeAmount}, SWAP=${tradingConfig.swapTradeAmount}, maxOpen=${tradingConfig.maxOpenPositions}, ratio=${tradingConfig.longPercent}/${tradingConfig.shortPercent}, random=${tradingConfig.randomizeAmount} ±${tradingConfig.amountVariancePercent}%`, "info");
   updateStatus();
   configForm.hide();
-  dailyActivitySubMenu.show();
+  if (configForm.configType === "lpConfig") lpSubMenu.show();
+  else dailyActivitySubMenu.show();
   setTimeout(() => {
-    if (dailyActivitySubMenu.visible) {
+    if (lpSubMenu.visible) {
+      screen.focusPush(lpSubMenu);
+      lpSubMenu.style.border.fg = "yellow";
+      logBox.style.border.fg = "magenta";
+      safeRender();
+    } else if (dailyActivitySubMenu.visible) {
       screen.focusPush(dailyActivitySubMenu);
       dailyActivitySubMenu.style.border.fg = "yellow";
       logBox.style.border.fg = "magenta";
@@ -2603,11 +2760,18 @@ function submitCurrentConfigForm() {
 
 function cancelCurrentConfigForm() {
   if (!configForm.visible) return;
+  const returnToLp = configForm.configType === "lpConfig";
   configForm.hide();
-  dailyActivitySubMenu.show();
+  if (returnToLp) lpSubMenu.show();
+  else dailyActivitySubMenu.show();
   addLog("[CONFIG] Cancelled.", "warn");
   setTimeout(() => {
-    if (dailyActivitySubMenu.visible) {
+    if (lpSubMenu.visible) {
+      screen.focusPush(lpSubMenu);
+      lpSubMenu.style.border.fg = "yellow";
+      logBox.style.border.fg = "magenta";
+      safeRender();
+    } else if (dailyActivitySubMenu.visible) {
       screen.focusPush(dailyActivitySubMenu);
       dailyActivitySubMenu.style.border.fg = "yellow";
       logBox.style.border.fg = "magenta";
@@ -2628,17 +2792,11 @@ configInput.key(["escape"], cancelCurrentConfigForm);
 configInputMax.key(["escape"], cancelCurrentConfigForm);
 
 dailyActivitySubMenu.key(["escape"], () => {
-  dailyActivitySubMenu.hide();
-  menuBox.show();
-  setTimeout(() => {
-    if (menuBox.visible) {
-      screen.focusPush(menuBox);
-      menuBox.style.border.fg = "cyan";
-      dailyActivitySubMenu.style.border.fg = "blue";
-      logBox.style.border.fg = "magenta";
-      safeRender();
-    }
-  }, 100);
+  showMainMenuFrom(dailyActivitySubMenu);
+});
+
+lpSubMenu.key(["escape"], () => {
+  showMainMenuFrom(lpSubMenu);
 });
 
 screen.key(["escape", "q", "C-c"], () => {
@@ -2646,6 +2804,7 @@ screen.key(["escape", "q", "C-c"], () => {
   clearInterval(statusInterval);
   if (rsiTradingInterval) clearInterval(rsiTradingInterval);
   stopAutoCloseMonitor();
+  if (lpManager) lpManager.stopAutoCycle();
   rsiRunning = false;
   fullAutoRunning = false;
   tradingConfig.autoRSIEnabled = false;
