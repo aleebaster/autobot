@@ -1,6 +1,6 @@
 {
   "enableSwaps": true,
-    "activityRepetitions": 10,
+  "activityRepetitions": 10,
   "ethRange": {
     "min": 0.00001,
     "max": 0.0001
@@ -18,7 +18,7 @@
     "max": 0.05
   },
   "loopHours": 1,
-    "enableLong": true,
+  "enableLong": true,
   "enableShort": true,
   "enableClose": true,
   "simulateOnly": false,
@@ -37,8 +37,8 @@
   "deadlineSeconds": 1200,
   "rsiLong": 30,
   "rsiShort": 70,
-    "cooldownSeconds": 300,
-    "maxOpenPositions": 20,
+  "cooldownSeconds": 300,
+  "maxOpenPositions": 20,
   "longPercent": 50,
   "shortPercent": 50,
   "randomizeAmount": true,
@@ -57,7 +57,7 @@
       "rsiSymbol": "ETHUSDT",
       "pool": "0xA079592346cF2CCe68Fd7e1FFADE041a602D33e4",
       "managerAddress": "0x87dbB2A051A50a9fC82736bd98e570E81dE67A37",
-      "liquidity": "13375214430583",
+      "liquidity": "13066522710433",
       "isActive": true,
       "health": "WORKING"
     }
@@ -66,9 +66,9 @@
   "maxTradesPerPair": 1,
   "maxConcurrentTrades": 1,
   "maxExposurePerMarket": "0.333216",
-    "maxDailyTrades": 10,
+  "maxDailyTrades": 10,
   "maxLossPerMarket": "0",
-    "cooldownPerMarket": 300,
+  "cooldownPerMarket": 300,
   "blacklistMarkets": [],
   "autoClose": false,
   "closePercent": 100,

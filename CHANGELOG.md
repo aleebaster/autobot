@@ -12,6 +12,8 @@
 - Verified full-auto runtime opens/closes using the actual app path: swaps executed, LONG opened/closed, SHORT opened/closed, receipts succeeded, local active-position cache cleared, chain active positions returned to zero, and UI open positions returned to zero.
 - Verified LP add/remove chain and UI balance agreement: chain LP balance moved `0 -> positive -> 0`, UI `lpBalance` moved `0 -> positive -> 0`.
 - Documented external Nemesis UI/indexer behavior: `userLiquidityPositions.status` may remain `OPEN` when `lpBalance` is `0`; this is treated as external UI/indexer state unless chain LP balance or UI `lpBalance` contradicts removal.
+- Fixed soak-discovered duplicate close submission by guarding in-flight/recently-closed position IDs and preflighting active chain state before sending a close transaction.
+- Hardened full-auto startup ordering so restart recovery runs an awaited close scan before RSI/daily activity can open new positions.
 
 ## 2026-06-03
 

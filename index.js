@@ -1331,11 +1331,30 @@ async function waitForClosedPositionOnChain(wallet, provider, position) {
 }
 
 async function sendCloseAndConfirm(wallet, provider, position) {
+  const positionId = String(position.positionId);
+  if (recentlyClosedPositionIds.has(positionId)) {
+    tradingConfig.activePositions = (tradingConfig.activePositions || []).filter(p => String(p.positionId) !== positionId);
+    if (String(tradingConfig.closePositionId) === positionId) tradingConfig.closePositionId = "";
+    saveConfig();
+    addLog(`[CLOSE] positionId=${positionId} already closed; skipping duplicate close`, "warn");
+    return null;
+  }
+  if (closingPositionIds.has(positionId)) throw new Error(`[SKIP] close already in flight for positionId=${positionId}`);
   if (closePending) throw new Error("Close already pending");
   closePending = true;
+  closingPositionIds.add(positionId);
   try {
     const target = position.closeTarget || position.managerAddress;
     if (!isValidContractTarget(target)) throw new Error("Close target unavailable after discovery");
+    const stillActive = await positionStillActiveOnChain(wallet, provider, { ...position, closeTarget: target, managerAddress: position.managerAddress || target });
+    if (!stillActive) {
+      recentlyClosedPositionIds.add(positionId);
+      tradingConfig.activePositions = (tradingConfig.activePositions || []).filter(p => String(p.positionId) !== positionId);
+      if (String(tradingConfig.closePositionId) === positionId) tradingConfig.closePositionId = "";
+      saveConfig();
+      addLog(`[CLOSE] positionId=${positionId} not active on-chain; skipping close tx`, "warn");
+      return null;
+    }
     const data = buildCloseTx({ positionId: position.positionId, closePercent: tradingConfig.closePercent });
     addLog(`[CLOSE] manager=${position.managerAddress || target}`, "warn");
     addLog(`[CLOSE] target=${target}`, "warn");
@@ -1344,13 +1363,15 @@ async function sendCloseAndConfirm(wallet, provider, position) {
     const result = await validateAndSendLeveragedTx(wallet, { to: target, manager: position.managerAddress || target, data, value: 0n }, "CLOSE", provider);
     if (!result || result.receipt?.status !== 1) throw new Error("Close transaction did not confirm with status=1");
     await waitForClosedPositionOnChain(wallet, provider, position);
-    tradingConfig.activePositions = (tradingConfig.activePositions || []).filter(p => String(p.positionId) !== String(position.positionId));
-    if (String(tradingConfig.closePositionId) === String(position.positionId)) tradingConfig.closePositionId = "";
+    recentlyClosedPositionIds.add(positionId);
+    tradingConfig.activePositions = (tradingConfig.activePositions || []).filter(p => String(p.positionId) !== positionId);
+    if (String(tradingConfig.closePositionId) === positionId) tradingConfig.closePositionId = "";
     saveConfig();
     await syncActivePositionsFromChain(wallet, provider);
     addLog("position closed", "success");
     return result;
   } finally {
+    closingPositionIds.delete(positionId);
     closePending = false;
   }
 }
@@ -1534,6 +1555,8 @@ let fullAutoRunning = false;
 let autoCloseInterval = null;
 let dailyActivityPromise = null;
 let closePending = false;
+const closingPositionIds = new Set();
+const recentlyClosedPositionIds = new Set();
 let lastRsiTradeAt = 0;
 let lastMarketTradeAt = {};
 let dailyTradeCounter = { day: "", count: 0 };
@@ -2256,10 +2279,12 @@ async function runFullAutoTrading({ resume = false } = {}) {
   tradingConfig.fullAutoEnabled = true;
   tradingConfig.autoRSIEnabled = true;
   saveConfig();
+  addLog("[AUTO] Running restart recovery close scan...", "info");
+  await runAutoCloseCycle();
+  startAutoCloseMonitor();
   addLog("[AUTO] Starting swaps...", "info");
   addLog("[AUTO] Starting RSI trading...", "info");
   if (!rsiRunning && !rsiTradingInterval) await runAutoRsiTrading();
-  startAutoCloseMonitor();
   updateMenu();
   updateStatus();
   if (resume) addLog("[AUTO] Resumed saved automation state.", "success");
