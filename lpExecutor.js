@@ -53,6 +53,32 @@ function short(value) {
   return value ? `${value.slice(0, 6)}...${value.slice(-4)}` : "N/A";
 }
 
+function decodeError(error) {
+  return error?.shortMessage || error?.reason || error?.info?.error?.message || error?.message || String(error);
+}
+
+function formatAmount(amount, decimals) {
+  try { return ethers.formatUnits(amount, decimals); } catch { return amount.toString(); }
+}
+
+async function getFixedOrPercentAmounts({ wallet, provider, config, tokenAddress, tokenDecimals }) {
+  if (config.lpAmountMode === "walletPercent") {
+    const percent = BigInt(Math.max(0, Math.min(10000, Math.floor(Number(config.lpWalletPercent) * 100))));
+    if (percent <= 0n) throw new Error("LP walletPercent must be greater than zero");
+    const token = new ethers.Contract(tokenAddress, ERC20_ABI, provider);
+    const [ethBalance, tokenBalance] = await Promise.all([provider.getBalance(wallet.address), token.balanceOf(wallet.address)]);
+    return {
+      ethAmount: ethBalance * percent / 10000n,
+      tokenAmount: tokenBalance * percent / 10000n
+    };
+  }
+
+  return {
+    ethAmount: ethers.parseEther(String(config.lpTokenAAmount ?? config.lpEthAmount)),
+    tokenAmount: ethers.parseUnits(String(config.lpTokenBAmount ?? config.lpDaiAmount), tokenDecimals)
+  };
+}
+
 async function ensureApproval({ wallet, provider, tokenAddress, spender, amount, getFeeParams, getNextNonce, chainId, log }) {
   const token = new ethers.Contract(tokenAddress, ERC20_ABI, wallet);
   const allowance = await token.allowance(wallet.address, spender);
@@ -101,36 +127,53 @@ export async function getLpStatus({ provider, walletAddress, routerAddress, toke
   return { factoryAddress, wethAddress, pairAddress, lpBalance, totalSupply, token0, token1, reserves, exists: lpBalance > 0n };
 }
 
-export async function addLiquidity({ wallet, provider, config, routerAddress, tokenAddress, tokenDecimals, chainId, getFeeParams, getNextNonce, log }) {
+export async function addLiquidity({ wallet, provider, config, routerAddress, tokenAddress, chainId, getFeeParams, getNextNonce, log }) {
   const router = new ethers.Contract(routerAddress, ROUTER_LP_ABI, wallet);
-  const tokenAmount = ethers.parseUnits(String(config.lpDaiAmount), tokenDecimals);
-  const ethAmount = ethers.parseEther(String(config.lpEthAmount));
+  const token = new ethers.Contract(tokenAddress, ERC20_ABI, provider);
+  const tokenDecimals = Number(await token.decimals());
+  const { ethAmount, tokenAmount } = await getFixedOrPercentAmounts({ wallet, provider, config, tokenAddress, tokenDecimals });
   if (tokenAmount <= 0n || ethAmount <= 0n) throw new Error("LP amounts must be greater than zero");
 
-  await ensureApproval({ wallet, provider, tokenAddress, spender: routerAddress, amount: tokenAmount, getFeeParams, getNextNonce, chainId, log });
-
   const before = await getLpStatus({ provider, walletAddress: wallet.address, routerAddress, tokenAddress });
+  if (!before.pairAddress || before.pairAddress === ZERO_ADDRESS) throw new Error(`LP pool not found for token ${tokenAddress}`);
+  if (BigInt(before.totalSupply || 0n) < ethers.parseUnits(String(config.lpMinLiquidity || "0"), 0)) throw new Error(`LP total liquidity below threshold: ${before.totalSupply}`);
   const { optimalEth, optimalToken } = getOptimalAddAmounts({ ethAmount, tokenAmount, status: before, wethAddress: before.wethAddress, tokenAddress });
+  await ensureApproval({ wallet, provider, tokenAddress, spender: routerAddress, amount: tokenAmount, getFeeParams, getNextNonce, chainId, log });
   const deadline = Math.floor(Date.now() / 1000) + 1200;
   const feeParams = await getFeeParams(provider);
   const nonce = await getNextNonce(provider, wallet.address, chainId);
-  const tx = await router.addLiquidityETH(
-    tokenAddress,
-    tokenAmount,
-    minAmount(optimalToken, config.lpSlippage),
-    minAmount(optimalEth, config.lpSlippage),
-    wallet.address,
-    deadline,
-    { ...feeParams, value: ethAmount, gasLimit: 600000n, nonce }
-  );
+  const amountTokenMin = minAmount(optimalToken, config.lpSlippage);
+  const amountEthMin = minAmount(optimalEth, config.lpSlippage);
+  const gasEstimate = await router.addLiquidityETH.estimateGas(tokenAddress, tokenAmount, amountTokenMin, amountEthMin, wallet.address, deadline, { value: ethAmount });
+  const tx = await router.addLiquidityETH(tokenAddress, tokenAmount, amountTokenMin, amountEthMin, wallet.address, deadline, { ...feeParams, value: ethAmount, gasLimit: gasEstimate + gasEstimate / 5n, nonce });
   log(`[LP] Add liquidity sent tx=${tx.hash}`, "warn");
   const receipt = await tx.wait();
   if (receipt.status !== 1) throw new Error("LP add liquidity reverted");
 
   const after = await getLpStatus({ provider, walletAddress: wallet.address, routerAddress, tokenAddress });
   if (!after.exists || after.lpBalance <= before.lpBalance) throw new Error("LP add verification failed: LP balance did not increase");
-  log(`[LP] Add verified pair=${after.pairAddress} lp=${after.lpBalance.toString()}`, "success");
-  return { receipt, before, after };
+  const proof = {
+    txHash: tx.hash,
+    receiptStatus: receipt.status,
+    routerAddress,
+    poolAddress: after.pairAddress,
+    tokenAddress,
+    tokenDecimals,
+    tokenAmountDesired: tokenAmount.toString(),
+    ethAmountDesired: ethAmount.toString(),
+    tokenAmountUsedMinReference: optimalToken.toString(),
+    ethAmountUsedMinReference: optimalEth.toString(),
+    tokenAmountDisplay: formatAmount(tokenAmount, tokenDecimals),
+    ethAmountDisplay: ethers.formatEther(ethAmount),
+    beforeLpBalance: before.lpBalance.toString(),
+    afterLpBalance: after.lpBalance.toString(),
+    liquidityDelta: (after.lpBalance - before.lpBalance).toString(),
+    before,
+    after
+  };
+  log(`[LP] Add verified tx=${tx.hash} status=${receipt.status} router=${routerAddress} pool=${after.pairAddress}`, "success");
+  log(`[LP] Amounts ETH=${proof.ethAmountDisplay} token=${proof.tokenAmountDisplay} beforeLp=${proof.beforeLpBalance} afterLp=${proof.afterLpBalance}`, "success");
+  return proof;
 }
 
 export async function removeLiquidity({ wallet, provider, config, routerAddress, tokenAddress, chainId, getFeeParams, getNextNonce, log }) {

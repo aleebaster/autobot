@@ -2323,7 +2323,10 @@ function getLpManager() {
       rpcUrl: SEPOLIA_RPC_URL,
       chainId: SEPOLIA_CHAIN_ID,
       routerAddress: LEVERAGED_ROUTER,
-      daiAddress: LEVERAGED_DAI_ADDRESS
+      tokenMap: {
+        DAI: LEVERAGED_DAI_ADDRESS,
+        USDC: USDC_ADDRESS
+      }
     });
   }
   lpManager.deps.accounts = accounts;
@@ -2518,9 +2521,9 @@ lpSubMenu.on("select", async (item) => {
         break;
       case "[4] LP Config":
         configForm.configType = "lpConfig";
-        configForm.setLabel(" lpEnabled,pair,eth,dai,wait,cooldown,slippage,cycles ");
+        configForm.setLabel(" pair,mode,tokenA,tokenB,slip,rebalance,removeMin,minLiq,retries,retrySec,custom ");
         minLabel.hide(); maxLabel.hide();
-        configInput.setValue(`${lpConfig.lpEnabled},${lpConfig.lpPair},${lpConfig.lpEthAmount},${lpConfig.lpDaiAmount},${lpConfig.lpWaitMinutes},${lpConfig.lpCooldownMinutes},${lpConfig.lpSlippage},${lpConfig.lpCycles}`);
+        configInput.setValue(`${lpConfig.lpPair},${lpConfig.lpAmountMode},${lpConfig.lpTokenAAmount},${lpConfig.lpTokenBAmount},${lpConfig.lpSlippage},${lpConfig.lpAutoRebalance},${lpConfig.lpAutoRemoveMinutes},${lpConfig.lpMinLiquidity},${lpConfig.lpRetryAttempts},${lpConfig.lpRetryDelaySeconds},${lpConfig.lpCustomTokenAddress}`);
         configInputMax.setValue(""); configInputMax.hide();
         lpSubMenu.hide();
         configForm.show();
@@ -2721,26 +2724,38 @@ configForm.on("submit", () => {
     tradingConfig.blacklistMarkets = (blacklist || "").split("|").map(v => v.trim()).filter(Boolean);
     addLog(`Safety daily=${tradingConfig.maxDailyTrades}, cooldown=${tradingConfig.cooldownPerMarket}s, blacklist=${tradingConfig.blacklistMarkets.join("|") || "none"}`, "success");
   } else if (configForm.configType === "lpConfig") {
-    const [enabled, pair, ethAmount, daiAmount, waitMinutes, cooldownMinutes, slippage, cycles] = String(value).split(",").map(v => v.trim());
-    if (!ethAmount || !daiAmount || !waitMinutes || !cooldownMinutes || !slippage || !cycles) {
-      addLog("Use LP format: enabled,pair,eth,dai,wait,cooldown,slippage,cycles", "error");
+    const [pair, amountMode, tokenAAmount, tokenBAmount, slippage, autoRebalance, autoRemoveMinutes, minLiquidity, retryAttempts, retryDelaySeconds, customTokenAddress] = String(value).split(",").map(v => v.trim());
+    if (!pair || !amountMode || !tokenAAmount || !tokenBAmount || !slippage || !autoRemoveMinutes || !minLiquidity || !retryAttempts || !retryDelaySeconds) {
+      addLog("Use LP format: pair,mode,tokenA,tokenB,slippage,rebalance,removeMin,minLiq,retries,retrySec,custom", "error");
       isSubmitting = false; return;
     }
-    if ((pair || "ETH/DAI") !== "ETH/DAI") {
-      addLog("LP pair currently supports ETH/DAI only.", "error");
+    if (!["fixed", "walletPercent"].includes(amountMode)) {
+      addLog("LP amount mode must be fixed or walletPercent.", "error");
+      isSubmitting = false; return;
+    }
+    const normalizedPair = pair.toUpperCase();
+    if (!["ETH/DAI", "ETH/USDC", "CUSTOM", "ETH/CUSTOM"].includes(normalizedPair)) {
+      addLog("LP pair must be ETH/DAI, ETH/USDC, CUSTOM, or ETH/CUSTOM.", "error");
       isSubmitting = false; return;
     }
     lpConfig = loadLpConfig({
-      lpEnabled: ["true", "yes", "1", "on"].includes(String(enabled).toLowerCase()),
-      lpPair: pair || "ETH/DAI",
-      lpEthAmount: ethAmount,
-      lpDaiAmount: daiAmount,
-      lpWaitMinutes: Number(waitMinutes),
-      lpCooldownMinutes: Number(cooldownMinutes),
+      lpEnabled: true,
+      lpPair: normalizedPair,
+      lpAmountMode: amountMode,
+      lpTokenAAmount: tokenAAmount,
+      lpTokenBAmount: tokenBAmount,
+      lpEthAmount: tokenAAmount,
+      lpDaiAmount: tokenBAmount,
       lpSlippage: Number(slippage),
-      lpCycles: Number(cycles)
+      lpAutoRebalance: ["true", "yes", "1", "on"].includes(String(autoRebalance).toLowerCase()),
+      lpAutoRemoveMinutes: Number(autoRemoveMinutes),
+      lpMinLiquidity: minLiquidity,
+      lpRetryAttempts: Number(retryAttempts),
+      lpRetryDelaySeconds: Number(retryDelaySeconds),
+      lpCustomTokenAddress: customTokenAddress || "",
+      lpCycles: lpConfig.lpCycles
     });
-    addLog(`LP Config saved enabled=${lpConfig.lpEnabled}, pair=${lpConfig.lpPair}, ETH=${lpConfig.lpEthAmount}, DAI=${lpConfig.lpDaiAmount}, wait=${lpConfig.lpWaitMinutes}m, cooldown=${lpConfig.lpCooldownMinutes}m, slippage=${lpConfig.lpSlippage}%, cycles=${lpConfig.lpCycles}`, "success");
+    addLog(`LP Config saved pair=${lpConfig.lpPair}, mode=${lpConfig.lpAmountMode}, tokenA=${lpConfig.lpTokenAAmount}, tokenB=${lpConfig.lpTokenBAmount}, slippage=${lpConfig.lpSlippage}%, rebalance=${lpConfig.lpAutoRebalance}, autoRemove=${lpConfig.lpAutoRemoveMinutes}m, minLiquidity=${lpConfig.lpMinLiquidity}, retries=${lpConfig.lpRetryAttempts}`, "success");
   } else if (configForm.configType === "loopHours") {
     dailyActivityConfig.loopHours = value;
     addLog(`Loop Daily set to ${value} hours`, "success");
