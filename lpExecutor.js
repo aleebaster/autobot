@@ -61,7 +61,24 @@ function formatAmount(amount, decimals) {
   try { return ethers.formatUnits(amount, decimals); } catch { return amount.toString(); }
 }
 
-async function getFixedOrPercentAmounts({ wallet, provider, config, tokenAddress, tokenDecimals }) {
+function getReserveSide(status, wethAddress, tokenAddress) {
+  const token0 = status.token0.toLowerCase();
+  return {
+    reserveEth: token0 === wethAddress.toLowerCase() ? status.reserves[0] : status.reserves[1],
+    reserveToken: token0 === tokenAddress.toLowerCase() ? status.reserves[0] : status.reserves[1]
+  };
+}
+
+function estimateLiquidity({ optimalEth, optimalToken, status, wethAddress, tokenAddress }) {
+  if (!status.reserves || status.totalSupply === 0n) return 0n;
+  const { reserveEth, reserveToken } = getReserveSide(status, wethAddress, tokenAddress);
+  if (reserveEth === 0n || reserveToken === 0n) return 0n;
+  const ethLiquidity = optimalEth * status.totalSupply / reserveEth;
+  const tokenLiquidity = optimalToken * status.totalSupply / reserveToken;
+  return ethLiquidity < tokenLiquidity ? ethLiquidity : tokenLiquidity;
+}
+
+async function getFixedOrPercentAmounts({ wallet, provider, config, tokenAddress, tokenDecimals, status, wethAddress }) {
   if (config.lpAmountMode === "walletPercent") {
     const percent = BigInt(Math.max(0, Math.min(10000, Math.floor(Number(config.lpWalletPercent) * 100))));
     if (percent <= 0n) throw new Error("LP walletPercent must be greater than zero");
@@ -75,7 +92,9 @@ async function getFixedOrPercentAmounts({ wallet, provider, config, tokenAddress
 
   return {
     ethAmount: ethers.parseEther(String(config.lpTokenAAmount ?? config.lpEthAmount)),
-    tokenAmount: ethers.parseUnits(String(config.lpTokenBAmount ?? config.lpDaiAmount), tokenDecimals)
+    tokenAmount: String(config.lpTokenBAmount ?? config.lpDaiAmount).toLowerCase() === "auto"
+      ? ethers.parseEther(String(config.lpTokenAAmount ?? config.lpEthAmount)) * getReserveSide(status, wethAddress, tokenAddress).reserveToken / getReserveSide(status, wethAddress, tokenAddress).reserveEth
+      : ethers.parseUnits(String(config.lpTokenBAmount ?? config.lpDaiAmount), tokenDecimals)
   };
 }
 
@@ -129,14 +148,13 @@ export async function getLpStatus({ provider, walletAddress, routerAddress, toke
 
 export async function addLiquidity({ wallet, provider, config, routerAddress, tokenAddress, chainId, getFeeParams, getNextNonce, log }) {
   const router = new ethers.Contract(routerAddress, ROUTER_LP_ABI, wallet);
-  const token = new ethers.Contract(tokenAddress, ERC20_ABI, provider);
-  const tokenDecimals = Number(await token.decimals());
-  const { ethAmount, tokenAmount } = await getFixedOrPercentAmounts({ wallet, provider, config, tokenAddress, tokenDecimals });
-  if (tokenAmount <= 0n || ethAmount <= 0n) throw new Error("LP amounts must be greater than zero");
-
   const before = await getLpStatus({ provider, walletAddress: wallet.address, routerAddress, tokenAddress });
   if (!before.pairAddress || before.pairAddress === ZERO_ADDRESS) throw new Error(`LP pool not found for token ${tokenAddress}`);
   if (BigInt(before.totalSupply || 0n) < ethers.parseUnits(String(config.lpMinLiquidity || "0"), 0)) throw new Error(`LP total liquidity below threshold: ${before.totalSupply}`);
+  const token = new ethers.Contract(tokenAddress, ERC20_ABI, provider);
+  const tokenDecimals = Number(await token.decimals());
+  const { ethAmount, tokenAmount } = await getFixedOrPercentAmounts({ wallet, provider, config, tokenAddress, tokenDecimals, status: before, wethAddress: before.wethAddress });
+  if (tokenAmount <= 0n || ethAmount <= 0n) throw new Error("LP amounts must be greater than zero");
   const { optimalEth, optimalToken } = getOptimalAddAmounts({ ethAmount, tokenAmount, status: before, wethAddress: before.wethAddress, tokenAddress });
   await ensureApproval({ wallet, provider, tokenAddress, spender: routerAddress, amount: tokenAmount, getFeeParams, getNextNonce, chainId, log });
   const deadline = Math.floor(Date.now() / 1000) + 1200;
@@ -144,6 +162,9 @@ export async function addLiquidity({ wallet, provider, config, routerAddress, to
   const nonce = await getNextNonce(provider, wallet.address, chainId);
   const amountTokenMin = minAmount(optimalToken, config.lpSlippage);
   const amountEthMin = minAmount(optimalEth, config.lpSlippage);
+  const expectedLiquidity = estimateLiquidity({ optimalEth, optimalToken, status: before, wethAddress: before.wethAddress, tokenAddress });
+  log(`[LP] Step 4 confirmation router=${routerAddress} pool=${before.pairAddress}`, "warn");
+  log(`[LP] expectedLp=${expectedLiquidity.toString()} slippage=${config.lpSlippage}% amountTokenMin=${amountTokenMin.toString()} amountEthMin=${amountEthMin.toString()}`, "warn");
   const gasEstimate = await router.addLiquidityETH.estimateGas(tokenAddress, tokenAmount, amountTokenMin, amountEthMin, wallet.address, deadline, { value: ethAmount });
   const tx = await router.addLiquidityETH(tokenAddress, tokenAmount, amountTokenMin, amountEthMin, wallet.address, deadline, { ...feeParams, value: ethAmount, gasLimit: gasEstimate + gasEstimate / 5n, nonce });
   log(`[LP] Add liquidity sent tx=${tx.hash}`, "warn");
@@ -163,6 +184,9 @@ export async function addLiquidity({ wallet, provider, config, routerAddress, to
     ethAmountDesired: ethAmount.toString(),
     tokenAmountUsedMinReference: optimalToken.toString(),
     ethAmountUsedMinReference: optimalEth.toString(),
+    expectedLiquidity: expectedLiquidity.toString(),
+    amountTokenMin: amountTokenMin.toString(),
+    amountEthMin: amountEthMin.toString(),
     tokenAmountDisplay: formatAmount(tokenAmount, tokenDecimals),
     ethAmountDisplay: ethers.formatEther(ethAmount),
     beforeLpBalance: before.lpBalance.toString(),

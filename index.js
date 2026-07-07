@@ -10,18 +10,18 @@ import { SocksProxyAgent } from "socks-proxy-agent";
 import { DEFAULT_LP_CONFIG, loadLpConfig, serializeLpConfig } from "./lpConfig.js";
 import { LpManager } from "./lpManager.js";
 
-const SEPOLIA_RPC_URL = "https://ethereum-sepolia-rpc.publicnode.com/";
+const SEPOLIA_RPC_URL = "https://ethereum-sepolia-rpc.publicnode.com/557d07a988c4164482ef0c56a10f98ee0e3073440fd72fbe89cd7f6fef809388";
 const SEPOLIA_CHAIN_ID = 11155111;
 
-const NEMESIS_ROUTER  = "0xA1f78beD1a79B9aec972e373E0e7F63d8cAce4a8";
+const NEMESIS_ROUTER  = "0xeDeC53F31C5f7BE26fcD1C5Edf405AE653BBd342";
 const WETH_ADDRESS    = "0x7b79995e5f793A07Bc00c21412e50Ecae098E7f9";
-const USDC_ADDRESS    = "0x10279e6333f9d0EE103F4715b8aaEA75BE61464C";
-const DAI_ADDRESS     = "0xd67215fD6c0890493F34aF3C5E4231cE98871fCb";
-const UNI_ADDRESS    = "0x7438eA86A89b7d53aF5264Fb3aBaE1172b046663";
+const USDC_ADDRESS    = "0x5cb826e44f313c3294663d74c7e555f145aa7c19";
+const DAI_ADDRESS     = "0xf43ca549bb166cd3b165b5262226bba8cb4114dc";
+const UNI_ADDRESS    = "0xbc77ba7b5a2bf4e71256f71fc5fb4fb5f498421a";
 const EXPECTED_WALLET = "0x315E5193633A962B3F369F9C3833D973D0588cCD";
-const LEVERAGED_FACTORY = "0x3A4A7D9ED3701bB331f6E6040362614ab1D787D3";
-const LEVERAGED_ROUTER = "0x5b23F24b08fa3FAa0Fa555611ACF74c3bAb23550";
-const LEVERAGED_DAI_ADDRESS = "0x8a871311feF28B3d684Fb4F06B964603196BD4E3";
+const LEVERAGED_FACTORY = "0x938B84B0F4E02B008dDf5FF3108C4DCd163e1318";
+const LEVERAGED_ROUTER = "0xeDeC53F31C5f7BE26fcD1C5Edf405AE653BBd342";
+const LEVERAGED_DAI_ADDRESS = "0xf43ca549bb166cd3b165b5262226bba8cb4114dc";
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 const BPS = 10000n;
 
@@ -98,9 +98,9 @@ const POSITION_ABI = [
   "error MAM_NotOwner()",
   "error MAM_OracleUnavailable()",
   "error MAM_ZeroOraclePrice()",
-  "event MAM_PositionCreated(uint256 indexed positionId,address indexed user,bool isLong,address collateralToken,uint256 collateralAmount,uint256 debtAmount)",
+  "event MAM_PositionCreated(uint256 indexed positionId,address indexed user,bool isLong,address collateralToken,uint256 collateralAmount,uint256 borrowAmount,uint256 debtAmount,uint256 leverageX10,uint256 deadline)",
   "event MAM_LoopPositionCreated(uint256 indexed positionId,address indexed user,uint256 leverageX10)",
-  "event MAM_PositionClosed(uint256 indexed positionId,uint256 collateralReturned)",
+  "event MAM_PositionClosed(uint256 indexed positionId,uint256 collateralReturned,int256 lossCollateral,uint256 borrowAmount)",
   "event MAM_PositionPartiallyClosed(uint256 indexed positionId,uint256 debtRepaid,uint256 collateralConsumed,uint256 collateralReturned,uint256 protocolFee)"
 ];
 
@@ -2052,7 +2052,7 @@ const lpSubMenu = blessed.list({
     selected: { bg: "green", fg: "black" },
     item: { fg: "white" }
   },
-  items:  ["[1] Add Liquidity", "[2] Remove Liquidity", "[3] Auto LP Cycle", "[4] LP Config", "[5] LP Status", "[6] Back"],
+  items:  ["[1] Add Liquidity", "[2] Remove Liquidity", "[3] LP Config", "[4] LP Status", "[5] Back"],
   padding: { left: 1, top: 1 },
   hidden:  true
 });
@@ -2516,10 +2516,7 @@ lpSubMenu.on("select", async (item) => {
       case "[2] Remove Liquidity":
         await getLpManager().removeLiquidity();
         break;
-      case "[3] Auto LP Cycle":
-        getLpManager().autoCycle().catch(error => addLog(`[LP] Auto LP Cycle failed: ${error.message}`, "error"));
-        break;
-      case "[4] LP Config":
+      case "[3] LP Config":
         configForm.configType = "lpConfig";
         configForm.setLabel(" pair,mode,tokenA,tokenB,slip,rebalance,removeMin,minLiq,retries,retrySec,custom ");
         minLabel.hide(); maxLabel.hide();
@@ -2535,10 +2532,10 @@ lpSubMenu.on("select", async (item) => {
           }
         }, 100);
         break;
-      case "[5] LP Status":
+      case "[4] LP Status":
         await getLpManager().status();
         break;
-      case "[6] Back":
+      case "[5] Back":
         showMainMenuFrom(lpSubMenu);
         break;
     }
