@@ -13,21 +13,22 @@ import { LpManager } from "./lpManager.js";
 const SEPOLIA_RPC_URL = "https://ethereum-sepolia-rpc.publicnode.com/557d07a988c4164482ef0c56a10f98ee0e3073440fd72fbe89cd7f6fef809388";
 const SEPOLIA_CHAIN_ID = 11155111;
 
-const NEMESIS_ROUTER  = "0xeDeC53F31C5f7BE26fcD1C5Edf405AE653BBd342";
+const NEMESIS_ROUTER  = "0x5b23F24b08fa3FAa0Fa555611ACF74c3bAb23550";
 const WETH_ADDRESS    = "0x7b79995e5f793A07Bc00c21412e50Ecae098E7f9";
-const USDC_ADDRESS    = "0x5cb826e44f313c3294663d74c7e555f145aa7c19";
-const DAI_ADDRESS     = "0xf43ca549bb166cd3b165b5262226bba8cb4114dc";
-const UNI_ADDRESS    = "0xbc77ba7b5a2bf4e71256f71fc5fb4fb5f498421a";
+const USDC_ADDRESS    = "0xc4D9dC931B43930e1AA1F90D8a032AF4Ac66560a";
+const DAI_ADDRESS     = "0x8a871311feF28B3d684Fb4F06B964603196BD4E3";
+const UNI_ADDRESS     = "0xC32a7fCB1cC8E247D9b8ED74220f6F8A61341F4F";
 const NEMESIS_ADDRESS = "0x534a29DfcA1ceFB6e933f6C0D00e8A43a52e60d2";
 const EXPECTED_WALLET = "0x315E5193633A962B3F369F9C3833D973D0588cCD";
-const LEVERAGED_FACTORY = "0x938B84B0F4E02B008dDf5FF3108C4DCd163e1318";
-const LEVERAGED_ROUTER = "0xeDeC53F31C5f7BE26fcD1C5Edf405AE653BBd342";
-const LEVERAGED_DAI_ADDRESS = "0xf43ca549bb166cd3b165b5262226bba8cb4114dc";
+const LEVERAGED_FACTORY = "0x3A4A7D9ED3701bB331f6E6040362614ab1D787D3";
+const LEVERAGED_ROUTER = "0x5b23F24b08fa3FAa0Fa555611ACF74c3bAb23550";
+const LEVERAGED_DAI_ADDRESS = "0x8a871311feF28B3d684Fb4F06B964603196BD4E3";
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 const BPS = 10000n;
 
 const CONFIG_FILE = "config.json";
 const isDebug = false;
+const IS_CLI = process.argv.includes("--long") || process.argv.includes("--short");
 
 const TOKENS = {
   USDC: { address: USDC_ADDRESS, decimals: 6,  symbol: "USDC" },
@@ -332,6 +333,7 @@ function addLog(message, type = "info") {
     default:        coloredMessage = chalk.white(message);
   }
   transactionLogs.push(`[${timestamp}] ${coloredMessage}`);
+  console.log(`[${timestamp}] ${coloredMessage}`);
   updateLogs();
 }
 
@@ -2175,6 +2177,7 @@ screen.append(configForm);
 let renderQueue  = [];
 let isRendering  = false;
 function safeRender() {
+  if (IS_CLI || typeof screen === 'undefined' || !screen) return;
   renderQueue.push(true);
   if (isRendering) return;
   isRendering = true;
@@ -2188,7 +2191,7 @@ function safeRender() {
       }
       screen.render();
     } catch (error) {
-      addLog(`UI render error: ${error.message}`, "error");
+      console.error(`UI render error (non-fatal): ${error.message}`);
     }
     renderQueue.shift();
     isRendering = false;
@@ -2197,6 +2200,7 @@ function safeRender() {
 }
 
 function adjustLayout() {
+  if (typeof screen === 'undefined' || !screen) return;
   const H = screen.height || 24;
   const W = screen.width  || 80;
   headerBox.height  = Math.max(6, Math.floor(H * 0.15));
@@ -2285,11 +2289,13 @@ async function updateWallets() {
 
 function updateLogs() {
   try {
-    logBox.add(transactionLogs[transactionLogs.length - 1] || chalk.gray("No logs available."));
-    logBox.scrollTo(transactionLogs.length);
+    if (typeof logBox !== 'undefined' && logBox) {
+      logBox.add(transactionLogs[transactionLogs.length - 1] || chalk.gray("No logs available."));
+      logBox.scrollTo(transactionLogs.length);
+    }
     safeRender();
   } catch (error) {
-    addLog(`Log update failed: ${error.message}`, "error");
+    console.error(`Log update error (non-fatal): ${error.message}`);
   }
 }
 
@@ -2940,9 +2946,35 @@ async function initialize() {
   }
 }
 
-setTimeout(() => {
-  adjustLayout();
-  screen.on("resize", adjustLayout);
-}, 100);
-
-initialize();
+if (IS_CLI) {
+  const side = process.argv.includes("--long") ? "LONG" : "SHORT";
+  loadConfig();
+  tradingConfig.defaultCollateralToken = "0x8a871311feF28B3d684Fb4F06B964603196BD4E3";
+  tradingConfig.fullAutoEnabled = false;
+  tradingConfig.autoRSIEnabled = false;
+  tradingConfig.simulateOnly = false;
+  tradingConfig.maxTradesPerPair = 5;
+  tradingConfig.maxConcurrentTrades = 5;
+  if (tradingConfig.uiShortPayloadReference) tradingConfig.uiShortPayloadReference[1] = "0x8a871311feF28B3d684Fb4F06B964603196BD4E3";
+  if (tradingConfig.uiLongPayloadReference) tradingConfig.uiLongPayloadReference[1] = "0x8a871311feF28B3d684Fb4F06B964603196BD4E3";
+  loadAccounts();
+  loadProxies();
+  const provider = getProvider(SEPOLIA_RPC_URL, SEPOLIA_CHAIN_ID, proxies[selectedWalletIndex % proxies.length] || null);
+  const wallet = new ethers.Wallet(accounts[selectedWalletIndex].privateKey, provider);
+  addLog(`[CLI] Starting ${side} position...`, "warn");
+  addLog(`[CLI] Wallet: ${wallet.address}`, "info");
+  addLog(`[CLI] defaultCollateralToken: ${tradingConfig.defaultCollateralToken}`, "info");
+  openLeveragedPosition(side).then(() => {
+    addLog("[CLI] === DONE ===", "success");
+    process.exit(0);
+  }).catch(e => {
+    addLog(`[CLI] FAILED: ${e.message}`, "error");
+    process.exit(1);
+  });
+} else {
+  setTimeout(() => {
+    adjustLayout();
+    screen.on("resize", adjustLayout);
+  }, 100);
+  initialize();
+}
