@@ -18,6 +18,7 @@ const WETH_ADDRESS    = "0x7b79995e5f793A07Bc00c21412e50Ecae098E7f9";
 const USDC_ADDRESS    = "0x5cb826e44f313c3294663d74c7e555f145aa7c19";
 const DAI_ADDRESS     = "0xf43ca549bb166cd3b165b5262226bba8cb4114dc";
 const UNI_ADDRESS    = "0xbc77ba7b5a2bf4e71256f71fc5fb4fb5f498421a";
+const NEMESIS_ADDRESS = "0x534a29DfcA1ceFB6e933f6C0D00e8A43a52e60d2";
 const EXPECTED_WALLET = "0x315E5193633A962B3F369F9C3833D973D0588cCD";
 const LEVERAGED_FACTORY = "0x938B84B0F4E02B008dDf5FF3108C4DCd163e1318";
 const LEVERAGED_ROUTER = "0xeDeC53F31C5f7BE26fcD1C5Edf405AE653BBd342";
@@ -30,8 +31,9 @@ const isDebug = false;
 
 const TOKENS = {
   USDC: { address: USDC_ADDRESS, decimals: 6,  symbol: "USDC" },
-  DAI:  { address: DAI_ADDRESS,  decimals: 18, symbol: "DAI"  },
-  UNI: { address: UNI_ADDRESS, decimals: 18, symbol: "UNI" }
+  DAI:  { address: DAI_ADDRESS,  decimals: 6, symbol: "DAI"  },
+  UNI: { address: UNI_ADDRESS, decimals: 6, symbol: "UNI" },
+  NEMESIS: { address: NEMESIS_ADDRESS, decimals: 6, symbol: "NEMESIS" }
 };
 
 const MARKET_CANDIDATES = [
@@ -40,14 +42,8 @@ const MARKET_CANDIDATES = [
   { symbol: "ETH/UNI", marketToken: WETH_ADDRESS, collateralToken: UNI_ADDRESS, supportsLong: true, supportsShort: true, rsiSymbol: "ETHUSDT" }
 ];
 
-const SWAP_PAIRS = [
-  { from: "ETH",  to: "USDC" },
-  { from: "USDC", to: "ETH"  },
-  { from: "ETH",  to: "DAI"  },
-  { from: "DAI",  to: "ETH"  },
-  { from: "ETH",  to: "UNI" },
-  { from: "UNI", to: "ETH"  }
-];
+// SWAP_PAIRS will be dynamically built based on real wallet balances
+let SWAP_PAIRS = [];
 
 const ROUTER_ABI = [
   "function swapExactETHForTokens(uint256 amountOutMin, address[] calldata path, address to, uint256 deadline) payable returns (uint256[] memory)",
@@ -125,6 +121,7 @@ let walletInfo = {
   balanceUSDC:  "0.00",
   balanceDAI:   "0.000000",
   balanceUNI:  "0.000000",
+  balanceNEMESIS: "0.000000",
   activeAccount:"N/A"
 };
 
@@ -153,6 +150,7 @@ let dailyActivityConfig = {
   usdcRange: { min: 500,     max: 1000    },
   daiRange:  { min: 0.5,     max: 1.0     },
   uniRange: { min: 0.01,    max: 0.05    },
+  nemesisRange: { min: 0.5, max: 1.0     },
   loopHours: 24
 };
 
@@ -229,6 +227,8 @@ function loadConfig() {
       dailyActivityConfig.daiRange.max  = Number(cfg.daiRange?.max)  || 1.0;
       dailyActivityConfig.uniRange.min = Number(cfg.uniRange?.min) || 0.01;
       dailyActivityConfig.uniRange.max = Number(cfg.uniRange?.max) || 0.05;
+      dailyActivityConfig.nemesisRange.min = Number(cfg.nemesisRange?.min) || 0.5;
+      dailyActivityConfig.nemesisRange.max = Number(cfg.nemesisRange?.max) || 1.0;
       dailyActivityConfig.loopHours     = Number(cfg.loopHours)      || 24;
 
       tradingConfig.enableLong = cfg.enableLong !== false;
@@ -471,16 +471,19 @@ async function updateWalletData() {
       const usdcContract = new ethers.Contract(USDC_ADDRESS, ERC20_ABI, provider);
       const daiContract  = new ethers.Contract(DAI_ADDRESS,  ERC20_ABI, provider);
       const uniContract = new ethers.Contract(UNI_ADDRESS, ERC20_ABI, provider);
+      const nemesisContract = new ethers.Contract(NEMESIS_ADDRESS, ERC20_ABI, provider);
 
-      const [usdcBal, daiBal, uniBal] = await Promise.all([
+      const [usdcBal, daiBal, uniBal, nemesisBal] = await Promise.all([
         usdcContract.balanceOf(wallet.address),
         daiContract.balanceOf(wallet.address),
-        uniContract.balanceOf(wallet.address)
+        uniContract.balanceOf(wallet.address),
+        nemesisContract.balanceOf(wallet.address)
       ]);
 
       const formattedUSDC = Number(ethers.formatUnits(usdcBal, 6)).toFixed(2);
-      const formattedDAI  = Number(ethers.formatEther(daiBal)).toFixed(4);
-      const formattedUNI = Number(ethers.formatEther(uniBal)).toFixed(4);
+      const formattedDAI  = Number(ethers.formatUnits(daiBal, 6)).toFixed(4);
+      const formattedUNI = Number(ethers.formatUnits(uniBal, 6)).toFixed(4);
+      const formattedNEMESIS = Number(ethers.formatUnits(nemesisBal, 6)).toFixed(4);
 
       if (i === selectedWalletIndex) {
         walletInfo.address      = wallet.address;
@@ -489,6 +492,7 @@ async function updateWalletData() {
         walletInfo.balanceUSDC  = formattedUSDC;
         walletInfo.balanceDAI   = formattedDAI;
         walletInfo.balanceUNI  = formattedUNI;
+        walletInfo.balanceNEMESIS = formattedNEMESIS;
       }
 
       const prefix = i === selectedWalletIndex ? "→ " : "  ";
@@ -497,7 +501,8 @@ async function updateWalletData() {
         `   ${chalk.bold.cyanBright(formattedETH.padEnd(10))}` +
         `  ${chalk.bold.greenBright(formattedUSDC.padEnd(10))}` +
         `  ${chalk.bold.yellowBright(formattedDAI.padEnd(8))}` +
-        `  ${chalk.bold.blueBright(formattedUNI)}`
+        `  ${chalk.bold.blueBright(formattedUNI.padEnd(8))}` +
+        `  ${chalk.bold.whiteBright(formattedNEMESIS)}`
       );
     } catch (error) {
       addLog(`Failed to fetch wallet data for account #${i + 1}: ${error.message}`, "error");
@@ -561,6 +566,24 @@ async function approveToken(wallet, tokenAddress, spender, amount, provider) {
   const receipt = await tx.wait();
   if (receipt.status === 0) throw new Error("Approve transaction reverted");
   addLog(`Approve confirmed: ${getShortHash(tx.hash)}`, "success");
+}
+
+async function buildDynamicSwapPairs(provider, walletAddress) {
+  const pairs = [];
+  const tokens = ["ETH"];
+  for (const [key, info] of Object.entries(TOKENS)) {
+    try {
+      const contract = new ethers.Contract(info.address, ERC20_ABI, provider);
+      const bal = await contract.balanceOf(walletAddress);
+      if (bal > 0n) tokens.push(key);
+    } catch {}
+  }
+  for (const token of tokens) {
+    if (token === "ETH") continue;
+    pairs.push({ from: "ETH", to: token });
+    pairs.push({ from: token, to: "ETH" });
+  }
+  return pairs;
 }
 
 async function performSwap(wallet, fromToken, toToken, amount, proxyUrl) {
@@ -1782,6 +1805,7 @@ function getSwapAmount(pair) {
     case "USDC": return getRandomAmount(dailyActivityConfig.usdcRange.min, dailyActivityConfig.usdcRange.max);
     case "DAI":  return getRandomAmount(dailyActivityConfig.daiRange.min,  dailyActivityConfig.daiRange.max);
     case "UNI": return getRandomAmount(dailyActivityConfig.uniRange.min, dailyActivityConfig.uniRange.max);
+    case "NEMESIS": return getRandomAmount(dailyActivityConfig.nemesisRange.min, dailyActivityConfig.nemesisRange.max);
     default: return 0;
   }
 }
@@ -1818,7 +1842,10 @@ async function runDailyActivity() {
       }
       addLog(`Processing account ${accountIndex + 1}: ${getShortAddress(wallet.address)}`, "wait");
 
-      const shuffledPairs = [...SWAP_PAIRS].sort(() => Math.random() - 0.5);
+      const providerForPairs = getProvider(SEPOLIA_RPC_URL, SEPOLIA_CHAIN_ID, proxyUrl);
+      const dynamicPairs = await buildDynamicSwapPairs(providerForPairs, wallet.address);
+      const activePairs = dynamicPairs.length > 0 ? dynamicPairs : SWAP_PAIRS;
+      const shuffledPairs = [...activePairs].sort(() => Math.random() - 0.5);
 
       for (let swapCount = 0; swapCount < dailyActivityConfig.activityRepetitions && !shouldStop; swapCount++) {
         const pair   = shuffledPairs[swapCount % shuffledPairs.length];
@@ -2029,6 +2056,7 @@ const dailyActivitySubMenu = blessed.list({
     "Set USDC Range",
     "Set DAI Range",
     "Set UNI Range",
+    "Set NEMESIS Range",
     "Set Loop Daily",
     "Back to Main Menu"
   ],
@@ -2237,9 +2265,10 @@ async function updateWallets() {
       `  ${chalk.bold.cyan("ETH".padEnd(10))}` +
       `  ${chalk.bold.green("USDC".padEnd(10))}` +
       `  ${chalk.bold.yellow("DAI".padEnd(8))}` +
-      `  ${chalk.bold.blue("UNI")}`
+      `  ${chalk.bold.blue("UNI".padEnd(8))}` +
+      `  ${chalk.bold.white("NEMESIS")}`
     );
-    const separator = chalk.gray("─".repeat(68));
+    const separator = chalk.gray("─".repeat(78));
     walletBox.setItems([header, separator, ...walletData]);
     walletBox.select(0);
     safeRender();
@@ -2563,6 +2592,7 @@ dailyActivitySubMenu.on("select", (item) => {
     "Set USDC Range":       { type: "usdcRange",           label: " Enter USDC Range (e.g. 500)",    hasRange: true, minVal: () => dailyActivityConfig.usdcRange.min.toString(), maxVal: () => dailyActivityConfig.usdcRange.max.toString() },
     "Set DAI Range":        { type: "daiRange",            label: " Enter DAI Range (e.g. 0.5)",     hasRange: true, minVal: () => dailyActivityConfig.daiRange.min.toString(),  maxVal: () => dailyActivityConfig.daiRange.max.toString()  },
     "Set UNI Range":       { type: "uniRange",           label: " Enter UNI Range (e.g. 0.01)",   hasRange: true, minVal: () => dailyActivityConfig.uniRange.min.toString(), maxVal: () => dailyActivityConfig.uniRange.max.toString() },
+    "Set NEMESIS Range":   { type: "nemesisRange",       label: " Enter NEMESIS Range (e.g. 0.5)", hasRange: true, minVal: () => dailyActivityConfig.nemesisRange.min.toString(), maxVal: () => dailyActivityConfig.nemesisRange.max.toString() },
     "Set Loop Daily":       { type: "loopHours",           label: " Enter Loop Hours (Min 1) ",       hasRange: false, val: () => dailyActivityConfig.loopHours.toString() }
   };
 
@@ -2608,7 +2638,7 @@ dailyActivitySubMenu.on("select", (item) => {
   }, 100);
 });
 
-const rangeKeys = ["ethRange", "usdcRange", "daiRange", "uniRange"];
+const rangeKeys = ["ethRange", "usdcRange", "daiRange", "uniRange", "nemesisRange"];
 let isSubmitting = false;
 
 configForm.on("submit", () => {
@@ -2850,6 +2880,30 @@ screen.key(["escape", "q", "C-c"], () => {
   process.exit(0);
 });
 
+async function printStartupDiagnostics(provider) {
+  addLog("===== DIAGNOSTICS =====", "warn");
+  addLog(`Wallet: ${walletInfo.address}`, "info");
+  addLog(`Chain: Sepolia (${SEPOLIA_CHAIN_ID})`, "info");
+  addLog(`RPC: ${SEPOLIA_RPC_URL}`, "info");
+  addLog(`Router: ${NEMESIS_ROUTER}`, "info");
+  addLog(`Factory: ${LEVERAGED_FACTORY}`, "info");
+  addLog(`WETH: ${WETH_ADDRESS}`, "info");
+  for (const [name, info] of Object.entries(TOKENS)) {
+    try {
+      const contract = new ethers.Contract(info.address, ERC20_ABI, provider);
+      const [dec, sym, bal] = await Promise.all([
+        contract.decimals(),
+        contract.symbol(),
+        contract.balanceOf(walletInfo.address)
+      ]);
+      addLog(`${name.padEnd(8)} ${info.address} dec=${dec} sym=${sym} raw=${bal.toString()} human=${ethers.formatUnits(bal, dec)}`, "info");
+    } catch (e) {
+      addLog(`${name.padEnd(8)} ${info.address} ERROR: ${e.message.slice(0,60)}`, "error");
+    }
+  }
+  addLog("=======================", "warn");
+}
+
 async function initialize() {
   try {
     startupGitSync();
@@ -2865,6 +2919,10 @@ async function initialize() {
     updateStatus();
     await updateWallets();
     updateLogs();
+    if (accounts.length > 0) {
+      const diagProvider = getProvider(SEPOLIA_RPC_URL, SEPOLIA_CHAIN_ID, proxies[selectedWalletIndex % proxies.length] || null);
+      await printStartupDiagnostics(diagProvider);
+    }
     addLog(`You Can Change the Default Config on set manual Config Menu`, "warn");
     safeRender();
     menuBox.focus();
