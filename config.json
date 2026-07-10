@@ -61,7 +61,7 @@
       "rsiSymbol": "ETHUSDT",
       "pool": "0xbd0446f21E65B145e2cd01c14424b1ed1Cf66bb4",
       "managerAddress": "0xc6951Dc2A758a473A941A1c32d585Fd59Ed983C4",
-      "liquidity": "97850090890750",
+      "liquidity": "97813181745862",
       "isActive": true,
       "health": "WORKING"
     },
@@ -74,7 +74,7 @@
       "rsiSymbol": "ETHUSDT",
       "pool": "0x840a4490bFAde0f2144760DbBC50DB3e2C35926f",
       "managerAddress": "0xF371b51eEf0b5E4C634c72caaD8A3Dd12C351363",
-      "liquidity": "33166794072650",
+      "liquidity": "33211893271031",
       "isActive": true,
       "health": "WORKING"
     },
@@ -87,7 +87,7 @@
       "rsiSymbol": "ETHUSDT",
       "pool": "0x9c9f120Bed52CdFecD809EE87e063ba99e23505C",
       "managerAddress": "0x8A81EeBb25c9C40cDDf1505543E1867B5C05055E",
-      "liquidity": "10368042251585",
+      "liquidity": "10368041236641",
       "isActive": true,
       "health": "WORKING"
     }
@@ -102,25 +102,11 @@
   "blacklistMarkets": [],
   "autoClose": false,
   "closePercent": 100,
-  "closeManager": "0xF371b51eEf0b5E4C634c72caaD8A3Dd12C351363",
-  "closePositionId": "89",
+  "closeManager": "0xc6951Dc2A758a473A941A1c32d585Fd59Ed983C4",
+  "closePositionId": "",
   "fallbackAmountOutMin": "0",
   "maxArg6Delta": "10",
-  "activePositions": [
-    {
-      "side": "LONG",
-      "positionId": "89",
-      "managerAddress": "0xF371b51eEf0b5E4C634c72caaD8A3Dd12C351363",
-      "symbol": "ETH/USDC",
-      "marketToken": "0x7b79995e5f793A07Bc00c21412e50Ecae098E7f9",
-      "collateralToken": "0x5cb826E44f313c3294663D74C7E555f145aA7c19",
-      "closeTarget": "0xF371b51eEf0b5E4C634c72caaD8A3Dd12C351363",
-      "openTarget": "0xF371b51eEf0b5E4C634c72caaD8A3Dd12C351363",
-      "txHash": "0xc8ef5549c06a7976e1f9e9889488317f7e40f1e0f155b498f87ab8c172c64a25",
-      "openedAt": 1783670980,
-      "size": "658026"
-    }
-  ],
+  "activePositions": [],
   "uiPayloadReference": null,
   "uiLongPayloadReference": null,
   "uiLongTxValueReference": null,
@@ -134,8 +120,8 @@
     "1780402415"
   ],
   "uiShortTxValueReference": "0",
-  "autoRSIEnabled": false,
-  "fullAutoEnabled": false,
+  "autoRSIEnabled": true,
+  "fullAutoEnabled": true,
   "lpEnabled": false,
   "lpPair": "ETH/DAI",
   "lpTokenA": "ETH",
