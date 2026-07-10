@@ -851,14 +851,16 @@ async function getLeveragedContext(provider, collateralToken, marketTokenArg = n
     throw new Error(`Collateral token and market token are identical: ${collateral}`);
   }
   const [tokenA, tokenB] = sortTokenPair(collateral, marketToken);
-  addLog(`marketToken=${marketToken}`, "info");
-  addLog(`collateralToken=${collateral}`, "info");
-  addLog(`pairToken=${pairToken}`, "info");
-  addLog(`poolKey=${tokenA}/${tokenB}`, "info");
+  addLog(`[DIAG] getLeveragedContext collateral=${collateral}(${getShortAddress(collateral)})`, "warn");
+  addLog(`[DIAG] marketToken=${marketToken}(${getShortAddress(marketToken)})`, "warn");
+  addLog(`[DIAG] poolKey=${tokenA}/${tokenB}`, "warn");
   const factory = new ethers.Contract(LEVERAGED_FACTORY, FACTORY_ABI, provider);
+  addLog(`[DIAG] factory.getPool(${getShortAddress(tokenA)}, ${getShortAddress(tokenB)})`, "warn");
   const pool = await factory.getPool(tokenA, tokenB);
-  if (!isValidContractTarget(pool)) throw new Error(`No leveraged pool for ${collateral}/${pairToken}`);
+  addLog(`[DIAG] getPool result=${pool}(${getShortAddress(pool)})`, "warn");
+  if (!isValidContractTarget(pool)) throw new Error(`No leveraged pool for ${collateral}/${pairToken} (poolKey=${getShortAddress(tokenA)}/${getShortAddress(tokenB)})`);
   const manager = await factory.getManager(pool);
+  addLog(`[DIAG] getManager result=${manager}(${getShortAddress(manager)})`, "warn");
   if (!isValidContractTarget(manager)) throw new Error(`No leveraged manager for pool ${pool}`);
   return { collateral, marketToken, pairToken, pool, manager, path: [collateral, marketToken] };
 }
@@ -1187,6 +1189,10 @@ async function waitForOpenPositionOnChain(wallet, provider, tx, side, positionId
 
 async function openLeveragedPosition(side, market = null, amountOverride = null) {
   const normalizedMarket = normalizeMarketConfig(market || {});
+  addLog(`[DIAG] openLeveragedPosition side=${side}`, "warn");
+  addLog(`[DIAG] market passed=${market ? JSON.stringify({ symbol: market.symbol, collateralToken: getShortAddress(market.collateralToken), marketToken: getShortAddress(market.marketToken) }) : "null"}`, "warn");
+  addLog(`[DIAG] normalizedMarket collateralToken=${getShortAddress(normalizedMarket.collateralToken)} marketToken=${getShortAddress(normalizedMarket.marketToken)}`, "warn");
+  addLog(`[DIAG] config defaultCollateralToken=${getShortAddress(tradingConfig.defaultCollateralToken)} marketToken=${getShortAddress(tradingConfig.marketToken)}`, "warn");
   if (side === "LONG" && !tradingConfig.enableLong) throw new Error("LONG disabled in config");
   if (side === "SHORT" && !tradingConfig.enableShort) throw new Error("SHORT disabled in config");
   if (closePending) throw new Error("[SKIP] close pending; waiting before opening new position");
