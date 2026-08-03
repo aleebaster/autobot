@@ -61,7 +61,7 @@
       "rsiSymbol": "ETHUSDT",
       "pool": "0x7Cb3D0dE20205059c2D629efd7802BCC68d7d17c",
       "managerAddress": "0x53bb0fFBdA04E5982fa08D846aA265Ff6cFE068e",
-      "liquidity": "1674126418854181",
+      "liquidity": "1674124243177660",
       "isActive": true,
       "health": "WORKING"
     }
@@ -77,10 +77,23 @@
   "autoClose": false,
   "closePercent": 100,
   "closeManager": "0x53bb0fFBdA04E5982fa08D846aA265Ff6cFE068e",
-  "closePositionId": "",
+  "closePositionId": "42",
   "fallbackAmountOutMin": "0",
   "maxArg6Delta": "10",
-  "activePositions": [],
+  "activePositions": [
+    {
+      "side": "SHORT",
+      "positionId": "42",
+      "managerAddress": "0x53bb0fFBdA04E5982fa08D846aA265Ff6cFE068e",
+      "symbol": "ETH/DAI",
+      "marketToken": "0x7b79995e5f793A07Bc00c21412e50Ecae098E7f9",
+      "collateralToken": "0xe99655E262eF4C20eBeC4805B3963dad52a1538e",
+      "closeTarget": "0x53bb0fFBdA04E5982fa08D846aA265Ff6cFE068e",
+      "openTarget": "0x53bb0fFBdA04E5982fa08D846aA265Ff6cFE068e",
+      "txHash": "0xf36120dd2d3120f8b91eb9dff2e54c777d8c9e20387ec3ff19d546b9b829f7ad",
+      "openedAt": 1785748490
+    }
+  ],
   "uiPayloadReference": null,
   "uiLongPayloadReference": null,
   "uiLongTxValueReference": null,
