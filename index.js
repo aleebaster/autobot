@@ -13,16 +13,16 @@ import { LpManager } from "./lpManager.js";
 const SEPOLIA_RPC_URL = "https://ethereum-sepolia-rpc.publicnode.com/557d07a988c4164482ef0c56a10f98ee0e3073440fd72fbe89cd7f6fef809388";
 const SEPOLIA_CHAIN_ID = 11155111;
 
-const NEMESIS_ROUTER  = "0x5b23F24b08fa3FAa0Fa555611ACF74c3bAb23550";
+const NEMESIS_ROUTER  = "0x0C88262f03B183DD183C2fC7A78578dBcE1e664C";
 const WETH_ADDRESS    = "0x7b79995e5f793A07Bc00c21412e50Ecae098E7f9";
-const USDC_ADDRESS    = "0xc4D9dC931B43930e1AA1F90D8a032AF4Ac66560a";
-const DAI_ADDRESS     = "0x8a871311feF28B3d684Fb4F06B964603196BD4E3";
-const UNI_ADDRESS     = "0xC32a7fCB1cC8E247D9b8ED74220f6F8A61341F4F";
+const USDC_ADDRESS    = "0x415582a27FDe699ea13f42277908572969223707";
+const DAI_ADDRESS     = "0xe99655E262eF4C20eBeC4805B3963dad52a1538e";
+const UNI_ADDRESS     = "0x8abea3BEDFD58e924712F1FC8f2761B2Ee49c116";
 const NEMESIS_ADDRESS = "0x534a29DfcA1ceFB6e933f6C0D00e8A43a52e60d2";
 const EXPECTED_WALLET = "0x315E5193633A962B3F369F9C3833D973D0588cCD";
-const LEVERAGED_FACTORY = "0x3A4A7D9ED3701bB331f6E6040362614ab1D787D3";
-const LEVERAGED_ROUTER = "0x5b23F24b08fa3FAa0Fa555611ACF74c3bAb23550";
-const LEVERAGED_DAI_ADDRESS = "0x8a871311feF28B3d684Fb4F06B964603196BD4E3";
+const LEVERAGED_FACTORY = "0xDd3D572f8B74dC4F83d268f50f962A7fE1C57c14";
+const LEVERAGED_ROUTER = "0x0C88262f03B183DD183C2fC7A78578dBcE1e664C";
+const LEVERAGED_DAI_ADDRESS = "0xe99655E262eF4C20eBeC4805B3963dad52a1538e";
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 const BPS = 10000n;
 
@@ -288,6 +288,8 @@ function loadConfig() {
     } else {
       addLog("No config file found, using default settings.", "info");
     }
+    // Force correct addresses to match current Nemesis deployment
+    tradingConfig.defaultCollateralToken = LEVERAGED_DAI_ADDRESS;
   } catch (error) {
     addLog(`Failed to load config: ${error.message}`, "error");
   }
@@ -2938,14 +2940,14 @@ async function initialize() {
 if (IS_CLI) {
   const side = process.argv.includes("--long") ? "LONG" : "SHORT";
   loadConfig();
-  tradingConfig.defaultCollateralToken = "0x8a871311feF28B3d684Fb4F06B964603196BD4E3";
+  tradingConfig.defaultCollateralToken = "0xe99655E262eF4C20eBeC4805B3963dad52a1538e";
   tradingConfig.fullAutoEnabled = false;
   tradingConfig.autoRSIEnabled = false;
   tradingConfig.simulateOnly = false;
   tradingConfig.maxTradesPerPair = 5;
   tradingConfig.maxConcurrentTrades = 5;
-  if (tradingConfig.uiShortPayloadReference) tradingConfig.uiShortPayloadReference[1] = "0x8a871311feF28B3d684Fb4F06B964603196BD4E3";
-  if (tradingConfig.uiLongPayloadReference) tradingConfig.uiLongPayloadReference[1] = "0x8a871311feF28B3d684Fb4F06B964603196BD4E3";
+  if (tradingConfig.uiShortPayloadReference) tradingConfig.uiShortPayloadReference[1] = "0xe99655E262eF4C20eBeC4805B3963dad52a1538e";
+  if (tradingConfig.uiLongPayloadReference) tradingConfig.uiLongPayloadReference[1] = "0xe99655E262eF4C20eBeC4805B3963dad52a1538e";
   loadAccounts();
   loadProxies();
   const provider = getProvider(SEPOLIA_RPC_URL, SEPOLIA_CHAIN_ID, proxies[selectedWalletIndex % proxies.length] || null);
