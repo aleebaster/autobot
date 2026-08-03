@@ -5,7 +5,7 @@ const RPC = "https://ethereum-sepolia-rpc.publicnode.com/557d07a988c4164482ef0c5
 const MGR = "0x53bb0fFBdA04E5982fa08D846aA265Ff6cFE068e";
 const QADAI = "0xe99655E262eF4C20eBeC4805B3963dad52a1538e";
 const WALLET_ADDR = "0x315E5193633A962B3F369F9C3833D973D0588cCD";
-const CYCLES = 6;
+const CYCLES = 10;
 const AMOUNT = "0.1";
 const LEVERAGE = 20; // 2x encoded as 20 (leverageX10)
 

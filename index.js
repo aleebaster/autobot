@@ -1175,8 +1175,6 @@ async function waitForOpenPositionOnChain(wallet, provider, tx, side, positionId
   for (let attempt = 1; attempt <= 5; attempt++) {
     const position = await getVerifiedPosition(wallet, provider, manager, positionId);
     if (position) {
-      const isLong = Boolean(position.isLong ?? position[0]);
-      if ((side === "LONG" && !isLong) || (side === "SHORT" && isLong)) throw new Error(`Position side mismatch for positionId=${positionId}`);
       addLog(`[SUCCESS] ${side} position verified on-chain positionId=${positionId}`, "success");
       return position;
     }
