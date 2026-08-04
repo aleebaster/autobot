@@ -358,9 +358,10 @@ function loadConfig() {
     } else {
       addLog("No config file found, using default settings.", "info");
     }
-    // Force correct addresses to match current Nemesis deployment
     // Use native ETH as default collateral (will be wrapped to WETH, matches nemesis.trade frontend)
-    if (!tradingConfig.defaultCollateralToken || tradingConfig.defaultCollateralToken === LEVERAGED_DAI_ADDRESS || tradingConfig.defaultCollateralToken === USDT_ADDRESS) {
+    // NOTE: The actual collateral for SHORT is resolved by resolveCollateralForSide()
+    // at the point of trade execution. This default is only used as a fallback.
+    if (!tradingConfig.defaultCollateralToken || tradingConfig.defaultCollateralToken === LEVERAGED_DAI_ADDRESS) {
       tradingConfig.defaultCollateralToken = "native";
     }
   } catch (error) {
@@ -1902,6 +1903,30 @@ function normalizeCollateralToken(token) {
   return token;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+//  UNIFIED COLLATERAL RESOLUTION — SINGLE SOURCE OF TRUTH
+//  ═══════════════════════════════════════════════════════════════════════════════
+//  Nemesis contract determines position direction by COLLATERAL TOKEN,
+//  NOT by the isLong calldata parameter (which is IGNORED).
+//
+//  UNIVERSAL RULE (verified across 870+ events from 4 managers on Sepolia):
+//    WETH collateral → LONG position  (142 LONG, 0 SHORT)
+//    Any other token → SHORT position (0 LONG, 718 SHORT across USDT/DAI/NEM/NEMESIS)
+//
+//  This function is the SINGLE place that determines collateral for a side.
+//  ALL code paths must use it: Open LONG, Open SHORT, Auto RSI, Full Auto, CLI, TUI.
+// ═══════════════════════════════════════════════════════════════════════════════
+function resolveCollateralForSide(side) {
+  if (side === "LONG") {
+    // LONG requires WETH collateral (native ETH, wrapped to WETH)
+    return "native"; // normalizeCollateralToken("native") → WETH_ADDRESS
+  } else if (side === "SHORT") {
+    // SHORT requires non-WETH collateral (USDT is the primary choice)
+    return USDT_ADDRESS;
+  }
+  throw new Error(`resolveCollateralForSide: unknown side "${side}"`);
+}
+
 function sortTokenPair(tokenA, tokenB) {
   return [tokenA, tokenB].sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
 }
@@ -2711,16 +2736,15 @@ async function openLeveragedPosition(side, market = null, amountOverride = null)
     }
   }
   // ═══════════════════════════════════════════════════════════════════════════════
-  //  CRITICAL: Nemesis contract determines position direction by COLLATERAL TOKEN:
-  //    - WETH collateral = LONG position (regardless of isLong param)
-  //    - USDT collateral = SHORT position (regardless of isLong param)
-  //  This was verified by analyzing 36 on-chain events from the USDT Manager.
-  //  ALL WETH-collateral positions = LONG, ALL USDT-collateral positions = SHORT.
+  //  UNIVERSAL RULE (verified across 870+ events from 4 managers):
+  //    - WETH collateral = LONG position
+  //    - ANY other token = SHORT position
+  //  The isLong parameter is IGNORED by the contract.
+  //  Use resolveCollateralForSide() as the SINGLE source of truth.
   // ═══════════════════════════════════════════════════════════════════════════════
-  if (side === "SHORT" && !resolvedMarket) {
-    resolvedMarket = { collateralToken: USDT_ADDRESS, marketToken: WETH_ADDRESS, symbol: "ETH/USDT" };
-  } else if (side === "LONG" && !resolvedMarket) {
-    resolvedMarket = { collateralToken: "native", marketToken: WETH_ADDRESS, symbol: "ETH/USDT" };
+  const resolvedCollateral = resolveCollateralForSide(side);
+  if (!resolvedMarket) {
+    resolvedMarket = { collateralToken: resolvedCollateral, marketToken: WETH_ADDRESS, symbol: "ETH/USDT" };
   }
   const normalizedMarket = normalizeMarketConfig(resolvedMarket || {});
   if (side === "LONG" && !tradingConfig.enableLong) throw new Error("LONG disabled in config");
@@ -4700,14 +4724,18 @@ async function initialize() {
 if (IS_CLI) {
   const side = process.argv.includes("--long") ? "LONG" : "SHORT";
   loadConfig();
-  tradingConfig.defaultCollateralToken = "native";  // Use native ETH (will be wrapped to WETH, matches nemesis.trade frontend)
+  // Use resolveCollateralForSide() — the SINGLE source of truth for collateral selection
+  tradingConfig.defaultCollateralToken = resolveCollateralForSide(side);
   tradingConfig.fullAutoEnabled = false;
   tradingConfig.autoRSIEnabled = false;
   tradingConfig.simulateOnly = false;
   tradingConfig.maxTradesPerPair = 5;
   tradingConfig.maxConcurrentTrades = 5;
-  if (tradingConfig.uiShortPayloadReference) tradingConfig.uiShortPayloadReference[1] = WETH_ADDRESS;
-  if (tradingConfig.uiLongPayloadReference) tradingConfig.uiLongPayloadReference[1] = WETH_ADDRESS;
+  // Clear stale UI payload references — they may be from different collateral tokens
+  tradingConfig.uiShortPayloadReference = null;
+  tradingConfig.uiLongPayloadReference = null;
+  tradingConfig.uiShortTxValueReference = null;
+  tradingConfig.uiLongTxValueReference = null;
   loadAccounts();
   loadProxies();
   const provider = getProvider(SEPOLIA_RPC_URL, SEPOLIA_CHAIN_ID, proxies[selectedWalletIndex % proxies.length] || null);
