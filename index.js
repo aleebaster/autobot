@@ -15,40 +15,68 @@ const SEPOLIA_CHAIN_ID = 11155111;
 
 const NEMESIS_ROUTER  = "0x0C88262f03B183DD183C2fC7A78578dBcE1e664C";
 const WETH_ADDRESS    = "0x7b79995e5f793A07Bc00c21412e50Ecae098E7f9";
-const USDC_ADDRESS    = "0x415582a27FDe699ea13f42277908572969223707";
-const DAI_ADDRESS     = "0xe99655E262eF4C20eBeC4805B3963dad52a1538e";
-const UNI_ADDRESS     = "0x8abea3BEDFD58e924712F1FC8f2761B2Ee49c116";
-const NEMESIS_ADDRESS = "0x534a29DfcA1ceFB6e933f6C0D00e8A43a52e60d2";
+const USDC_ADDRESS    = "0xbeCe1313784742fc57168892d5d8ff8BEb2f4774";  // QA USD Coin (from nemesis.trade frontend)
+const DAI_ADDRESS     = "0xD8a5222924daE3D3C6b08AdB95d929845F1f5Dd7";  // QA Dai (from nemesis.trade frontend)
+const UNI_ADDRESS     = "0xae1150b6b6147DA6Ebc0acB638febC234398CD1E";  // QA Uniswap (from nemesis.trade frontend)
+const NEMESIS_ADDRESS = "0x05B78daf98024a3b896FD8558EfDCA6DAdC076c4";  // QA Nemesis (from nemesis.trade frontend)
+const USDT_ADDRESS    = "0xb66f21dC4E6701d686Dee90C3c71b03D8069C844";  // QA Tether USD (from nemesis.trade frontend)
+const LINK_ADDRESS    = "0x3b147AeEd769AA24bE059c5135506693c70327Be";  // QA Chainlink (from nemesis.trade frontend)
 const EXPECTED_WALLET = "0x315E5193633A962B3F369F9C3833D973D0588cCD";
 const LEVERAGED_FACTORY = "0xDd3D572f8B74dC4F83d268f50f962A7fE1C57c14";
 const LEVERAGED_ROUTER = "0x0C88262f03B183DD183C2fC7A78578dBcE1e664C";
-const LEVERAGED_DAI_ADDRESS = "0xe99655E262eF4C20eBeC4805B3963dad52a1538e";
+const LEVERAGED_DAI_ADDRESS = "0xb66f21dC4E6701d686Dee90C3c71b03D8069C844";  // QA USDT (from nemesis.trade frontend) — default collateral
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 const BPS = 10000n;
+const NEMESIS_SUBGRAPH_URL = "https://nemesis.trade/api/subgraph";
+const GOLDSKY_SUBGRAPH_URL = "https://api.goldsky.com/api/public/project_cmma0sxdrnwdx01ym126h3z8q/subgraphs/nemesis-eth-sepolia/prod/gn";
 
 const CONFIG_FILE = "config.json";
 const isDebug = false;
 const IS_CLI = process.argv.includes("--long") || process.argv.includes("--short");
 
+// ─── Universal TOKENS map (expanded with all known Sepolia tokens) ───
 const TOKENS = {
-  USDC: { address: USDC_ADDRESS, decimals: 6,  symbol: "USDC" },
-  DAI:  { address: DAI_ADDRESS,  decimals: 6, symbol: "DAI"  },
-  UNI: { address: UNI_ADDRESS, decimals: 6, symbol: "UNI" },
-  NEMESIS: { address: NEMESIS_ADDRESS, decimals: 6, symbol: "NEMESIS" }
+  WETH:    { address: WETH_ADDRESS,    decimals: 18, symbol: "WETH" },
+  ETH:     { address: WETH_ADDRESS,    decimals: 18, symbol: "ETH" },
+  DAI:     { address: DAI_ADDRESS,     decimals: 6,  symbol: "DAI" },
+  USDC:    { address: USDC_ADDRESS,    decimals: 6,  symbol: "USDC" },
+  USDT:    { address: USDT_ADDRESS,    decimals: 6,  symbol: "USDT" },
+  UNI:     { address: UNI_ADDRESS,     decimals: 6,  symbol: "UNI" },
+  LINK:    { address: LINK_ADDRESS,    decimals: 6,  symbol: "LINK" },
+  NEMESIS: { address: NEMESIS_ADDRESS, decimals: 6,  symbol: "NEMESIS" }
 };
 
-const MARKET_CANDIDATES = [
-  { symbol: "ETH/DAI", marketToken: WETH_ADDRESS, collateralToken: LEVERAGED_DAI_ADDRESS, supportsLong: true, supportsShort: true, rsiSymbol: "ETHUSDT" },
-  { symbol: "ETH/USDC", marketToken: WETH_ADDRESS, collateralToken: USDC_ADDRESS, supportsLong: true, supportsShort: true, rsiSymbol: "ETHUSDT" },
-  { symbol: "ETH/UNI", marketToken: WETH_ADDRESS, collateralToken: UNI_ADDRESS, supportsLong: true, supportsShort: true, rsiSymbol: "ETHUSDT" }
+// ─── Dynamic market candidates (built from discovered tokens + Factory lookup) ───
+// Static fallback used before discovery completes; replaced by discoveredMarkets at runtime
+const MARKET_CANDIDATES_FALLBACK = [
+  { symbol: "ETH/USDT",    marketToken: WETH_ADDRESS, collateralToken: USDT_ADDRESS, supportsLong: true, supportsShort: true, rsiSymbol: "ETHUSDT" },
+  { symbol: "NEMESIS/USDT", marketToken: NEMESIS_ADDRESS, collateralToken: USDT_ADDRESS, supportsLong: true, supportsShort: true, rsiSymbol: "NEMESISUSDT" },
+  { symbol: "NEMESIS/ETH",  marketToken: NEMESIS_ADDRESS, collateralToken: NEMESIS_ADDRESS, supportsLong: true, supportsShort: true, rsiSymbol: "NEMESISUSDT" },
+  { symbol: "DAI/USDT",    marketToken: DAI_ADDRESS, collateralToken: USDT_ADDRESS, supportsLong: true, supportsShort: true, rsiSymbol: "DAIUSDT" },
+  { symbol: "USDC/USDT",   marketToken: USDC_ADDRESS, collateralToken: USDT_ADDRESS, supportsLong: true, supportsShort: true, rsiSymbol: "USDCUSDT" },
+  { symbol: "UNI/USDT",    marketToken: UNI_ADDRESS, collateralToken: USDT_ADDRESS, supportsLong: true, supportsShort: true, rsiSymbol: "UNIUSDT" },
+  { symbol: "LINK/USDT",   marketToken: LINK_ADDRESS, collateralToken: USDT_ADDRESS, supportsLong: true, supportsShort: true, rsiSymbol: "LINKUSDT" }
 ];
+
+// Mutable list — populated at startup by discoverSupportedMarkets();
+// used by openLeveragedPosition / RSI / Full Auto
+let discoveredMarkets = [...MARKET_CANDIDATES_FALLBACK];
+
+// ─── Token list cache (populated by discoverTokenList) ───
+let discoveredTokenList = Object.values(TOKENS);
 
 // SWAP_PAIRS will be dynamically built based on real wallet balances
 let SWAP_PAIRS = [];
 
+// ─── Discovered valid swap pairs (populated at startup by discoverSupportedSwapPairs) ───
+// Only pairs where: Factory.getPool() returns non-zero address AND getAmountsOut() succeeds.
+// Used by: TUI, CLI, Auto RSI, Full Auto, Cyclic Swap Engine.
+let discoveredSwapPairs = [];
+
 const ROUTER_ABI = [
   "function swapExactETHForTokens(uint256 amountOutMin, address[] calldata path, address to, uint256 deadline) payable returns (uint256[] memory)",
   "function swapExactTokensForETH(uint256 amountIn, uint256 amountOutMin, address[] calldata path, address to, uint256 deadline) returns (uint256[] memory)",
+  "function swapExactTokensForTokens(uint256 amountIn, uint256 amountOutMin, address[] calldata path, address to, uint256 deadline) returns (uint256[] memory)",
   "function getAmountsOut(uint256 amountIn, address[] calldata path) view returns (uint256[] memory)"
 ];
 
@@ -144,15 +172,24 @@ let hasLoggedSleepInterrupt = false;
 let isHeaderRendered = false;
 let activeProcesses  = 0;
 
+// ─── Natural behavior: consecutive repeat prevention ───
+let lastTradeAmount = null;       // last trade amount used (prevents consecutive repeat)
+let lastTradeSide   = null;       // last trade side used (prevents same side twice)
+let lastSwapAmounts = {};         // { pairKey: lastAmount } — prevents same swap amount twice in a row
+let lastLeverage    = null;       // last leverage used (prevents consecutive repeat)
+
 let dailyActivityConfig = {
   enableSwaps: true,
   activityRepetitions: 1,
   ethRange:  { min: 0.00001, max: 0.00002 },
   usdcRange: { min: 500,     max: 1000    },
+  usdtRange: { min: 500,     max: 1000    },
   daiRange:  { min: 0.5,     max: 1.0     },
   uniRange: { min: 0.01,    max: 0.05    },
-  nemesisRange: { min: 0.5, max: 1.0     },
-  loopHours: 24
+  linkRange: { min: 0.1,     max: 0.5     },
+  nemesisRange: { min: 0.5,  max: 1.0     },
+  loopHours: 24,
+  swapIntervalSeconds: 20
 };
 
 let tradingConfig = {
@@ -163,7 +200,7 @@ let tradingConfig = {
   firstTxMode: true,
   defaultCollateralToken: "native",
   marketToken: WETH_ADDRESS,
-  pairToken: LEVERAGED_DAI_ADDRESS,
+  pairToken: USDT_ADDRESS,
   tradeAmount: "0.01",
   longTradeAmount: "0.01",
   shortTradeAmount: "0.01",
@@ -179,6 +216,21 @@ let tradingConfig = {
   maxOpenPositions: 1,
   longPercent: 50,
   shortPercent: 50,
+  // ─── Natural behavior: randomized trade amounts ───
+  tradeAmountMode: "random",       // "fixed" | "random" | "percentage"
+  tradeMinAmount: "0.1",            // min trade amount (used in random/percentage mode)
+  tradeMaxAmount: "1.0",            // max trade amount (used in random/percentage mode)
+  tradeBalancePercentMin: 1,        // min % of wallet balance for percentage mode
+  tradeBalancePercentMax: 5,        // max % of wallet balance for percentage mode
+  leverageMin: 1,                   // min leverage (randomized between min..max)
+  leverageMax: 5,                   // max leverage (randomized between min..max)
+  // ─── Natural behavior: randomized swap amounts ───
+  swapAmountMode: "random",         // "fixed" | "random" | "percentage"
+  swapMinAmount: "0.0001",          // min swap amount (used in random mode)
+  swapMaxAmount: "0.5",             // max swap amount (used in random mode)
+  swapBalancePercentMin: 1,         // min % of wallet balance for percentage mode
+  swapBalancePercentMax: 8,         // max % of wallet balance for percentage mode
+  // ─── Legacy (kept for backward compat) ───
   randomizeAmount: false,
   amountVariancePercent: 0,
   tradeMode: "fixed",
@@ -231,6 +283,9 @@ function loadConfig() {
       dailyActivityConfig.nemesisRange.min = Number(cfg.nemesisRange?.min) || 0.5;
       dailyActivityConfig.nemesisRange.max = Number(cfg.nemesisRange?.max) || 1.0;
       dailyActivityConfig.loopHours     = Number(cfg.loopHours)      || 24;
+      dailyActivityConfig.swapIntervalSeconds = Number(cfg.swapIntervalSeconds) || 20;
+      if (cfg.usdtRange) { dailyActivityConfig.usdtRange.min = Number(cfg.usdtRange.min) || 500; dailyActivityConfig.usdtRange.max = Number(cfg.usdtRange.max) || 1000; }
+      if (cfg.linkRange) { dailyActivityConfig.linkRange.min = Number(cfg.linkRange.min) || 0.1; dailyActivityConfig.linkRange.max = Number(cfg.linkRange.max) || 0.5; }
 
       tradingConfig.enableLong = cfg.enableLong !== false;
       tradingConfig.enableShort = cfg.enableShort !== false;
@@ -238,8 +293,10 @@ function loadConfig() {
       tradingConfig.simulateOnly = cfg.simulateOnly !== false;
       tradingConfig.firstTxMode = cfg.firstTxMode !== false;
       tradingConfig.defaultCollateralToken = cfg.defaultCollateralToken || tradingConfig.defaultCollateralToken;
-      tradingConfig.marketToken = cfg.marketToken || cfg.pairToken || tradingConfig.marketToken;
-      tradingConfig.pairToken = cfg.pairToken || tradingConfig.pairToken;
+      // marketToken is always WETH (the token we trade)
+      tradingConfig.marketToken = WETH_ADDRESS;
+      // pairToken is always USDT (the quote token for Nemesis pools)
+      tradingConfig.pairToken = USDT_ADDRESS;
       tradingConfig.tradeAmount = String(cfg.tradeAmount ?? tradingConfig.tradeAmount);
       tradingConfig.longTradeAmount = String(cfg.longTradeAmount ?? cfg.tradeAmount ?? tradingConfig.longTradeAmount);
       tradingConfig.shortTradeAmount = String(cfg.shortTradeAmount ?? cfg.tradeAmount ?? tradingConfig.shortTradeAmount);
@@ -258,6 +315,19 @@ function loadConfig() {
       tradingConfig.randomizeAmount = cfg.randomizeAmount === true;
       tradingConfig.amountVariancePercent = Number(cfg.amountVariancePercent) || 0;
       tradingConfig.tradeMode = cfg.tradeMode || tradingConfig.tradeMode;
+      // ─── Natural behavior: load new randomization params ───
+      tradingConfig.tradeAmountMode    = cfg.tradeAmountMode    || tradingConfig.tradeAmountMode;
+      tradingConfig.tradeMinAmount     = String(cfg.tradeMinAmount    ?? tradingConfig.tradeMinAmount);
+      tradingConfig.tradeMaxAmount     = String(cfg.tradeMaxAmount    ?? tradingConfig.tradeMaxAmount);
+      tradingConfig.tradeBalancePercentMin = Number(cfg.tradeBalancePercentMin) || tradingConfig.tradeBalancePercentMin;
+      tradingConfig.tradeBalancePercentMax = Number(cfg.tradeBalancePercentMax) || tradingConfig.tradeBalancePercentMax;
+      tradingConfig.leverageMin         = Number(cfg.leverageMin)         || tradingConfig.leverageMin;
+      tradingConfig.leverageMax         = Number(cfg.leverageMax)         || tradingConfig.leverageMax;
+      tradingConfig.swapAmountMode     = cfg.swapAmountMode     || tradingConfig.swapAmountMode;
+      tradingConfig.swapMinAmount      = String(cfg.swapMinAmount      ?? tradingConfig.swapMinAmount);
+      tradingConfig.swapMaxAmount      = String(cfg.swapMaxAmount      ?? tradingConfig.swapMaxAmount);
+      tradingConfig.swapBalancePercentMin = Number(cfg.swapBalancePercentMin) || tradingConfig.swapBalancePercentMin;
+      tradingConfig.swapBalancePercentMax = Number(cfg.swapBalancePercentMax) || tradingConfig.swapBalancePercentMax;
       tradingConfig.walletPercent = Number(cfg.walletPercent) || tradingConfig.walletPercent;
       tradingConfig.marketMode = cfg.marketMode || tradingConfig.marketMode;
       tradingConfig.selectedMarkets = Array.isArray(cfg.selectedMarkets) ? cfg.selectedMarkets : [];
@@ -289,7 +359,10 @@ function loadConfig() {
       addLog("No config file found, using default settings.", "info");
     }
     // Force correct addresses to match current Nemesis deployment
-    tradingConfig.defaultCollateralToken = LEVERAGED_DAI_ADDRESS;
+    // Use native ETH as default collateral (will be wrapped to WETH, matches nemesis.trade frontend)
+    if (!tradingConfig.defaultCollateralToken || tradingConfig.defaultCollateralToken === LEVERAGED_DAI_ADDRESS || tradingConfig.defaultCollateralToken === USDT_ADDRESS) {
+      tradingConfig.defaultCollateralToken = "native";
+    }
   } catch (error) {
     addLog(`Failed to load config: ${error.message}`, "error");
   }
@@ -531,13 +604,268 @@ function getRandomAmount(min, max) {
   return Math.min(min + idx * step, max);
 }
 
+/**
+ * Generate a randomized trade amount for LONG/SHORT positions.
+ * 
+ * Modes:
+ *  - "fixed":     use configured longTradeAmount / shortTradeAmount as-is
+ *  - "random":    random value between tradeMinAmount..tradeMaxAmount
+ *  - "percentage": random % of wallet balance between tradeBalancePercentMin..Max
+ * 
+ * GUARANTEE: Never returns the same value twice in a row (consecutive repeat prevention).
+ * Leverage is also randomized between leverageMin..leverageMax.
+ */
+let _lastTradeAmount = null;  // module-level for consecutive repeat prevention
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  UNIFIED RANDOM AMOUNT GENERATOR — used by ALL modes (Swap, LONG, SHORT)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Track last amounts per token to prevent consecutive repeats
+const _lastSwapAmounts = {};  // { tokenSymbol: lastAmount }
+const _lastTradeAmounts = {}; // { side: lastAmount }
+
+/**
+ * Generate a random swap amount based on token balance.
+ * 
+ * Rules:
+ *  - Amount = random % of wallet balance (1%..5% by default)
+ *  - Never repeats the same value twice in a row (per token)
+ *  - Minimum 10-15% difference from previous amount
+ *  - Random number of decimal places for natural look
+ *  - Respects configured min/max bounds
+ * 
+ * @param {string} tokenSymbol - Token symbol (ETH, DAI, USDT, etc.)
+ * @param {object} [options] - Optional overrides
+ * @returns {string} Amount as string (e.g., "0.01837")
+ */
+async function getRandomSwapAmount(tokenSymbol, options = {}) {
+  const sym = String(tokenSymbol).toUpperCase();
+  const isEth = sym === "ETH" || sym === "WETH";
+  const decimals = isEth ? 18 : (TOKENS[sym]?.decimals || 6);
+
+  // ── Get wallet balance ──
+  let balance = 0n;
+  try {
+    const provider = getProvider(SEPOLIA_RPC_URL, SEPOLIA_CHAIN_ID, proxies[selectedWalletIndex % proxies.length] || null);
+    const wallet = new ethers.Wallet(accounts[selectedWalletIndex].privateKey, provider);
+    if (isEth) {
+      balance = await provider.getBalance(wallet.address);
+    } else {
+      const tokenAddr = TOKENS[sym]?.address;
+      if (tokenAddr) {
+        const contract = new ethers.Contract(tokenAddr, ERC20_ABI, provider);
+        balance = await contract.balanceOf(wallet.address);
+      }
+    }
+  } catch (e) {
+    addLog(`[AMOUNT] Failed to fetch balance for ${sym}: ${e.message}`, "warn");
+  }
+
+  const balanceFloat = Number(ethers.formatUnits(balance, decimals));
+  if (balanceFloat <= 0) {
+    addLog(`[AMOUNT] Zero balance for ${sym}, using fallback amount`, "warn");
+    return "0.001";
+  }
+
+  // ── Generate random percentage of balance (1%..5%) ──
+  const pctMin = options.pctMin || 0.01;  // 1%
+  const pctMax = options.pctMax || 0.05;  // 5%
+  const pct = pctMin + Math.random() * (pctMax - pctMin);
+  let rawAmount = balanceFloat * pct;
+
+  // ── Apply configured min/max bounds ──
+  const configuredMin = isEth
+    ? Number(dailyActivityConfig.ethRange?.min || 0.00001)
+    : Number(dailyActivityConfig[`${sym.toLowerCase()}Range`]?.min || 0.001);
+  const configuredMaxRaw = isEth
+    ? Number(dailyActivityConfig.ethRange?.max || 0.0002)
+    : Number(dailyActivityConfig[`${sym.toLowerCase()}Range`]?.max || balanceFloat * 0.1);
+  // Use the LARGER of configured max and balance-based max to avoid over-capping
+  const configuredMax = Math.max(configuredMaxRaw, balanceFloat * 0.05, configuredMin * 10);
+
+  rawAmount = Math.max(configuredMin, Math.min(configuredMax, rawAmount));
+
+  // ── Randomize decimal places (2-6 digits for natural look) ──
+  const decimalPlaces = 2 + Math.floor(Math.random() * 5); // 2..6
+  let amount = Number(rawAmount.toFixed(decimalPlaces));
+
+  // ── Consecutive repeat prevention (10-15% minimum difference) ──
+  const prevAmount = _lastSwapAmounts[sym];
+  if (prevAmount !== undefined && prevAmount > 0) {
+    const diff = Math.abs(amount - prevAmount);
+    const threshold = Math.max(prevAmount * 0.10, configuredMin * 0.5); // 10% minimum
+    if (diff < threshold) {
+      // Force different amount: shift away from previous
+      const shift = threshold + Math.random() * threshold;
+      if (amount > prevAmount) {
+        amount = Math.min(configuredMax, amount + shift);
+      } else {
+        amount = Math.max(configuredMin, amount - shift);
+      }
+      amount = Number(amount.toFixed(decimalPlaces));
+    }
+  }
+
+  // ── Final bounds check ──
+  amount = Math.max(configuredMin, Math.min(configuredMax, amount));
+  if (amount <= 0) amount = configuredMin;
+
+  // ── Store for next comparison ──
+  _lastSwapAmounts[sym] = amount;
+
+  const formatted = amount.toFixed(decimalPlaces).replace(/0+$/, "").replace(/\.$/, "");
+  return formatted || String(configuredMin);
+}
+
+/**
+ * Generate a random trade amount for LONG/SHORT based on collateral balance.
+ * Uses the same logic as getRandomSwapAmount but for trading positions.
+ * 
+ * @param {string} side - "LONG" or "SHORT"
+ * @param {string} [collateralSymbol] - Collateral token symbol
+ * @returns {string} Amount as string
+ */
+async function getRandomTradeAmount(side, collateralSymbol = "ETH") {
+  const sym = String(collateralSymbol).toUpperCase();
+  const isEth = sym === "ETH" || sym === "WETH";
+  const decimals = isEth ? 18 : (TOKENS[sym]?.decimals || 6);
+
+  // ── Get wallet balance ──
+  let balance = 0n;
+  try {
+    const provider = getProvider(SEPOLIA_RPC_URL, SEPOLIA_CHAIN_ID, proxies[selectedWalletIndex % proxies.length] || null);
+    const wallet = new ethers.Wallet(accounts[selectedWalletIndex].privateKey, provider);
+    if (isEth) {
+      balance = await provider.getBalance(wallet.address);
+    } else {
+      const tokenAddr = TOKENS[sym]?.address;
+      if (tokenAddr) {
+        const contract = new ethers.Contract(tokenAddr, ERC20_ABI, provider);
+        balance = await contract.balanceOf(wallet.address);
+      }
+    }
+  } catch (e) {
+    addLog(`[AMOUNT] Failed to fetch balance for ${sym}: ${e.message}`, "warn");
+  }
+
+  const balanceFloat = Number(ethers.formatUnits(balance, decimals));
+  if (balanceFloat <= 0) {
+    addLog(`[AMOUNT] Zero balance for ${sym}, using fallback amount`, "warn");
+    return tradingConfig.tradeMinAmount || "0.01";
+  }
+
+  // ── Generate random percentage of balance (1%..5%) ──
+  const pctMin = Math.max(0.01, Number(tradingConfig.tradeBalancePercentMin || 1) / 100);
+  const pctMax = Math.max(pctMin, Number(tradingConfig.tradeBalancePercentMax || 5) / 100);
+  const pct = pctMin + Math.random() * (pctMax - pctMin);
+  let rawAmount = balanceFloat * pct;
+
+  // ── Apply configured min/max bounds ──
+  const configuredMin = Number(tradingConfig.tradeMinAmount) || 0.01;
+  const configuredMaxRaw = Number(tradingConfig.tradeMaxAmount) || balanceFloat * 0.1;
+  // Use the LARGER of configured max and balance-based max to avoid over-capping
+  const configuredMax = Math.max(configuredMaxRaw, balanceFloat * 0.05, configuredMin * 10);
+  rawAmount = Math.max(configuredMin, Math.min(configuredMax, rawAmount));
+
+  // ── Randomize decimal places (2-5 digits for natural look) ──
+  const decimalPlaces = 2 + Math.floor(Math.random() * 4); // 2..5
+  let amount = Number(rawAmount.toFixed(decimalPlaces));
+
+  // ── Consecutive repeat prevention (10-15% minimum difference) ──
+  const prevAmount = _lastTradeAmounts[side];
+  if (prevAmount !== undefined && prevAmount > 0) {
+    const diff = Math.abs(amount - prevAmount);
+    const threshold = Math.max(prevAmount * 0.10, configuredMin * 0.5);
+    if (diff < threshold) {
+      const shift = threshold + Math.random() * threshold;
+      if (amount > prevAmount) {
+        amount = Math.min(configuredMax, amount + shift);
+      } else {
+        amount = Math.max(configuredMin, amount - shift);
+      }
+      amount = Number(amount.toFixed(decimalPlaces));
+    }
+  }
+
+  // ── Final bounds check ──
+  amount = Math.max(configuredMin, Math.min(configuredMax, amount));
+  if (amount <= 0) amount = configuredMin;
+
+  // ── Store for next comparison ──
+  _lastTradeAmounts[side] = amount;
+
+  const formatted = amount.toFixed(decimalPlaces).replace(/0+$/, "").replace(/\.$/, "");
+  return formatted || String(configuredMin);
+}
+
 function getTradingAmount(side) {
-  const base = Number(side === "LONG" ? tradingConfig.longTradeAmount : tradingConfig.shortTradeAmount);
-  if (!tradingConfig.randomizeAmount || !Number.isFinite(base)) return String(side === "LONG" ? tradingConfig.longTradeAmount : tradingConfig.shortTradeAmount);
-  const variance = Math.max(0, Number(tradingConfig.amountVariancePercent) || 0) / 100;
-  const min = base * (1 - variance);
-  const max = base * (1 + variance);
-  return (min + Math.random() * (max - min)).toFixed(8).replace(/0+$/, "").replace(/\.$/, "");
+  const mode = tradingConfig.tradeAmountMode || "random";
+  let amount;
+
+  if (mode === "fixed") {
+    // ── FIXED mode: use configured amounts ──
+    amount = Number(side === "LONG" ? tradingConfig.longTradeAmount : tradingConfig.shortTradeAmount);
+    if (!Number.isFinite(amount) || amount <= 0) amount = 0.01;
+
+  } else if (mode === "percentage") {
+    // ── PERCENTAGE mode: handled by caller with wallet balance ──
+    // Return config values; caller applies balance calculation
+    const pctMin = Math.max(0.1, Number(tradingConfig.tradeBalancePercentMin) || 1);
+    const pctMax = Math.max(pctMin, Number(tradingConfig.tradeBalancePercentMax) || 5);
+    const pct = pctMin + Math.random() * (pctMax - pctMin);
+    // Return as "pct:<value>" signal for the caller to compute balance-based amount
+    amount = -pct; // negative signals percentage mode to caller
+
+  } else {
+    // ── RANDOM mode (default): random between tradeMinAmount..tradeMaxAmount ──
+    const minVal = Math.max(0.000001, Number(tradingConfig.tradeMinAmount) || 0.1);
+    const maxVal = Math.max(minVal, Number(tradingConfig.tradeMaxAmount) || 1.0);
+    amount = minVal + Math.random() * (maxVal - minVal);
+  }
+
+  // ── Consecutive repeat prevention ──
+  if (amount > 0 && _lastTradeAmount !== null) {
+    const diff = Math.abs(amount - _lastTradeAmount);
+    const threshold = Math.max(amount * 0.15, 0.00001); // must differ by at least 15%
+    if (diff < threshold) {
+      // Regenerate with forced offset
+      const minVal = Math.max(0.000001, Number(tradingConfig.tradeMinAmount) || 0.1);
+      const maxVal = Math.max(minVal, Number(tradingConfig.tradeMaxAmount) || 1.0);
+      // Shift amount away from last used value
+      if (amount > _lastTradeAmount) {
+        amount = Math.min(maxVal, amount + threshold + Math.random() * (maxVal - minVal) * 0.3);
+      } else {
+        amount = Math.max(minVal, amount - threshold - Math.random() * (maxVal - minVal) * 0.3);
+      }
+    }
+  }
+
+  if (amount > 0) _lastTradeAmount = amount;
+
+  // For percentage mode, return the percentage (caller handles balance calc)
+  if (mode === "percentage") return `pct:${Math.abs(amount).toFixed(2)}`;
+
+  return amount.toFixed(8).replace(/0+$/, "").replace(/\.$/, "");
+}
+
+/**
+ * Get randomized leverage between leverageMin..leverageMax.
+ * Prevents consecutive identical values.
+ */
+function getRandomLeverage() {
+  const minLev = Math.max(1, Number(tradingConfig.leverageMin) || 1);
+  const maxLev = Math.max(minLev, Number(tradingConfig.leverageMax) || 5);
+  let leverage = Math.round(minLev + Math.random() * (maxLev - minLev));
+  leverage = Math.max(minLev, Math.min(maxLev, leverage));
+
+  // Consecutive repeat prevention
+  if (lastLeverage !== null && leverage === lastLeverage) {
+    leverage = leverage + 1;
+    if (leverage > maxLev) leverage = minLev;
+  }
+  lastLeverage = leverage;
+  return leverage;
 }
 
 async function getWalletPercentTradeAmount(wallet, provider, collateralToken, side) {
@@ -574,23 +902,687 @@ async function approveToken(wallet, tokenAddress, spender, amount, provider) {
 
 async function buildDynamicSwapPairs(provider, walletAddress) {
   const pairs = [];
-  const tokens = ["ETH"];
+  // Deduplicate by address: only add each unique address once
+  const seenAddresses = new Map(); // address → symbol
+  seenAddresses.set(WETH_ADDRESS.toLowerCase(), "ETH"); // ETH is always first
+
   for (const [key, info] of Object.entries(TOKENS)) {
+    if (!info || !info.address) continue;
+    const addrLower = info.address.toLowerCase();
+    if (seenAddresses.has(addrLower)) continue; // skip WETH if ETH already added
     try {
       const contract = new ethers.Contract(info.address, ERC20_ABI, provider);
       const bal = await contract.balanceOf(walletAddress);
-      if (bal > 0n) tokens.push(key);
+      if (bal > 0n) seenAddresses.set(addrLower, key);
     } catch {}
   }
+
+  // Generate pairs only where addresses differ
+  const tokens = Array.from(seenAddresses.values());
   for (const token of tokens) {
     if (token === "ETH") continue;
+    // Verify addresses are actually different
+    const ethInfo = normalizeToken("ETH");
+    const tokInfo = normalizeToken(token);
+    if (ethInfo.address.toLowerCase() === tokInfo.address.toLowerCase()) continue;
     pairs.push({ from: "ETH", to: token });
     pairs.push({ from: token, to: "ETH" });
   }
   return pairs;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+//  UNIVERSAL SWAP ENGINE — works for ANY supported token pair
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Resolve a token symbol or address to its full token info.
+ * Supports: symbol ("DAI"), address, or alias ("ETH"→WETH).
+ * Uses normalizeToken() internally for consistent ETH/WETH handling.
+ */
+function resolveTokenInfo(input) {
+  return normalizeToken(input);
+}
+
+/**
+ * Universal swap path builder.
+ * Direct pair with WETH: [TokenA, TokenB]
+ * Cross pair: [TokenA, WETH, TokenB]
+ * 
+ * SAFETY: If tokenInAddress == tokenOutAddress, throws immediately
+ * instead of passing identical addresses to the router.
+ */
+function buildSwapPath(tokenInAddress, tokenOutAddress, preferDirect = false) {
+  if (tokenInAddress.toLowerCase() === tokenOutAddress.toLowerCase()) {
+    throw new Error(`buildSwapPath: identical addresses ${tokenInAddress} — cannot swap a token with itself`);
+  }
+  const isInWeth = tokenInAddress.toLowerCase() === WETH_ADDRESS.toLowerCase();
+  const isOutWeth = tokenOutAddress.toLowerCase() === WETH_ADDRESS.toLowerCase();
+  // ETH↔Token: always direct
+  if (isInWeth || isOutWeth) return [tokenInAddress, tokenOutAddress];
+  // Token↔Token: prefer direct path (Nemesis OMM pools work better with direct swaps)
+  // Fall back to WETH intermediary only if direct path fails
+  if (preferDirect) return [tokenInAddress, tokenOutAddress];
+  return [tokenInAddress, WETH_ADDRESS, tokenOutAddress];
+}
+
+/**
+ * Build swap path with automatic fallback: try direct first, then WETH intermediary.
+ * Returns { path, isDirect } or throws if both fail.
+ */
+async function buildSwapPathWithFallback(tokenInAddress, tokenOutAddress, router) {
+  // Try direct path first
+  const directPath = [tokenInAddress, tokenOutAddress];
+  const testAmount = 1000n; // tiny test amount
+  try {
+    const amounts = await router.getAmountsOut(testAmount, directPath);
+    if (BigInt(amounts[amounts.length - 1]) > 0n) {
+      return { path: directPath, isDirect: true };
+    }
+  } catch (e) { /* direct path failed, try WETH intermediary */ }
+
+  // Try WETH intermediary
+  const wethPath = [tokenInAddress, WETH_ADDRESS, tokenOutAddress];
+  try {
+    const amounts = await router.getAmountsOut(testAmount, wethPath);
+    if (BigInt(amounts[amounts.length - 1]) > 0n) {
+      return { path: wethPath, isDirect: false };
+    }
+  } catch (e) { /* both failed */ }
+
+  throw new Error(`No valid swap path found for ${tokenInAddress} → ${tokenOutAddress}`);
+}
+
+/**
+ * Universal executeSwap — works for ANY supported token pair.
+ * Handles: ETH→Token, Token→ETH, Token→Token (via WETH routing).
+ * 
+ * SAFETY CHECKS:
+ *  1. amount > 0 — rejects zero/negative amounts BEFORE calling router
+ *  2. tokenIn.address !== tokenOut.address — prevents OMMLibrary: IDENTICAL_ADDRESSES
+ *  3. Uses normalizeToken() to resolve ETH↔WETH aliasing
+ */
+async function executeSwap(wallet, tokenIn, tokenOut, amount, options = {}) {
+  const proxyUrl = options.proxyUrl || null;
+  const slippageBps = options.slippageBps || tradingConfig.slippageBps || 50;
+  const deadlineSeconds = options.deadlineSeconds || tradingConfig.deadlineSeconds || 1200;
+
+  // ── SAFETY CHECK 1: amount must be > 0 ──
+  const numericAmount = Number(amount);
+  if (!Number.isFinite(numericAmount) || numericAmount <= 0) {
+    addLog(`[SWAP] SKIP invalid amount: ${amount} (must be > 0)`, "warn");
+    throw new Error(`Swap amount must be > 0, got: ${amount}`);
+  }
+
+  const provider = getProvider(SEPOLIA_RPC_URL, SEPOLIA_CHAIN_ID, proxyUrl);
+  wallet = wallet.connect(provider);
+  await assertContractTarget(provider, NEMESIS_ROUTER, "swap router");
+  const router = new ethers.Contract(NEMESIS_ROUTER, ROUTER_ABI, wallet);
+  const deadline = Math.floor(Date.now() / 1000) + deadlineSeconds;
+
+  // Use normalizeToken for consistent resolution — ETH and WETH become the same
+  const infoIn = normalizeToken(tokenIn);
+  const infoOut = normalizeToken(tokenOut);
+
+  // ── SAFETY CHECK 2: prevent identical addresses (OMMLibrary: IDENTICAL_ADDRESSES) ──
+  if (infoIn.address.toLowerCase() === infoOut.address.toLowerCase()) {
+    addLog(`[SWAP] SKIP identical pair: ${tokenIn} → ${tokenOut} (both resolve to ${getShortAddress(infoIn.address)})`, "warn");
+    throw new Error(`Cannot swap identical tokens: ${tokenIn} and ${tokenOut} both resolve to ${infoIn.address}`);
+  }
+
+  const isInEth = isNativeToken(tokenIn);
+  const isOutEth = isNativeToken(tokenOut);
+  const isTokenToToken = !isInEth && !isOutEth;
+
+  // ── SAFETY CHECK 3: pair must be in discovered list ──
+  if (discoveredSwapPairs.length > 0) {
+    const fromSym = infoIn.symbol;
+    const toSym = infoOut.symbol;
+    const isValidPair = discoveredSwapPairs.some(p =>
+      (p.from === fromSym && p.to === toSym) ||
+      (p.from === "ETH" && fromSym === "WETH" && p.to === toSym) ||
+      (p.to === "ETH" && toSym === "WETH" && p.from === fromSym)
+    );
+    if (!isValidPair) {
+      addLog(`[SWAP] SKIP ${fromSym} → ${toSym}: pair not in discovered swap list (no pool or route)`, "warn");
+      throw new Error(`Pair ${fromSym} → ${toSym} is not a supported swap pair (no confirmed pool)`);
+    }
+  }
+
+  // ── PATH BUILDING with fallback for token→token swaps ──
+  // Nemesis OMM pools work better with direct swaps. Try direct first,
+  // fall back to WETH intermediary only if direct fails.
+  let path;
+  if (isTokenToToken) {
+    try {
+      const result = await buildSwapPathWithFallback(infoIn.address, infoOut.address, router);
+      path = result.path;
+      const pathType = result.isDirect ? "direct" : "via WETH";
+      addLog(`[SWAP] Using ${pathType} path`, "info");
+    } catch (pathErr) {
+      throw new Error(`No valid swap route found: ${pathErr.message}`);
+    }
+  } else {
+    path = buildSwapPath(infoIn.address, infoOut.address);
+  }
+
+  const label = `${infoIn.symbol} ➪ ${infoOut.symbol}`;
+  addLog(`[SWAP] ${label} amount=${amount} router=${NEMESIS_ROUTER}`, "info");
+  addLog(`[SWAP] path=${path.map(a => getShortAddress(a)).join(" → ")}`, "info");
+
+  const feeParams = await getFeeParams(provider);
+  const gasLimit = 300000n;
+  const slippageMultiplier = BigInt(10000 - slippageBps);
+
+  if (isInEth) {
+    const amountInWei = ethers.parseEther(String(amount));
+    if (amountInWei <= 0n) throw new Error("Swap amount must be > 0");
+    let amountOut = 0n, amountOutMin = 0n;
+    try {
+      const amounts = await router.getAmountsOut(amountInWei, path);
+      amountOut = BigInt(amounts[amounts.length - 1]);
+      amountOutMin = amountOut * slippageMultiplier / 10000n;
+      addLog(`[SWAP] Quote: ${amount} ${infoIn.symbol} ➪ ${ethers.formatUnits(amountOut, infoOut.decimals)} ${infoOut.symbol} (min: ${ethers.formatUnits(amountOutMin, infoOut.decimals)})`, "info");
+    } catch (err) { throw new Error(`getAmountsOut failed: ${err.message}`); }
+    if (isInvalidQuote(amountOut, amountOutMin)) throw new Error("Invalid quote: zero output");
+    const ethBal = await provider.getBalance(wallet.address);
+    const gasCost = (feeParams.maxFeePerGas || feeParams.gasPrice) * gasLimit;
+    if (ethBal < amountInWei + gasCost) throw new Error(`Insufficient ETH: have ${ethers.formatEther(ethBal)}, need ${ethers.formatEther(amountInWei + gasCost)}`);
+    const nonce = await getNextNonce(provider, wallet.address, SEPOLIA_CHAIN_ID);
+    const tx = await router.swapExactETHForTokens(amountOutMin, path, wallet.address, deadline, { value: amountInWei, ...feeParams, gasLimit, nonce });
+    addLog(`[SWAP] tx sent: ${tx.hash}`, "warn");
+    const receipt = await waitForTx(tx);
+    addLog(`[SWAP] SUCCESS ${label} | ${tx.hash}`, "success");
+    return { txHash: tx.hash, receipt, amountOut, amountOutMin };
+
+  } else if (isOutEth) {
+    const amountInWei = ethers.parseUnits(String(amount), infoIn.decimals);
+    if (amountInWei <= 0n) throw new Error("Swap amount must be > 0");
+    const tokenContract = new ethers.Contract(infoIn.address, ERC20_ABI, provider);
+    const tokenBal = await tokenContract.balanceOf(wallet.address);
+    if (tokenBal < amountInWei) throw new Error(`Insufficient ${infoIn.symbol}: have ${ethers.formatUnits(tokenBal, infoIn.decimals)}, need ${ethers.formatUnits(amountInWei, infoIn.decimals)}`);
+    let amountOut = 0n, amountOutMin = 0n;
+    try {
+      const amounts = await router.getAmountsOut(amountInWei, path);
+      amountOut = BigInt(amounts[amounts.length - 1]);
+      amountOutMin = amountOut * slippageMultiplier / 10000n;
+      addLog(`[SWAP] Quote: ${amount} ${infoIn.symbol} ➪ ${ethers.formatEther(amountOut)} ETH (min: ${ethers.formatEther(amountOutMin)})`, "info");
+    } catch (err) { throw new Error(`getAmountsOut failed: ${err.message}`); }
+    if (isInvalidQuote(amountOut, amountOutMin)) throw new Error("Invalid quote: zero output");
+    await approveToken(wallet, infoIn.address, NEMESIS_ROUTER, amountInWei, provider);
+    const ethBal = await provider.getBalance(wallet.address);
+    const gasCost = (feeParams.maxFeePerGas || feeParams.gasPrice) * gasLimit;
+    if (ethBal < gasCost) throw new Error(`Insufficient ETH for gas: have ${ethers.formatEther(ethBal)}, need ${ethers.formatEther(gasCost)}`);
+    const nonce = await getNextNonce(provider, wallet.address, SEPOLIA_CHAIN_ID);
+    const tx = await router.swapExactTokensForETH(amountInWei, amountOutMin, path, wallet.address, deadline, { ...feeParams, gasLimit, nonce });
+    addLog(`[SWAP] tx sent: ${tx.hash}`, "warn");
+    const receipt = await waitForTx(tx);
+    addLog(`[SWAP] SUCCESS ${label} | ${tx.hash}`, "success");
+    return { txHash: tx.hash, receipt, amountOut, amountOutMin };
+
+  } else {
+    const amountInWei = ethers.parseUnits(String(amount), infoIn.decimals);
+    if (amountInWei <= 0n) throw new Error("Swap amount must be > 0");
+    const tokenContract = new ethers.Contract(infoIn.address, ERC20_ABI, provider);
+    const tokenBal = await tokenContract.balanceOf(wallet.address);
+    if (tokenBal < amountInWei) throw new Error(`Insufficient ${infoIn.symbol}: have ${ethers.formatUnits(tokenBal, infoIn.decimals)}, need ${ethers.formatUnits(amountInWei, infoIn.decimals)}`);
+    let amountOut = 0n, amountOutMin = 0n;
+    try {
+      const amounts = await router.getAmountsOut(amountInWei, path);
+      amountOut = BigInt(amounts[amounts.length - 1]);
+      amountOutMin = amountOut * slippageMultiplier / 10000n;
+      addLog(`[SWAP] Quote: ${amount} ${infoIn.symbol} ➪ ${ethers.formatUnits(amountOut, infoOut.decimals)} ${infoOut.symbol} (min: ${ethers.formatUnits(amountOutMin, infoOut.decimals)})`, "info");
+    } catch (err) { throw new Error(`getAmountsOut failed: ${err.message}`); }
+    if (isInvalidQuote(amountOut, amountOutMin)) throw new Error("Invalid quote: zero output");
+    await approveToken(wallet, infoIn.address, NEMESIS_ROUTER, amountInWei, provider);
+    const ethBal = await provider.getBalance(wallet.address);
+    const gasCost = (feeParams.maxFeePerGas || feeParams.gasPrice) * gasLimit;
+    if (ethBal < gasCost) throw new Error(`Insufficient ETH for gas: have ${ethers.formatEther(ethBal)}, need ${ethers.formatEther(gasCost)}`);
+    const nonce = await getNextNonce(provider, wallet.address, SEPOLIA_CHAIN_ID);
+    const tx = await router.swapExactTokensForTokens(amountInWei, amountOutMin, path, wallet.address, deadline, { ...feeParams, gasLimit, nonce });
+    addLog(`[SWAP] tx sent: ${tx.hash}`, "warn");
+    const receipt = await waitForTx(tx);
+    addLog(`[SWAP] SUCCESS ${label} | ${tx.hash}`, "success");
+    return { txHash: tx.hash, receipt, amountOut, amountOutMin };
+  }
+}
+
+// Legacy wrapper for backward compatibility
 async function performSwap(wallet, fromToken, toToken, amount, proxyUrl) {
+  return executeSwap(wallet, fromToken, toToken, amount, { proxyUrl });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  CYCLIC SWAP ENGINE — rotates through ALL supported pairs every N seconds
+// ═══════════════════════════════════════════════════════════════════════════════
+
+let cyclicSwapRunning = false;
+let cyclicSwapStopRequested = false;
+
+/**
+ * Discover ALL supported swap pairs by probing the Nemesis Factory contract.
+ *
+ * For each unique token pair (A, B):
+ *  1. Factory.getPool(A, B) — checks if a liquidity pool exists
+ *  2. router.getAmountsOut() — validates the route works (no POOL_NOT_FOUND)
+ *
+ * Only pairs that pass BOTH checks are included in the result.
+ * Logs both supported and unsupported pairs with reasons.
+ *
+ * This is the SINGLE SOURCE OF TRUTH for swap pairs used by:
+ *  - TUI swap menu
+ *  - CLI swap commands
+ *  - Auto RSI trading
+ *  - Full Auto trading
+ *  - Cyclic Swap Engine
+ */
+async function discoverSupportedSwapPairs(provider) {
+  addLog("[SWAP DISCOVER] Probing Nemesis Factory for valid swap pools...", "info");
+
+  const factory = new ethers.Contract(LEVERAGED_FACTORY, FACTORY_ABI, provider);
+  const router = new ethers.Contract(NEMESIS_ROUTER, ROUTER_ABI, provider);
+
+  // Step 1: Deduplicate tokens by resolved address (collapse ETH/WETH)
+  const uniqueByAddress = new Map();
+  for (const [sym, info] of Object.entries(TOKENS)) {
+    if (!info || !info.address) continue;
+    const addrLower = info.address.toLowerCase();
+    if (!uniqueByAddress.has(addrLower)) {
+      const canonicalSymbol = (sym === "WETH" && uniqueByAddress.size === 0) || sym === "ETH" ? "ETH" : sym;
+      uniqueByAddress.set(addrLower, {
+        symbol: canonicalSymbol,
+        address: info.address,
+        decimals: info.decimals
+      });
+    } else if (sym === "ETH") {
+      uniqueByAddress.get(addrLower).symbol = "ETH";
+    }
+  }
+  const tokenEntries = Array.from(uniqueByAddress.values());
+  addLog(`[SWAP DISCOVER] ${tokenEntries.length} unique tokens to probe: ${tokenEntries.map(t => t.symbol).join(", ")}`, "info");
+
+  // Step 2: Generate all candidate pairs (deduplicated by address)
+  const candidatePairs = [];
+  const pairKeys = new Set();
+
+  for (const a of tokenEntries) {
+    for (const b of tokenEntries) {
+      if (a.address.toLowerCase() === b.address.toLowerCase()) continue;
+      const key = `${a.address.toLowerCase()}:${b.address.toLowerCase()}`;
+      if (pairKeys.has(key)) continue;
+      pairKeys.add(key);
+      candidatePairs.push({ from: a.symbol, to: b.symbol, fromAddress: a.address, toAddress: b.address, fromDecimals: a.decimals, toDecimals: b.decimals });
+    }
+  }
+  addLog(`[SWAP DISCOVER] ${candidatePairs.length} candidate pairs to validate`, "info");
+
+  // Step 3: Validate each pair — Factory.getPool + getAmountsOut
+  const supported = [];
+  const unsupported = [];
+  const TEST_AMOUNT_ETH = ethers.parseEther("0.0001"); // tiny test amount
+  const TEST_AMOUNT_ERC20 = 1000n; // 1000 units (smallest possible)
+
+  for (const pair of candidatePairs) {
+    const pairLabel = `${pair.from} → ${pair.to}`;
+    try {
+      // Check 1: Does a pool exist in the Factory?
+      const [tokenA, tokenB] = sortTokenPair(pair.fromAddress, pair.toAddress);
+      const pool = await factory.getPool(tokenA, tokenB);
+      if (!pool || pool === ZERO_ADDRESS) {
+        unsupported.push({ from: pair.from, to: pair.to, reason: "POOL_NOT_FOUND" });
+        addLog(`[SWAP DISCOVER] ✗ ${pairLabel} — POOL_NOT_FOUND`, "debug");
+        continue;
+      }
+
+      // Check 2: Does getAmountsOut work? (validates route + liquidity)
+      // For token→token swaps, try direct path first, then WETH intermediary
+      const testAmount = pair.from === "ETH" ? TEST_AMOUNT_ETH : TEST_AMOUNT_ERC20;
+      const pairIsTokenToToken = pair.from !== "ETH" && pair.to !== "ETH";
+      let routeFound = false;
+      const paths = pairIsTokenToToken
+        ? [[pair.fromAddress, pair.toAddress], [pair.fromAddress, WETH_ADDRESS, pair.toAddress]]
+        : [buildSwapPath(pair.fromAddress, pair.toAddress)];
+
+      for (const path of paths) {
+        try {
+          const amounts = await router.getAmountsOut(testAmount, path);
+          const amountOut = BigInt(amounts[amounts.length - 1]);
+          if (amountOut > 0n) {
+            routeFound = true;
+            const pathType = path.length === 2 ? "direct" : "via WETH";
+            addLog(`[SWAP DISCOVER] ✓ ${pairLabel} (${pathType})`, "info");
+            break;
+          }
+        } catch (quoteErr) { /* try next path */ }
+      }
+
+      if (!routeFound) {
+        unsupported.push({ from: pair.from, to: pair.to, reason: "NO_ROUTE" });
+        addLog(`[SWAP DISCOVER] ✗ ${pairLabel} — NO_ROUTE (neither direct nor WETH path works)`, "debug");
+        continue;
+      }
+
+      // Pair is valid!
+      supported.push({ from: pair.from, to: pair.to });
+    } catch (err) {
+      unsupported.push({ from: pair.from, to: pair.to, reason: `ERROR: ${err.message}` });
+      addLog(`[SWAP DISCOVER] ✗ ${pairLabel} — ERROR: ${err.message}`, "debug");
+    }
+  }
+
+  // Step 4: Log summary
+  addLog("", "info");
+  addLog(`══════ Supported Swap Pairs (${supported.length}) ══════`, "success");
+  for (const p of supported) {
+    addLog(`  ✓ ${p.from} → ${p.to}`, "success");
+  }
+  if (unsupported.length > 0) {
+    addLog(`══════ Unsupported Swap Pairs (${unsupported.length}) ══════`, "warn");
+    for (const p of unsupported) {
+      addLog(`  ✗ ${p.from} → ${p.to} — ${p.reason}`, "warn");
+    }
+  }
+  addLog(`[SWAP DISCOVER] Total: ${supported.length} supported, ${unsupported.length} unsupported out of ${candidatePairs.length} candidates`, "success");
+
+  return supported;
+}
+
+/**
+ * Generate ALL possible swap pairs from the TOKENS map.
+ * 
+ * KEY FIX: Tokens are first deduplicated by resolved address, so ETH and WETH
+ * (which share the same address on Nemesis) are collapsed into a single entry.
+ * Pairs where tokenIn.address == tokenOut.address are NEVER generated.
+ * 
+ * Uses native "ETH" as the canonical name for the WETH token in pair labels.
+ * For N unique-address tokens, produces N*(N-1) ordered pairs.
+ */
+function getAllSwapPairs() {
+  // ─── USE DISCOVERED VALID PAIRS (Factory-validated) ───
+  // If discoverSupportedSwapPairs() has run, use its result.
+  // Only pairs with confirmed pools and working getAmountsOut() are included.
+  if (discoveredSwapPairs.length > 0) {
+    addLog(`[SWAP ENGINE] Using ${discoveredSwapPairs.length} Factory-validated swap pairs`, "success");
+    return discoveredSwapPairs;
+  }
+
+  // ─── FALLBACK: generate from TOKENS map (pre-discovery or if discovery failed) ───
+  addLog("[SWAP ENGINE] No discovered pairs available, using fallback generation", "warn");
+  const uniqueByAddress = new Map();
+  for (const [sym, info] of Object.entries(TOKENS)) {
+    if (!info || !info.address) continue;
+    const addrLower = info.address.toLowerCase();
+    if (!uniqueByAddress.has(addrLower)) {
+      const canonicalSymbol = (sym === "WETH" && uniqueByAddress.size === 0) || sym === "ETH" ? "ETH" : sym;
+      uniqueByAddress.set(addrLower, {
+        symbol: canonicalSymbol,
+        address: info.address,
+        decimals: info.decimals
+      });
+    } else if (sym === "ETH") {
+      uniqueByAddress.get(addrLower).symbol = "ETH";
+    }
+  }
+
+  const tokenEntries = Array.from(uniqueByAddress.values());
+  addLog(`[SWAP ENGINE] Deduplicated tokens: ${tokenEntries.length} unique addresses from ${Object.keys(TOKENS).length} entries`, "debug");
+
+  const pairs = [];
+  const pairKeys = new Set();
+
+  function addPair(from, to) {
+    const fromInfo = normalizeToken(from);
+    const toInfo = normalizeToken(to);
+    if (fromInfo.address.toLowerCase() === toInfo.address.toLowerCase()) {
+      addLog(`[SWAP ENGINE] SKIP identical pair: ${from} → ${to} (same address ${getShortAddress(fromInfo.address)})`, "debug");
+      return;
+    }
+    const key = `${fromInfo.address.toLowerCase()}:${toInfo.address.toLowerCase()}`;
+    if (pairKeys.has(key)) return;
+    pairKeys.add(key);
+    pairs.push({ from, to });
+  }
+
+  for (const a of tokenEntries) {
+    for (const b of tokenEntries) {
+      if (a.address.toLowerCase() === b.address.toLowerCase()) continue;
+      addPair(a.symbol, b.symbol);
+    }
+  }
+
+  for (const t of tokenEntries) {
+    if (t.symbol === "ETH") continue;
+    addPair("ETH", t.symbol);
+    addPair(t.symbol, "ETH");
+  }
+
+  addLog(`[SWAP ENGINE] Generated ${pairs.length} fallback swap pairs (no Factory validation)`, "warn");
+  return pairs;
+}
+
+/**
+ * Get the swap amount for a given token symbol.
+ * 
+ * Modes:
+ *  - "fixed":     use configured swapTradeAmount
+ *  - "random":    random value between swapMinAmount..swapMaxAmount
+ *  - "percentage": random % of wallet balance between swapBalancePercentMin..Max
+ * 
+ * Falls back to per-token ranges (dailyActivityConfig.ethRange etc.) when
+ * swapAmountMode is "random" but swapMinAmount/swapMaxAmount are not set.
+ * 
+ * GUARANTEE: Never returns the same amount for the same pair twice in a row.
+ * SAFETY: Always returns a value > 0.
+ */
+function getSwapAmountForSymbol(symbol, toSymbol = null) {
+  const s = String(symbol).toUpperCase();
+  // Use full pair key for consecutive repeat tracking
+  const amountPairKey = toSymbol ? `${s}->${String(toSymbol).toUpperCase()}` : s;
+  const mode = tradingConfig.swapAmountMode || "random";
+  let amount;
+
+  if (mode === "fixed") {
+    // ── FIXED mode: use configured swapTradeAmount ──
+    amount = Number(tradingConfig.swapTradeAmount) || 0.01;
+
+  } else if (mode === "percentage") {
+    // ── PERCENTAGE mode: return signal for caller to compute from balance ──
+    const pctMin = Math.max(0.1, Number(tradingConfig.swapBalancePercentMin) || 1);
+    const pctMax = Math.max(pctMin, Number(tradingConfig.swapBalancePercentMax) || 8);
+    const pct = pctMin + Math.random() * (pctMax - pctMin);
+    amount = -pct; // negative signals percentage mode
+
+  } else {
+    // ── RANDOM mode (default): use swapMinAmount..swapMaxAmount with per-token fallback ranges ──
+    const globalMin = Number(tradingConfig.swapMinAmount);
+    const globalMax = Number(tradingConfig.swapMaxAmount);
+
+    if (Number.isFinite(globalMin) && Number.isFinite(globalMax) && globalMin > 0 && globalMax > 0) {
+      // Use global random range
+      const minVal = Math.max(0.000001, globalMin);
+      const maxVal = Math.max(minVal, globalMax);
+      amount = minVal + Math.random() * (maxVal - minVal);
+    } else {
+      // Fall back to per-token configured ranges
+      switch (s) {
+        case "ETH":     amount = getRandomAmount(dailyActivityConfig.ethRange.min, dailyActivityConfig.ethRange.max); break;
+        case "USDC":    amount = getRandomAmount(dailyActivityConfig.usdcRange.min, dailyActivityConfig.usdcRange.max); break;
+        case "USDT":    amount = getRandomAmount(dailyActivityConfig.usdtRange.min, dailyActivityConfig.usdtRange.max); break;
+        case "DAI":     amount = getRandomAmount(dailyActivityConfig.daiRange.min, dailyActivityConfig.daiRange.max); break;
+        case "UNI":     amount = getRandomAmount(dailyActivityConfig.uniRange.min, dailyActivityConfig.uniRange.max); break;
+        case "LINK":    amount = getRandomAmount(dailyActivityConfig.linkRange.min, dailyActivityConfig.linkRange.max); break;
+        case "NEMESIS": amount = getRandomAmount(dailyActivityConfig.nemesisRange.min, dailyActivityConfig.nemesisRange.max); break;
+        default:         amount = getRandomAmount(0.00001, 0.00002); break;
+      }
+    }
+  }
+
+  // ── For percentage mode, return the percentage signal ──
+  if (mode === "percentage") return `pct:${Math.abs(amount).toFixed(2)}`;
+
+  // ── Consecutive repeat prevention: ensure different amount per pair ──
+  if (Number.isFinite(amount) && amount > 0 && lastSwapAmounts[amountPairKey] !== undefined) {
+    const diff = Math.abs(amount - lastSwapAmounts[amountPairKey]);
+    const threshold = Math.max(amount * 0.15, 0.000001);
+    if (diff < threshold) {
+      // Force a different amount
+      const minVal = Math.max(0.000001, Number(tradingConfig.swapMinAmount) || 0.0001);
+      const maxVal = Math.max(minVal, Number(tradingConfig.swapMaxAmount) || 0.5);
+      if (amount > lastSwapAmounts[amountPairKey]) {
+        amount = Math.min(maxVal, amount + threshold + Math.random() * (maxVal - minVal) * 0.3);
+      } else {
+        amount = Math.max(minVal, amount - threshold - Math.random() * (maxVal - minVal) * 0.3);
+      }
+    }
+  }
+  if (Number.isFinite(amount) && amount > 0) lastSwapAmounts[amountPairKey] = amount;
+
+  // SAFETY: ensure amount is always > 0
+  if (!Number.isFinite(amount) || amount <= 0) {
+    addLog(`[SWAP] WARN getSwapAmountForSymbol(${symbol}) returned ${amount}, using fallback`, "warn");
+    amount = 0.00001;
+  }
+  return amount;
+}
+
+/**
+ * Check if we have sufficient balance for a swap.
+ */
+async function hasSufficientBalance(wallet, provider, tokenSymbol, amount) {
+  try {
+    if (tokenSymbol.toUpperCase() === "ETH") {
+      const bal = await provider.getBalance(wallet.address);
+      return bal >= ethers.parseEther(String(amount));
+    }
+    const info = resolveTokenInfo(tokenSymbol);
+    const contract = new ethers.Contract(info.address, ERC20_ABI, provider);
+    const bal = await contract.balanceOf(wallet.address);
+    return bal >= ethers.parseUnits(String(amount), info.decimals);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Main cyclic swap engine.
+ * Rotates through ALL supported pairs with configurable interval.
+ * 
+ * @param {object} options - { intervalSeconds, maxCycles, onSwapComplete }
+ */
+async function runCyclicSwapEngine(options = {}) {
+  if (cyclicSwapRunning) {
+    addLog("[SWAP ENGINE] Already running", "warn");
+    return;
+  }
+  cyclicSwapRunning = true;
+  cyclicSwapStopRequested = false;
+
+  const intervalSeconds = options.intervalSeconds || dailyActivityConfig.swapIntervalSeconds || 20;
+  const maxCycles = options.maxCycles || Infinity;
+  const onSwapComplete = options.onSwapComplete || (() => {});
+
+  const allPairs = getAllSwapPairs();
+  addLog(`[SWAP ENGINE] Starting cyclic engine: ${allPairs.length} pairs, interval=${intervalSeconds}s`, "success");
+
+  let cycleCount = 0;
+  let pairIndex = 0;  try {
+    while (!cyclicSwapStopRequested && cycleCount < maxCycles) {
+      const pair = allPairs[pairIndex];
+
+      // ── Pre-swap SAFETY: validate addresses won't collide ──
+      try {
+        const fromInfo = normalizeToken(pair.from);
+        const toInfo = normalizeToken(pair.to);
+        if (fromInfo.address.toLowerCase() === toInfo.address.toLowerCase()) {
+          addLog(`[SWAP ENGINE] SKIP ${pair.from} → ${pair.to}: identical addresses (${getShortAddress(fromInfo.address)})`, "warn");
+          // skip to next pair without calling router
+          pairIndex++;
+          if (pairIndex >= allPairs.length) { pairIndex = 0; cycleCount++; }
+          continue;
+        }
+      } catch (resolveErr) {
+        addLog(`[SWAP ENGINE] SKIP ${pair.from} → ${pair.to}: ${resolveErr.message}`, "warn");
+        pairIndex++;
+        if (pairIndex >= allPairs.length) { pairIndex = 0; cycleCount++; }
+        continue;
+      }
+
+      // ── AUTO: Generate random amount from token balance (no manual input) ──
+      let amount;
+      try {
+        const amtStr = await getRandomSwapAmount(pair.from, { tokenOut: pair.to });
+        amount = Number(amtStr);
+      } catch (e) {
+        addLog(`[SWAP ENGINE] Failed to generate amount for ${pair.from}: ${e.message}, using fallback`, "warn");
+        amount = 0.00001;
+      }
+
+      // ── Pre-swap SAFETY: amount must be > 0 ──
+      if (!Number.isFinite(amount) || amount <= 0) {
+        addLog(`[SWAP ENGINE] SKIP ${pair.from} → ${pair.to}: amount is ${amount} (must be > 0)`, "warn");
+        pairIndex++;
+        if (pairIndex >= allPairs.length) { pairIndex = 0; cycleCount++; }
+        continue;
+      }
+
+      addLog(`[SWAP ENGINE] Cycle ${cycleCount + 1} | Pair ${pairIndex + 1}/${allPairs.length}: ${pair.from} → ${pair.to} (amount=${amount})`, "info");
+
+      // Get wallet and provider
+      const accountIndex = 0;
+      const proxyUrl = proxies[accountIndex % proxies.length] || null;
+      const provider = getProvider(SEPOLIA_RPC_URL, SEPOLIA_CHAIN_ID, proxyUrl);
+      const wallet = new ethers.Wallet(accounts[accountIndex].privateKey, provider);
+
+      // Check balance before attempting swap
+      const hasBalance = await hasSufficientBalance(wallet, provider, pair.from, amount);
+      if (!hasBalance) {
+        addLog(`[SWAP ENGINE] SKIP ${pair.from} → ${pair.to}: insufficient ${pair.from} balance`, "warn");
+      } else {
+        try {
+          const result = await executeSwap(wallet, pair.from, pair.to, amount, { proxyUrl, slippageBps: 50, deadlineSeconds: 600 });
+          addLog(`[SWAP ENGINE] SUCCESS ${pair.from} → ${pair.to} | tx=${result.txHash}`, "success");
+          onSwapComplete(result);
+        } catch (error) {
+          const msg = String(error.message || "");
+          // Skip silently on expected errors
+          if (msg.includes("insufficient") || msg.includes("Invalid quote") || msg.includes("zero output") || msg.includes("getAmountsOut failed") || msg.includes("identical tokens") || msg.includes("identical addresses")) {
+            addLog(`[SWAP ENGINE] SKIP ${pair.from} → ${pair.to}: ${msg.slice(0, 80)}`, "warn");
+          } else {
+            addLog(`[SWAP ENGINE] ERROR ${pair.from} → ${pair.to}: ${msg.slice(0, 120)} `, "error");
+          }
+        }
+      }
+
+      // Move to next pair
+      pairIndex++;
+      if (pairIndex >= allPairs.length) {
+        pairIndex = 0;
+        cycleCount++;
+        addLog(`[SWAP ENGINE] Completed cycle ${cycleCount}, restarting from pair 1...`, "success");
+      }
+
+      // Wait interval before next swap (unless stopping)
+      if (!cyclicSwapStopRequested) {
+        addLog(`[SWAP ENGINE] Waiting ${intervalSeconds}s before next swap...`, "info");
+        await sleep(intervalSeconds * 1000);
+      }
+    }
+  } finally {
+    cyclicSwapRunning = false;
+    addLog("[SWAP ENGINE] Stopped", "warn");
+  }
+}
+
+/**
+ * Stop the cyclic swap engine.
+ */
+function stopCyclicSwapEngine() {
+  cyclicSwapStopRequested = true;
+  addLog("[SWAP ENGINE] Stop requested", "warn");
+}
+
+// Old performSwap helper code below (kept for reference, now unused)
+async function _old_performSwap_legacy(wallet, fromToken, toToken, amount, proxyUrl) {
   const provider = getProvider(SEPOLIA_RPC_URL, SEPOLIA_CHAIN_ID, proxyUrl);
   wallet = wallet.connect(provider);
   await assertContractTarget(provider, NEMESIS_ROUTER, "swap router");
@@ -722,6 +1714,188 @@ function isNativeToken(token) {
   return !token || token === ZERO_ADDRESS || String(token).toLowerCase() === "native" || String(token).toLowerCase() === "eth";
 }
 
+// ─── Universal token normalization ───
+// Maps any token input (symbol, address, alias) to a canonical { symbol, address, decimals }.
+// ETH and WETH always resolve to the SAME address, so they are never treated as
+// two different assets.  Returns { symbol, address, decimals }.
+function normalizeToken(input) {
+  if (!input) throw new Error("No token specified for normalizeToken");
+
+  // If it's an address, look it up in TOKENS map
+  if (ethers.isAddress(input)) {
+    const found = Object.values(TOKENS).find(t => t.address.toLowerCase() === input.toLowerCase());
+    if (found) return { ...found };
+    return { address: input, decimals: 18, symbol: getShortAddress(input) };
+  }
+
+  const upper = String(input).toUpperCase();
+
+  // ETH and WETH are the SAME token on Nemesis — always return WETH address
+  if (upper === "ETH" || upper === "WETH") {
+    return { address: WETH_ADDRESS, decimals: 18, symbol: "WETH" };
+  }
+
+  if (TOKENS[upper]) return { ...TOKENS[upper] };
+
+  const discovered = discoveredTokenList.find(t => t.symbol?.toUpperCase() === upper);
+  if (discovered) return { ...discovered };
+
+  throw new Error(`Unknown token: ${input}. Available: ${Object.keys(TOKENS).join(", ")}`);
+}
+
+/**
+ * Validate that a token contract exists and implements standard ERC20 methods.
+ * Returns a validation report object.
+ *
+ * Checks:
+ *  1. Contract exists (getCode returns non-empty)
+ *  2. decimals() works and returns a reasonable value (1-18)
+ *  3. symbol() works and returns a non-empty string
+ *  4. name() works (optional, non-critical)
+ *  5. balanceOf() works (optional, non-critical)
+ *  6. allowance() works (optional, non-critical)
+ *
+ * @param {string} tokenAddress - The token contract address
+n * @param {string} expectedSymbol - The expected symbol (for logging)
+ * @param {object} provider - ethers provider
+ * @returns {object} { valid, address, symbol, name, decimals, error, checks }
+ */
+async function validateTokenContract(tokenAddress, expectedSymbol, provider) {
+  const result = {
+    valid: false,
+    address: tokenAddress,
+    symbol: expectedSymbol,
+    name: null,
+    decimals: null,
+    error: null,
+    checks: {
+      contractExists: false,
+      isERC20: false,
+      decimals: false,
+      symbol: false,
+      name: false,
+      balanceOf: false,
+      allowance: false
+    }
+  };
+
+  try {
+    // Check 1: Contract exists
+    const code = await provider.getCode(tokenAddress);
+    if (!code || code === "0x" || code.length <= 2) {
+      result.error = `NO_CONTRACT: address ${tokenAddress} has no contract code (is an EOA or empty)`;
+      addLog(`[TOKEN VALID] ✗ ${expectedSymbol} (${getShortAddress(tokenAddress)}) — ${result.error}`, "error");
+      return result;
+    }
+    result.checks.contractExists = true;
+
+    // Check 2-6: Call ERC20 methods
+    const ERC20_VALIDATION_ABI = [
+      "function decimals() view returns (uint8)",
+      "function symbol() view returns (string)",
+      "function name() view returns (string)",
+      "function balanceOf(address) view returns (uint256)",
+      "function allowance(address owner, address spender) view returns (uint256)"
+    ];
+    const contract = new ethers.Contract(tokenAddress, ERC20_VALIDATION_ABI, provider);
+
+    // Check decimals
+    try {
+      const dec = await contract.decimals();
+      const decNum = Number(dec);
+      if (Number.isFinite(decNum) && decNum >= 0 && decNum <= 18) {
+        result.decimals = decNum;
+        result.checks.decimals = true;
+      } else {
+        result.error = `INVALID_DECIMALS: got ${dec} (expected 0-18)`;
+      }
+    } catch (e) {
+      result.error = `DECIMALS_FAILED: ${e.message}`;
+    }
+
+    // Check symbol
+    try {
+      const sym = await contract.symbol();
+      if (sym && String(sym).length > 0) {
+        result.symbol = String(sym);
+        result.checks.symbol = true;
+        // Warn if on-chain symbol differs from expected
+        if (String(sym).toUpperCase() !== expectedSymbol.toUpperCase()) {
+          result.error = `SYMBOL_MISMATCH: expected ${expectedSymbol}, got ${sym}`;
+          addLog(`[TOKEN VALID] ⚠ ${expectedSymbol} → on-chain symbol is "${sym}" (may be wrong address)`, "warn");
+        }
+      } else {
+        result.error = `EMPTY_SYMBOL: symbol() returned empty`;
+      }
+    } catch (e) {
+      result.error = `SYMBOL_FAILED: ${e.message}`;
+    }
+
+    // Check name
+    try {
+      const n = await contract.name();
+      if (n && String(n).length > 0) {
+        result.name = String(n);
+        result.checks.name = true;
+      }
+    } catch (e) { /* name is optional */ }
+
+    // Check balanceOf
+    try {
+      const ZERO_ADDR = "0x0000000000000000000000000000000000000000";
+      await contract.balanceOf(ZERO_ADDR);
+      result.checks.balanceOf = true;
+    } catch (e) { /* balanceOf failure is non-critical */ }
+
+    // Check allowance
+    try {
+      const ZERO_ADDR = "0x0000000000000000000000000000000000000000";
+      await contract.allowance(ZERO_ADDR, ZERO_ADDR);
+      result.checks.allowance = true;
+    } catch (e) { /* allowance failure is non-critical */ }
+
+    // Determine if valid (must have: contract exists + decimals + symbol)
+    result.checks.isERC20 = result.checks.decimals && result.checks.symbol;
+    result.valid = result.checks.contractExists && result.checks.isERC20;
+
+    if (result.valid) {
+      addLog(`[TOKEN VALID] ✓ ${result.symbol} (${getShortAddress(tokenAddress)}) dec=${result.decimals} name=${result.name || "?"}`, "success");
+    } else {
+      addLog(`[TOKEN VALID] ✗ ${expectedSymbol} (${getShortAddress(tokenAddress)}) — ${result.error}`, "error");
+    }
+
+    return result;
+  } catch (err) {
+    result.error = `VALIDATION_ERROR: ${err.message}`;
+    addLog(`[TOKEN VALID] ✗ ${expectedSymbol} (${getShortAddress(tokenAddress)}) — ${result.error}`, "error");
+    return result;
+  }
+}
+
+/**
+ * Remove invalid tokens from the TOKENS map at startup.
+ * This prevents errors in swap engine, trade engine, and diagnostics.
+ */
+async function cleanupInvalidTokens(provider) {
+  const invalidSymbols = [];
+  for (const [name, info] of Object.entries(TOKENS)) {
+    if (!info || !info.address) continue;
+    const report = await validateTokenContract(info.address, name, provider);
+    if (!report.valid) {
+      invalidSymbols.push(name);
+    }
+  }
+  if (invalidSymbols.length > 0) {
+    for (const sym of invalidSymbols) {
+      addLog(`[CLEANUP] Removing invalid token: ${sym} (${TOKENS[sym].address})`, "warn");
+      delete TOKENS[sym];
+    }
+    addLog(`[CLEANUP] Removed ${invalidSymbols.length} invalid tokens from TOKENS map`, "warn");
+  } else {
+    addLog(`[CLEANUP] All tokens validated successfully, no removals needed`, "success");
+  }
+}
+
 function normalizeCollateralToken(token) {
   if (isNativeToken(token)) return WETH_ADDRESS;
   if (!ethers.isAddress(token)) throw new Error(`Invalid collateral token: ${token}`);
@@ -847,18 +2021,333 @@ function lpBorrowToExpectedOut({ lpBorrowAmount, collateralToken, reserve0, rese
   return amountInWithFee * adjustedReserveOut / (adjustedReserveIn * BPS + amountInWithFee);
 }
 
-async function getLeveragedContext(provider, collateralToken, marketTokenArg = null) {
-  const collateral = normalizeCollateralToken(collateralToken);
-  const marketToken = normalizeCollateralToken(marketTokenArg || tradingConfig.marketToken || tradingConfig.pairToken);
-  const pairToken = marketToken;
-  if (collateral.toLowerCase() === marketToken.toLowerCase()) {
-    throw new Error(`Collateral token and market token are identical: ${collateral}`);
+// ═══════════════════════════════════════════════════════════════════════════════
+//  UNIVERSAL COLLATERAL DISCOVERY — queries Nemesis subgraph + Factory on-chain
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Fetch the canonical token list from the Nemesis subgraph.
+ * Returns an array of { address, symbol, decimals } objects.
+ */
+async function discoverTokenList(provider) {
+  try {
+    const query = `query { tokens(first: 100, orderBy: symbol) { id symbol decimals name } }`;
+    const response = await fetch(NEMESIS_SUBGRAPH_URL, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ query })
+    });
+    const json = await response.json();
+    const tokens = json.data?.tokens || [];
+    if (tokens.length === 0) {
+      addLog("[DISCOVER] Subgraph returned no tokens, using static list", "warn");
+      return Object.values(TOKENS);
+    }
+    const list = tokens.map(t => ({
+      address: t.id,
+      symbol: t.symbol,
+      decimals: Number(t.decimals) || 18,
+      name: t.name || t.symbol
+    }));
+    addLog(`[DISCOVER] Found ${list.length} tokens from subgraph`, "success");
+    return list;
+  } catch (error) {
+    addLog(`[DISCOVER] Subgraph token fetch failed: ${error.message}, using static list`, "warn");
+    return Object.values(TOKENS);
   }
-  const [tokenA, tokenB] = sortTokenPair(collateral, marketToken);
+}
+
+/**
+ * For each collateral token, probe the Factory to check if a pool exists with WETH.
+ * Returns an array of market candidates with pool/manager resolved.
+ */
+async function discoverSupportedMarkets(provider, tokenList) {
   const factory = new ethers.Contract(LEVERAGED_FACTORY, FACTORY_ABI, provider);
-  const pool = await factory.getPool(tokenA, tokenB);
-  if (!isValidContractTarget(pool)) throw new Error(`No leveraged pool for ${collateral}/${pairToken} (poolKey=${getShortAddress(tokenA)}/${getShortAddress(tokenB)})`);
-  const manager = await factory.getManager(pool);
+  const markets = [];
+  const seen = new Set();
+
+  // WETH is always the marketToken (the token you go long/short on)
+  const marketToken = WETH_ADDRESS;
+
+  for (const token of tokenList) {
+    const collateral = token.address;
+    // Skip WETH as collateral (can't go long ETH with ETH collateral — use native)
+    if (collateral.toLowerCase() === marketToken.toLowerCase()) continue;
+    // Skip known zero address
+    if (!collateral || collateral === ZERO_ADDRESS) continue;
+
+    const pairKey = [marketToken, collateral].sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase())).join(":");
+    if (seen.has(pairKey)) continue;
+    seen.add(pairKey);
+
+    try {
+      const [tokenA, tokenB] = sortTokenPair(marketToken, collateral);
+      const pool = await factory.getPool(tokenA, tokenB);
+      if (!pool || pool === ZERO_ADDRESS) {
+        addLog(`[DISCOVER] No pool for ${token.symbol}/ETH, skipping`, "debug");
+        continue;
+      }
+      const manager = await factory.getManager(pool);
+      if (!manager || manager === ZERO_ADDRESS) {
+        addLog(`[DISCOVER] No manager for pool ${pool}, skipping`, "debug");
+        continue;
+      }
+      // ── HEALTH CHECK: verify manager responds to getAvailableLiquidity() ──
+      try {
+        const mgrContract = new ethers.Contract(manager, POSITION_ABI, provider);
+        const liquidity = await mgrContract.getAvailableLiquidity();
+        if (liquidity <= 0n) {
+          addLog(`[DISCOVER] Manager ${getShortAddress(manager)} has zero liquidity, skipping`, "debug");
+          continue;
+        }
+        addLog(`[DISCOVER] Manager ${getShortAddress(manager)} liquidity=${liquidity.toString()}`, "debug");
+      } catch (healthErr) {
+        addLog(`[DISCOVER] Manager ${getShortAddress(manager)} failed health check: ${healthErr.message}, skipping`, "warn");
+        continue;
+      }
+      markets.push({
+        symbol: `ETH/${token.symbol}`,
+        marketToken,
+        collateralToken: collateral,
+        collateralSymbol: token.symbol,
+        collateralDecimals: token.decimals,
+        poolAddress: pool,
+        managerAddress: manager,
+        supportsLong: true,
+        supportsShort: true,
+        rsiSymbol: "ETHUSDT"
+      });
+      addLog(`[DISCOVER] ✓ ETH/${token.symbol} pool=${getShortAddress(pool)} manager=${getShortAddress(manager)}`, "info");
+    } catch (error) {
+      addLog(`[DISCOVER] Error probing ${token.symbol}: ${error.message}`, "debug");
+    }
+  }
+
+  addLog(`[DISCOVER] Total supported markets: ${markets.length}`, "success");
+  return markets;
+}
+
+/**
+ * Build a token map from discovered token list (indexed by symbol and address).
+ * Merges with the static TOKENS map so fallback data is preserved.
+ */
+function buildTokenMap(tokenList) {
+  const map = {};
+  for (const token of tokenList) {
+    map[token.symbol] = token;
+    map[token.address.toLowerCase()] = token;
+  }
+  // Ensure WETH/ETH alias
+  if (map["WETH"] && !map["ETH"]) map["ETH"] = map["WETH"];
+  if (map["ETH"] && !map["WETH"]) map["WETH"] = map["ETH"];
+  return map;
+}
+
+/**
+ * Resolve the collateral token address from a symbol or address.
+ * Returns the normalized address.
+ */
+function resolveCollateralAddress(input, tokenMap) {
+  if (!input) throw new Error("No collateral token specified");
+  // Already an address
+  if (ethers.isAddress(input)) return input;
+  // Symbol lookup
+  const upper = String(input).toUpperCase();
+  if (tokenMap[upper]) return tokenMap[upper].address;
+  if (tokenMap[input]) return tokenMap[input].address;
+  throw new Error(`Unknown collateral token: ${input}`);
+}
+
+/**
+ * Get the list of available collateral symbols for the TUI menu.
+ * Only includes tokens that have a valid pool in the Factory.
+ */
+function getAvailableCollateralSymbols() {
+  const symbols = [];
+  for (const market of discoveredMarkets) {
+    const sym = market.collateralSymbol || market.symbol.split("/")[1];
+    if (sym && !symbols.includes(sym)) symbols.push(sym);
+  }
+  return symbols;
+}
+
+/**
+ * Prompt the user to select a collateral token, then open a position.
+ * Uses the discoveredMarkets list to show only tokens with valid pools.
+ */
+async function promptCollateralAndOpen(side) {
+  const symbols = getAvailableCollateralSymbols();
+  if (symbols.length === 0) {
+    addLog("No supported collateral tokens found. Running discovery...", "warn");
+    const provider = getProvider(SEPOLIA_RPC_URL, SEPOLIA_CHAIN_ID, proxies[selectedWalletIndex % proxies.length] || null);
+    discoveredMarkets = await discoverSupportedMarkets(provider, discoveredTokenList);
+    const retrySymbols = getAvailableCollateralSymbols();
+    if (retrySymbols.length === 0) throw new Error("No supported collateral tokens found in Nemesis Factory");
+    return promptCollateralAndOpen(side);
+  }
+  addLog(`[SELECT] Choose collateral for ${side}: ${symbols.join(", ")}`, "info");
+  return new Promise((resolve) => {
+    const items = [
+      ...symbols.map((s, i) => `[${i + 1}] ${s}`),
+      "[0] Cancel"
+    ];
+    const selectBox = blessed.list({
+      label: ` ${side} — Select Collateral `, 
+      items,
+      keys: true, vi: true,
+      style: { border: { fg: "yellow" }, selected: { bg: "blue", fg: "white" }, item: { fg: "white" } },
+      width: "50%", height: symbols.length + 4,
+      top: "center", left: "center"
+    });
+    selectBox.on("select", async (item) => {
+      selectBox.hide(); screen.remove(selectBox); safeRender();
+      const text = item.getText();
+      const match = text.match(/^\[(\d+)\]/);
+      const idx = match ? parseInt(match[1], 10) : -1;
+      if (idx === 0 || idx < 1 || idx > symbols.length) {
+        addLog("[SELECT] Cancelled", "info");
+        resolve();
+        return;
+      }
+      const chosenSymbol = symbols[idx - 1];
+      const market = discoveredMarkets.find(m => m.collateralSymbol?.toUpperCase() === chosenSymbol.toUpperCase());
+      if (!market) throw new Error(`Market not found for ${chosenSymbol}`);
+      addLog(`[SELECT] Opening ${side} with collateral: ${chosenSymbol} (${market.symbol})`, "success");
+      try {
+        await openLeveragedPosition(side, market);
+      } catch (error) {
+        addLog(`Open ${side} failed: ${error.message}`, "error");
+        try { await logLongShortPayloadDelta(getProvider(SEPOLIA_RPC_URL, SEPOLIA_CHAIN_ID, proxies[selectedWalletIndex % proxies.length] || null)); } catch {}
+      }
+      resolve();
+    });
+    selectBox.on("cancel", () => { selectBox.hide(); screen.remove(selectBox); safeRender(); resolve(); });
+    screen.append(selectBox); safeRender(); screen.focusPush(selectBox);
+  });
+}
+
+/**
+ * Prompt user to select TokenIn, TokenOut, and amount for a swap.
+ * Uses the universal executeSwap function.
+ */
+async function promptTokenSwap() {
+  const tokenSymbols = Object.keys(TOKENS).filter(s => s !== "WETH");
+  if (tokenSymbols.length === 0) throw new Error("No tokens available for swap");
+
+  return new Promise((resolve) => {
+    // Step 1: Select Token In
+    const inItems = [
+      ...tokenSymbols.map((s, i) => `[${i + 1}] ${s}`),
+      "[0] Cancel"
+    ];
+    const inBox = blessed.list({
+      label: " Swap — Select Token In ",
+      items: inItems,
+      keys: true, vi: true,
+      style: { border: { fg: "cyan" }, selected: { bg: "blue", fg: "white" }, item: { fg: "white" } },
+      width: "50%", height: tokenSymbols.length + 4,
+      top: "center", left: "center"
+    });
+
+    inBox.on("select", (item) => {
+      inBox.hide(); screen.remove(inBox); safeRender();
+      const text = item.getText();
+      const match = text.match(/^\[(\d+)\]/);
+      const idx = match ? parseInt(match[1], 10) : -1;
+      if (idx === 0 || idx < 1 || idx > tokenSymbols.length) {
+        addLog("[SWAP] Cancelled", "info");
+        resolve();
+        return;
+      }
+      const tokenIn = tokenSymbols[idx - 1];
+
+      // Step 2: Select Token Out
+      const outSymbols = tokenSymbols.filter(s => s !== tokenIn);
+      const outItems = [
+        ...outSymbols.map((s, i) => `[${i + 1}] ${s}`),
+        "[0] Cancel"
+      ];
+      const outBox = blessed.list({
+        label: ` Swap ${tokenIn} → ? — Select Token Out `,
+        items: outItems,
+        keys: true, vi: true,
+        style: { border: { fg: "cyan" }, selected: { bg: "blue", fg: "white" }, item: { fg: "white" } },
+        width: "50%", height: outSymbols.length + 4,
+        top: "center", left: "center"
+      });
+
+      outBox.on("select", async (outItem) => {
+        outBox.hide(); screen.remove(outBox); safeRender();
+        const outText = outItem.getText();
+        const outMatch = outText.match(/^\[(\d+)\]/);
+        const outIdx = outMatch ? parseInt(outMatch[1], 10) : -1;
+        if (outIdx === 0 || outIdx < 1 || outIdx > outSymbols.length) {
+          addLog("[SWAP] Cancelled", "info");
+          resolve();
+          return;
+        }
+        const tokenOut = outSymbols[outIdx - 1];
+
+        // ── AUTO: Generate random amount from balance (no input box) ──
+        try {
+          const amount = await getRandomSwapAmount(tokenIn, { tokenOut });
+          addLog(`[SWAP] Auto amount: ${amount} ${tokenIn} → ${tokenOut}`, "info");
+          const wallet = new ethers.Wallet(accounts[selectedWalletIndex].privateKey, getProvider(SEPOLIA_RPC_URL, SEPOLIA_CHAIN_ID, proxies[selectedWalletIndex % proxies.length] || null));
+          const result = await executeSwap(wallet, tokenIn, tokenOut, amount);
+          addLog(`[SWAP] Done! tx=${result.txHash}`, "success");
+        } catch (error) {
+          addLog(`[SWAP] Failed: ${error.message}`, "error");
+        }
+        resolve();
+      });
+      outBox.on("cancel", () => { outBox.hide(); screen.remove(outBox); safeRender(); resolve(); });
+      screen.append(outBox); safeRender(); screen.focusPush(outBox);
+    });
+
+    inBox.on("cancel", () => { inBox.hide(); screen.remove(inBox); safeRender(); resolve(); });
+    screen.append(inBox); safeRender(); screen.focusPush(inBox);
+  });
+}
+
+async function getLeveragedContext(provider, collateralToken, marketTokenArg = null, marketConfig = null) {
+  const collateral = normalizeCollateralToken(collateralToken);
+  const marketToken = normalizeCollateralToken(marketTokenArg || tradingConfig.marketToken);
+  const pairToken = normalizeCollateralToken(tradingConfig.pairToken || USDT_ADDRESS);
+  // NOTE: Collateral CAN equal market token (e.g., WETH collateral for LONG ETH)
+  // The Nemesis UI allows this - user provides ETH as collateral to go long on ETH
+  // When collateral == marketToken, we need to find the pool that includes both
+
+  // ── PREFERRED: use market config's known pool/manager if available ──
+  // This avoids re-querying Factory which may return a different (broken) pool
+  if (marketConfig && isValidContractTarget(marketConfig.poolAddress) && isValidContractTarget(marketConfig.managerAddress)) {
+    addLog(`[CONTEXT] Using market config pool=${getShortAddress(marketConfig.poolAddress)} mgr=${getShortAddress(marketConfig.managerAddress)}`, "info");
+    return { collateral, marketToken, pairToken, pool: marketConfig.poolAddress, manager: marketConfig.managerAddress, path: [collateral, marketToken] };
+  }
+
+  // ── FALLBACK: query Factory for pool/manager ──
+  const factory = new ethers.Contract(LEVERAGED_FACTORY, FACTORY_ABI, provider);
+  let pool, manager;
+  
+  // When collateral == marketToken (e.g., WETH collateral for LONG ETH),
+  // we need to find a pool that contains both tokens
+  if (collateral.toLowerCase() === marketToken.toLowerCase()) {
+    // Try pools: collateral/pairToken (e.g., WETH/USDT)
+    const [tokenA, tokenB] = sortTokenPair(collateral, pairToken);
+    pool = await factory.getPool(tokenA, tokenB);
+    if (isValidContractTarget(pool)) {
+      manager = await factory.getManager(pool);
+      if (isValidContractTarget(manager)) {
+        addLog(`[CONTEXT] Found pool ${getShortAddress(pool)} for ${getShortAddress(collateral)}/${getShortAddress(pairToken)}`, "info");
+        return { collateral, marketToken, pairToken, pool, manager, path: [collateral, marketToken] };
+      }
+    }
+    throw new Error(`No leveraged pool for ${collateral}/${pairToken} (collateral == marketToken)`);
+  }
+  
+  const [tokenA, tokenB] = sortTokenPair(collateral, marketToken);
+  pool = await factory.getPool(tokenA, tokenB);
+  if (!isValidContractTarget(pool)) throw new Error(`No leveraged pool for ${collateral}/${marketToken} (poolKey=${getShortAddress(tokenA)}/${getShortAddress(tokenB)})`);
+  manager = await factory.getManager(pool);
   if (!isValidContractTarget(manager)) throw new Error(`No leveraged manager for pool ${pool}`);
   return { collateral, marketToken, pairToken, pool, manager, path: [collateral, marketToken] };
 }
@@ -910,7 +2399,7 @@ async function quoteLeveragedAmountOutMin(provider, { pool, manager, collateralT
 async function buildLeveragedTx(provider, isLong, amount, token, leverage, deadline, market = null) {
   const normalizedMarket = normalizeMarketConfig(market || { collateralToken: token });
   const nativeCollateral = isNativeToken(token);
-  const context = await getLeveragedContext(provider, token, normalizedMarket.marketToken);
+  const context = await getLeveragedContext(provider, token, normalizedMarket.marketToken, normalizedMarket);
   const decimals = await getCollateralDecimals(provider, context.collateral, nativeCollateral);
   const collateralAmount = ethers.parseUnits(String(amount), decimals);
   addLog(`rawUserAmount=${amount}`, "info");
@@ -1061,15 +2550,15 @@ async function validateAndSendLeveragedTx(wallet, tx, side, provider) {
   try {
     await provider.call({ from: wallet.address, to: tx.to, data: tx.data, value: tx.value });
   } catch (error) {
-    addLog(`[${side}] provider.call revert/error: ${decodeContractError(error)}`, "error");
-    throw error;
+    addLog(`[${side}] provider.call revert (simulation), will attempt real send: ${decodeContractError(error)}`, "warn");
+    // Don't throw here — some Nemesis managers accept real TXs that fail simulation
   }
   let gasEstimate;
   try {
     gasEstimate = await provider.estimateGas({ from: wallet.address, to: tx.to, data: tx.data, value: tx.value });
   } catch (error) {
-    addLog(`[${side}] estimateGas revert/error: ${decodeContractError(error)}`, "error");
-    throw error;
+    addLog(`[${side}] estimateGas failed, using fallback gas limit: ${decodeContractError(error)}`, "warn");
+    gasEstimate = 1000000n; // fallback gas limit for Nemesis openPosition (800000 was too low)
   }
   const feeParams = await getFeeParams(provider);
   const nonce = await getNextNonce(provider, wallet.address, SEPOLIA_CHAIN_ID);
@@ -1138,6 +2627,17 @@ async function validateAndSendLeveragedTx(wallet, tx, side, provider) {
   return { sent, receipt };
 }
 
+// ═══════════════════════════════════════════════════════════════════
+//  KNOWN NEMESIS CUSTOM ERROR SELECTORS
+//  Discovered via on-chain simulation of each Manager contract.
+//  These are proprietary errors — source not verified on Etherscan.
+// ═══════════════════════════════════════════════════════════════════
+const KNOWN_NEMESIS_ERRORS = {
+  "0x7939f424": "NEMESIS_MANAGER_BROKEN_PROXY (Manager implementation has empty bytecode — pool/manager pair is defunct)",
+  "0x24811982": "NEMESIS_WRONG_COLLATERAL_TOKEN (collateral token does not match this Manager's expected token)",
+  "0x499ad952": "NEMESIS_POSITION_NOT_ALLOWED (position cannot be opened — likely broken proxy or unsupported market config)",
+};
+
 function decodeContractError(error) {
   const data = error?.data || error?.info?.error?.data || error?.error?.data;
   if (data) {
@@ -1146,8 +2646,15 @@ function decodeContractError(error) {
       return `${parsed.name}(${parsed.args.map(String).join(",")})`;
     } catch {
       const selector = String(data).slice(0, 10);
-      if (selector === "0x499ad952") return "Unknown Nemesis custom error selector 0x499ad952";
-      return `${error.reason || error.shortMessage || error.message} data=${data}`;
+      // Check known Nemesis error map
+      if (KNOWN_NEMESIS_ERRORS[selector]) {
+        addLog(`[ERROR] Custom error ${selector}: ${KNOWN_NEMESIS_ERRORS[selector]}`, "error");
+        return KNOWN_NEMESIS_ERRORS[selector];
+      }
+      // Unknown selector — log details for debugging
+      addLog(`[ERROR] Unknown custom error selector ${selector} — raw data: ${data}`, "error");
+      addLog(`[ERROR] This error is NOT in the known Nemesis error map. The contract may have been upgraded.`, "error");
+      return `Unknown custom error ${selector} (data=${data})`;
     }
   }
   return error.reason || error.shortMessage || error.message;
@@ -1184,7 +2691,38 @@ async function waitForOpenPositionOnChain(wallet, provider, tx, side, positionId
 }
 
 async function openLeveragedPosition(side, market = null, amountOverride = null) {
-  const normalizedMarket = normalizeMarketConfig(market || {});
+  // If market is a string (symbol or address), resolve it to a market config
+  let resolvedMarket = market;
+  if (typeof market === "string" && market) {
+    // Try to find in discoveredMarkets by collateralSymbol
+    const found = discoveredMarkets.find(m =>
+      m.collateralSymbol?.toUpperCase() === market.toUpperCase() ||
+      m.symbol.toUpperCase().includes(market.toUpperCase())
+    );
+    if (found) {
+      resolvedMarket = found;
+    } else if (ethers.isAddress(market)) {
+      resolvedMarket = { collateralToken: market };
+    } else {
+      // Try to resolve symbol to address using token map
+      const tokenMap = buildTokenMap(discoveredTokenList);
+      const resolvedAddress = resolveCollateralAddress(market, tokenMap);
+      resolvedMarket = { collateralToken: resolvedAddress };
+    }
+  }
+  // ═══════════════════════════════════════════════════════════════════════════════
+  //  CRITICAL: Nemesis contract determines position direction by COLLATERAL TOKEN:
+  //    - WETH collateral = LONG position (regardless of isLong param)
+  //    - USDT collateral = SHORT position (regardless of isLong param)
+  //  This was verified by analyzing 36 on-chain events from the USDT Manager.
+  //  ALL WETH-collateral positions = LONG, ALL USDT-collateral positions = SHORT.
+  // ═══════════════════════════════════════════════════════════════════════════════
+  if (side === "SHORT" && !resolvedMarket) {
+    resolvedMarket = { collateralToken: USDT_ADDRESS, marketToken: WETH_ADDRESS, symbol: "ETH/USDT" };
+  } else if (side === "LONG" && !resolvedMarket) {
+    resolvedMarket = { collateralToken: "native", marketToken: WETH_ADDRESS, symbol: "ETH/USDT" };
+  }
+  const normalizedMarket = normalizeMarketConfig(resolvedMarket || {});
   if (side === "LONG" && !tradingConfig.enableLong) throw new Error("LONG disabled in config");
   if (side === "SHORT" && !tradingConfig.enableShort) throw new Error("SHORT disabled in config");
   if (closePending) throw new Error("[SKIP] close pending; waiting before opening new position");
@@ -1196,11 +2734,25 @@ async function openLeveragedPosition(side, market = null, amountOverride = null)
   await syncActivePositionsFromChain(wallet, provider);
   if (!canOpenMarketSide(normalizedMarket, side)) throw new Error(`[SKIP] ${side} duplicate or limit reached for ${normalizedMarket.symbol}`);
   addLog("[OPEN] duplicate check passed", "success");
-  const amount = amountOverride || (tradingConfig.firstTxMode ? tradingConfig.tinyTradeAmount : await getWalletPercentTradeAmount(wallet, provider, normalizedMarket.collateralToken, side));
-  addLog(`[OPEN] ${side} ${normalizedMarket.symbol} amount=${amount}`, "warn");
+  // ── Determine amount: override > random/fixed/percentage mode ──
+  let amount;
+  if (amountOverride) {
+    amount = String(amountOverride);
+  } else if (tradingConfig.firstTxMode) {
+    amount = tradingConfig.tinyTradeAmount;
+  } else {
+    // ── AUTO: Generate random amount from collateral balance ──
+    const collateralSym = normalizedMarket.collateralSymbol || "ETH";
+    amount = await getRandomTradeAmount(side, collateralSym);
+  }
+
+  // ── Randomize leverage between leverageMin..leverageMax ──
+  const leverage = getRandomLeverage();
+
+  addLog(`[OPEN] ${side} ${normalizedMarket.symbol} amount=${amount} leverage=${leverage}x (mode=${tradingConfig.tradeAmountMode})`, "warn");
   const tx = side === "LONG"
-    ? await buildLongTx(amount, normalizedMarket.collateralToken, tradingConfig.leverage, undefined, provider, normalizedMarket)
-    : await buildShortTx(amount, normalizedMarket.collateralToken, tradingConfig.leverage, undefined, provider, normalizedMarket);
+    ? await buildLongTx(amount, normalizedMarket.collateralToken, leverage, undefined, provider, normalizedMarket)
+    : await buildShortTx(amount, normalizedMarket.collateralToken, leverage, undefined, provider, normalizedMarket);
   await ensureLeveragedApproval(wallet, tx.collateralToken, tx.to, tx.collateralAmount, tx.nativeCollateral, provider);
   await validateAndSendLeveragedTx(wallet, tx, side, provider);
 }
@@ -1461,15 +3013,136 @@ function choosePositionToClose(positions) {
   });
 }
 
+/**
+ * Query the Nemesis Goldsky subgraph for OPEN positions owned by our wallet.
+ * This uses the SAME source as nemesis.trade UI — positions here are guaranteed
+ * to appear in the Nemesis interface.
+ * 
+ * The subgraph composite ID format is: `{managerAddress lowercase}-{positionId}`
+ * This is how Nemesis UI identifies positions.
+ */
+async function queryOpenPositionsFromSubgraph(walletAddress) {
+  const subgraphs = [GOLDSKY_SUBGRAPH_URL, NEMESIS_SUBGRAPH_URL];
+  for (const url of subgraphs) {
+    try {
+      const query = `{ positions(where: { user: "${walletAddress.toLowerCase()}", status: "OPEN" }, first: 50, orderBy: openedAtTimestamp, orderDirection: desc) { id isLong status collateralToken collateralAmount leverageX10 pool { id } openedAtTimestamp } }`;
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ query })
+      });
+      const json = await response.json();
+      const positions = json.data?.positions || [];
+      if (positions.length > 0) {
+        addLog(`[SUBGRAPH] Found ${positions.length} OPEN positions from ${url.includes("goldsky") ? "Goldsky" : "Nemesis"} subgraph`, "success");
+        return positions;
+      }
+    } catch (error) {
+      addLog(`[SUBGRAPH] Query failed for ${url.includes("goldsky") ? "Goldsky" : "Nemesis"}: ${error.message}`, "warn");
+    }
+  }
+  return [];
+}
+
+/**
+ * Discover active positions using the SAME source as Nemesis UI (subgraph).
+ * Falls back to on-chain getUserPositions() only if subgraph fails.
+ * 
+ * KEY INSIGHT: getUserPositions() is BROKEN on some managers (misses positions).
+ * The subgraph indexes MAM_PositionCreated events and correctly tracks all positions.
+ * This is EXACTLY what nemesis.trade/trade uses to display positions.
+ */
 async function discoverActivePositions(wallet, provider) {
   const tracked = Array.isArray(tradingConfig.activePositions) ? tradingConfig.activePositions : [];
+  const found = [];
+  const seenKeys = new Set();
+
+  // ═══════════════════════════════════════════════════════════════════════════════
+  //  PRIMARY: Use subgraph (same source as nemesis.trade UI)
+  // ═══════════════════════════════════════════════════════════════════════════════
+  try {
+    const subgraphPositions = await queryOpenPositionsFromSubgraph(wallet.address);
+    for (const sp of subgraphPositions) {
+      // Parse composite ID: "{managerAddress}-{positionId}"
+      const compositeId = sp.id || "";
+      const dashIdx = compositeId.lastIndexOf("-");
+      if (dashIdx <= 0) {
+        addLog(`[CLOSE] Skipping subgraph position with unexpected ID format: ${compositeId}`, "warn");
+        continue;
+      }
+      const managerAddress = compositeId.substring(0, dashIdx);
+      const positionId = compositeId.substring(dashIdx + 1);
+
+      // Verify on-chain via Manager.getPosition()
+      let collateralAmount = 0n;
+      let currentDebt = 0n;
+      let collateralToken = sp.collateralToken || "";
+      let isLong = sp.isLong;
+      try {
+        const contract = new ethers.Contract(managerAddress, POSITION_ABI, provider);
+        const position = await contract.getPosition(positionId);
+        const user = String(position.user || position[1]);
+        if (user.toLowerCase() !== wallet.address.toLowerCase()) {
+          addLog(`[CLOSE] Subgraph position ${compositeId} user mismatch on-chain`, "warn");
+          continue;
+        }
+        collateralAmount = BigInt(position.collateralAmount ?? position[3] ?? 0n);
+        currentDebt = BigInt(position.currentDebt ?? position[5] ?? 0n);
+        collateralToken = position.collateralToken || position[2] || collateralToken;
+        isLong = Boolean(position.isLong ?? position[0]);
+      } catch (error) {
+        addLog(`[CLOSE] On-chain verify failed for ${compositeId}: ${error.message}`, "warn");
+        // Still include it if subgraph says OPEN — subgraph is the source of truth for UI visibility
+      }
+
+      // Skip if both zero (truly closed)
+      if (collateralAmount === 0n && currentDebt === 0n) {
+        addLog(`[CLOSE] Subgraph position ${compositeId} has zero collateral+debt on-chain, skipping`, "info");
+        continue;
+      }
+
+      const side = isLong ? "LONG" : "SHORT";
+      const key = `${managerAddress.toLowerCase()}:${positionId}`;
+      if (seenKeys.has(key)) continue;
+      seenKeys.add(key);
+
+      addLog(`[CLOSE] found ${side} positionId=${positionId} manager=${getShortAddress(managerAddress)} size=${collateralAmount} debt=${currentDebt} (via subgraph)`, "warn");
+      const trackedMeta = tracked.find(p => String(p.positionId) === String(positionId)) || {};
+      found.push({
+        side,
+        positionId,
+        managerAddress,
+        closeTarget: managerAddress,
+        symbol: trackedMeta.symbol || sp.symbol,
+        marketToken: trackedMeta.marketToken,
+        collateralToken,
+        size: collateralAmount.toString()
+      });
+    }
+    // If subgraph found positions, return them — don't fall back to broken getUserPositions()
+    if (found.length > 0) {
+      addLog(`[CLOSE] Returning ${found.length} positions discovered via subgraph (matches Nemesis UI)`, "success");
+      return found;
+    }
+  } catch (error) {
+    addLog(`[CLOSE] Subgraph discovery failed: ${error.message}, falling back to on-chain`, "warn");
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════════
+  //  FALLBACK: on-chain getUserPositions() (may miss positions on some managers)
+  // ═══════════════════════════════════════════════════════════════════════════════
+  addLog("[CLOSE] Falling back to on-chain getUserPositions() (subgraph unavailable)", "warn");
   const managers = new Set(tracked.map(p => p.managerAddress || p.closeTarget).filter(Boolean));
   if (tradingConfig.closeManager) managers.add(tradingConfig.closeManager);
-  if (managers.size === 0) {
-    const context = await getLeveragedContext(provider, tradingConfig.defaultCollateralToken);
-    managers.add(context.manager);
+  for (const market of discoveredMarkets) {
+    if (market.managerAddress) managers.add(market.managerAddress);
   }
-  const found = [];
+  if (managers.size === 0) {
+    try {
+      const context = await getLeveragedContext(provider, tradingConfig.defaultCollateralToken);
+      managers.add(context.manager);
+    } catch {}
+  }
   for (const manager of managers) {
     try {
       const contract = new ethers.Contract(manager, POSITION_ABI, provider);
@@ -1488,7 +3161,10 @@ async function discoverActivePositions(wallet, provider) {
           if (collateralAmount === 0n && currentDebt === 0n) continue;
           const isLong = Boolean(position.isLong ?? position[0]);
           const side = isLong ? "LONG" : "SHORT";
-          addLog(`[CLOSE] found ${side} positionId=${id} size=${collateralAmount} debt=${currentDebt}`, "warn");
+          const key = `${manager.toLowerCase()}:${id}`;
+          if (seenKeys.has(key)) continue;
+          seenKeys.add(key);
+          addLog(`[CLOSE] found ${side} positionId=${id} size=${collateralAmount} debt=${currentDebt} (via getUserPositions)`, "warn");
           const trackedMeta = tracked.find(p => String(p.positionId) === String(id)) || {};
           found.push({ side, positionId: id, managerAddress: manager, closeTarget: manager, symbol: trackedMeta.symbol, marketToken: trackedMeta.marketToken, collateralToken: position.collateralToken || position[2], size: collateralAmount.toString() });
         } catch {}
@@ -1500,7 +3176,7 @@ async function discoverActivePositions(wallet, provider) {
 
 async function discoverAvailableMarkets(provider) {
   const factory = new ethers.Contract(LEVERAGED_FACTORY, FACTORY_ABI, provider);
-  const configured = [...MARKET_CANDIDATES, ...(Array.isArray(tradingConfig.availableMarkets) ? tradingConfig.availableMarkets : [])];
+  const configured = [...discoveredMarkets, ...(Array.isArray(tradingConfig.availableMarkets) ? tradingConfig.availableMarkets : [])];
   const blacklist = new Set((tradingConfig.blacklistMarkets || []).map(item => String(item).toLowerCase()));
   const found = [];
   const seen = new Set();
@@ -1729,10 +3405,10 @@ function dailyTradeLimitReached() {
   return dailyTradeCounter.count >= tradingConfig.maxDailyTrades;
 }
 
-function getDistributedAmount(side, marketsCount) {
-  const base = tradingConfig.firstTxMode ? tradingConfig.tinyTradeAmount : getTradingAmount(side);
-  if (tradingConfig.balanceDistribution !== "equal" || marketsCount <= 1) return base;
-  const value = Number(base) / marketsCount;
+async function getDistributedAmount(side, marketsCount, collateralSymbol = "ETH") {
+  const rawAmount = tradingConfig.firstTxMode ? tradingConfig.tinyTradeAmount : await getRandomTradeAmount(side, collateralSymbol);
+  if (tradingConfig.balanceDistribution !== "equal" || marketsCount <= 1) return rawAmount;
+  const value = Number(rawAmount) / marketsCount;
   return value.toFixed(8).replace(/0+$/, "").replace(/\.$/, "");
 }
 
@@ -1768,7 +3444,7 @@ async function runAutoRsiTrading() {
         const side = selectAutoSide(value);
         if (!side) continue;
         if (isMarketSideBlacklisted(market, side)) continue;
-        const amount = tradingConfig.tradeMode === "walletPercent" ? null : getDistributedAmount(side, markets.length);
+        const amount = tradingConfig.tradeMode === "walletPercent" ? null : await getDistributedAmount(side, markets.length, market.collateralSymbol || "ETH");
         lastRsiTradeAt = now;
         lastMarketTradeAt[key] = now;
         addLog(`[AUTO] Opening ${side}...`, "warn");
@@ -2017,8 +3693,8 @@ const menuBox = blessed.list({
     item: { fg: "white" }
   },
   items:   fullAutoRunning || isCycleRunning
-    ? ["[1] Stop Full Auto Trading", "[2] Open LONG Now", "[3] Open SHORT Now", "[4] Close Position", "[5] Auto RSI Trading", "[6] Set Manual Config", "[7] Refresh Wallet", "[8] Exit", "[9] Stop Auto RSI Trading", "[10] Liquidity Pool Mode"]
-    : ["[1] Start Full Auto Trading", "[2] Open LONG Now", "[3] Open SHORT Now", "[4] Close Position", "[5] Auto RSI Trading", "[6] Set Manual Config", "[7] Refresh Wallet", "[8] Exit", "[9] Stop Auto RSI Trading", "[10] Liquidity Pool Mode"],
+    ? ["[1] Stop Full Auto Trading", "[2] Open LONG Now", "[3] Open SHORT Now", "[4] Close Position", "[5] Auto RSI Trading", "[6] Set Manual Config", "[7] Refresh Wallet", "[8] Exit", "[9] Stop Auto RSI Trading", "[10] Liquidity Pool Mode", "[11] Token Swap", "[12] Stop Cyclic Swap"]
+    : ["[1] Start Full Auto Trading", "[2] Open LONG Now", "[3] Open SHORT Now", "[4] Close Position", "[5] Auto RSI Trading", "[6] Set Manual Config", "[7] Refresh Wallet", "[8] Exit", "[9] Stop Auto RSI Trading", "[10] Liquidity Pool Mode", "[11] Token Swap", "[12] Start Cyclic Swap"],
   padding: { left: 1, top: 1 }
 });
 
@@ -2293,8 +3969,8 @@ function updateMenu() {
   try {
     menuBox.setItems(
       fullAutoRunning || isCycleRunning
-        ? ["[1] Stop Full Auto Trading", "[2] Open LONG Now", "[3] Open SHORT Now", "[4] Close Position", "[5] Auto RSI Trading", "[6] Set Manual Config", "[7] Refresh Wallet", "[8] Exit", "[9] Stop Auto RSI Trading", "[10] Liquidity Pool Mode"]
-        : ["[1] Start Full Auto Trading", "[2] Open LONG Now", "[3] Open SHORT Now", "[4] Close Position", "[5] Auto RSI Trading", "[6] Set Manual Config", "[7] Refresh Wallet", "[8] Exit", "[9] Stop Auto RSI Trading", "[10] Liquidity Pool Mode"]
+        ? ["[1] Stop Full Auto Trading", "[2] Open LONG Now", "[3] Open SHORT Now", "[4] Close Position", "[5] Auto RSI Trading", "[6] Set Manual Config", "[7] Refresh Wallet", "[8] Exit", "[9] Stop Auto RSI Trading", "[10] Liquidity Pool Mode", "[11] Token Swap", "[12] Stop Cyclic Swap"]
+        : ["[1] Start Full Auto Trading", "[2] Open LONG Now", "[3] Open SHORT Now", "[4] Close Position", "[5] Auto RSI Trading", "[6] Set Manual Config", "[7] Refresh Wallet", "[8] Exit", "[9] Stop Auto RSI Trading", "[10] Liquidity Pool Mode", "[11] Token Swap", "[12] Start Cyclic Swap"]
     );
     safeRender();
   } catch (error) {
@@ -2354,9 +4030,12 @@ function getLpManager() {
       rpcUrl: SEPOLIA_RPC_URL,
       chainId: SEPOLIA_CHAIN_ID,
       routerAddress: LEVERAGED_ROUTER,
+      leveragedFactory: LEVERAGED_FACTORY,
+      config: tradingConfig,
       tokenMap: {
         DAI: LEVERAGED_DAI_ADDRESS,
-        USDC: USDC_ADDRESS
+        USDC: USDC_ADDRESS,
+        WETH: WETH_ADDRESS
       }
     });
   }
@@ -2454,19 +4133,11 @@ menuBox.on("select", async (item) => {
       break;
 
     case "[2] Open LONG Now":
-      try { await openLeveragedPosition("LONG"); }
-      catch (error) {
-        addLog(`Open LONG failed: ${error.message}`, "error");
-        try { await logLongShortPayloadDelta(getProvider(SEPOLIA_RPC_URL, SEPOLIA_CHAIN_ID, proxies[selectedWalletIndex % proxies.length] || null)); } catch {}
-      }
+      await promptCollateralAndOpen("LONG");
       break;
 
     case "[3] Open SHORT Now":
-      try { await openLeveragedPosition("SHORT"); }
-      catch (error) {
-        addLog(`Open SHORT failed: ${error.message}`, "error");
-        try { await logLongShortPayloadDelta(getProvider(SEPOLIA_RPC_URL, SEPOLIA_CHAIN_ID, proxies[selectedWalletIndex % proxies.length] || null)); } catch {}
-      }
+      await promptCollateralAndOpen("SHORT");
       break;
 
     case "[4] Close Position":
@@ -2520,6 +4191,29 @@ menuBox.on("select", async (item) => {
     case "Refresh":
       await updateWallets();
       addLog("Data refreshed.", "success");
+      break;
+
+    case "[11] Token Swap":
+    case "Token Swap":
+      await promptTokenSwap();
+      break;
+
+    case "[12] Start Cyclic Swap":
+    case "Start Cyclic Swap":
+      if (cyclicSwapRunning) {
+        addLog("[SWAP] Cyclic swap already running", "warn");
+      } else {
+        addLog("[SWAP] Starting cyclic swap engine...", "success");
+        runCyclicSwapEngine({
+          intervalSeconds: dailyActivityConfig.swapIntervalSeconds || 20,
+          onSwapComplete: () => { updateWallets(); }
+        }).catch(e => addLog(`[SWAP] Engine error: ${e.message}`, "error"));
+      }
+      break;
+
+    case "[12] Stop Cyclic Swap":
+    case "Stop Cyclic Swap":
+      stopCyclicSwapEngine();
       break;
 
     case "[8] Exit":
@@ -2882,27 +4576,66 @@ screen.key(["escape", "q", "C-c"], () => {
 });
 
 async function printStartupDiagnostics(provider) {
-  addLog("===== DIAGNOSTICS =====", "warn");
+  addLog("", "info");
+  addLog("═══════════════════════════════════════════════════════", "warn");
+  addLog("  VALIDATE SUPPORTED TOKENS", "warn");
+  addLog("═══════════════════════════════════════════════════════", "warn");
   addLog(`Wallet: ${walletInfo.address}`, "info");
   addLog(`Chain: Sepolia (${SEPOLIA_CHAIN_ID})`, "info");
-  addLog(`RPC: ${SEPOLIA_RPC_URL}`, "info");
   addLog(`Router: ${NEMESIS_ROUTER}`, "info");
   addLog(`Factory: ${LEVERAGED_FACTORY}`, "info");
-  addLog(`WETH: ${WETH_ADDRESS}`, "info");
+  addLog(`WETH:   ${WETH_ADDRESS}`, "info");
+  addLog("", "info");
+
+  // Validate each token in the TOKENS map
+  const validTokens = [];
+  const invalidTokens = [];
+  const seenAddresses = new Set();
+
   for (const [name, info] of Object.entries(TOKENS)) {
-    try {
-      const contract = new ethers.Contract(info.address, ERC20_ABI, provider);
-      const [dec, sym, bal] = await Promise.all([
-        contract.decimals(),
-        contract.symbol(),
-        contract.balanceOf(walletInfo.address)
-      ]);
-      addLog(`${name.padEnd(8)} ${info.address} dec=${dec} sym=${sym} raw=${bal.toString()} human=${ethers.formatUnits(bal, dec)}`, "info");
-    } catch (e) {
-      addLog(`${name.padEnd(8)} ${info.address} ERROR: ${e.message.slice(0,60)}`, "error");
+    if (!info || !info.address) continue;
+    const addrLower = info.address.toLowerCase();
+    if (seenAddresses.has(addrLower)) continue; // skip duplicates (ETH/WETH share address)
+    seenAddresses.add(addrLower);
+
+    const report = await validateTokenContract(info.address, name, provider);
+
+    if (report.valid) {
+      // Get balance
+      let balance = "?";
+      try {
+        if (name === "ETH" || name === "WETH") {
+          const bal = await provider.getBalance(walletInfo.address);
+          balance = `${ethers.formatEther(bal)} ETH`;
+        } else {
+          const contract = new ethers.Contract(info.address, ["function balanceOf(address) view returns (uint256)"], provider);
+          const bal = await contract.balanceOf(walletInfo.address);
+          balance = `${ethers.formatUnits(bal, report.decimals)} ${report.symbol}`;
+        }
+      } catch (e) { balance = `error: ${e.message.slice(0, 30)}`; }
+
+      validTokens.push({ name, symbol: report.symbol, address: info.address, decimals: report.decimals, balance });
+    } else {
+      invalidTokens.push({ name, address: info.address, error: report.error || "UNKNOWN" });
     }
   }
-  addLog("=======================", "warn");
+
+  // Log results
+  addLog("", "info");
+  addLog(`─── Valid Tokens (${validTokens.length}) ───`, "success");
+  for (const t of validTokens) {
+    addLog(`  ✓ ${t.symbol.padEnd(8)} ${getShortAddress(t.address)} dec=${t.decimals} bal=${t.balance}`, "success");
+  }
+  if (invalidTokens.length > 0) {
+    addLog(`─── Invalid Tokens (${invalidTokens.length}) ───`, "error");
+    for (const t of invalidTokens) {
+      addLog(`  ✗ ${t.name.padEnd(8)} ${getShortAddress(t.address)} — ${t.error}`, "error");
+    }
+    addLog(`  ⚠ Invalid tokens will be EXCLUDED from Swap Engine and Trading Engine`, "warn");
+  }
+
+  addLog("", "info");
+  addLog("═══════════════════════════════════════════════════════", "warn");
 }
 
 async function initialize() {
@@ -2920,12 +4653,41 @@ async function initialize() {
     updateStatus();
     await updateWallets();
     updateLogs();
+
+    // ─── Universal collateral discovery at startup ───
+    if (accounts.length > 0) {
+      try {
+        const provider = getProvider(SEPOLIA_RPC_URL, SEPOLIA_CHAIN_ID, proxies[selectedWalletIndex % proxies.length] || null);
+        discoveredTokenList = await discoverTokenList(provider);
+        const tokenMap = buildTokenMap(discoveredTokenList);
+        discoveredMarkets = await discoverSupportedMarkets(provider, discoveredTokenList);
+        addLog(`[INIT] Discovered ${discoveredMarkets.length} supported markets`, "success");
+      } catch (error) {
+        addLog(`[INIT] Market discovery failed: ${error.message}, using fallback list`, "warn");
+        discoveredMarkets = [...MARKET_CANDIDATES_FALLBACK];
+      }
+    }
+
+    // ─── Discover supported SWAP pairs at startup (Factory + getAmountsOut validation) ───
+    if (accounts.length > 0) {
+      try {
+        const provider = getProvider(SEPOLIA_RPC_URL, SEPOLIA_CHAIN_ID, proxies[selectedWalletIndex % proxies.length] || null);
+        discoveredSwapPairs = await discoverSupportedSwapPairs(provider);
+        addLog(`[INIT] Discovered ${discoveredSwapPairs.length} supported swap pairs`, "success");
+      } catch (error) {
+        addLog(`[INIT] Swap pair discovery failed: ${error.message}, using fallback`, "warn");
+        discoveredSwapPairs = [];
+      }
+    }
     if (accounts.length > 0) {
       const diagProvider = getProvider(SEPOLIA_RPC_URL, SEPOLIA_CHAIN_ID, proxies[selectedWalletIndex % proxies.length] || null);
       await printStartupDiagnostics(diagProvider);
+      // Remove invalid tokens from TOKENS map to prevent errors in swap/trade engines
+      await cleanupInvalidTokens(diagProvider);
     }
     addLog(`You Can Change the Default Config on set manual Config Menu`, "warn");
     safeRender();
+    updateMenu();
     menuBox.focus();
     if (shouldResumeFullAuto) {
       setTimeout(() => runFullAutoTrading({ resume: true }).catch(error => addLog(`[AUTO] Resume failed: ${error.message}`, "error")), 1000);
@@ -2938,14 +4700,14 @@ async function initialize() {
 if (IS_CLI) {
   const side = process.argv.includes("--long") ? "LONG" : "SHORT";
   loadConfig();
-  tradingConfig.defaultCollateralToken = "0xe99655E262eF4C20eBeC4805B3963dad52a1538e";
+  tradingConfig.defaultCollateralToken = "native";  // Use native ETH (will be wrapped to WETH, matches nemesis.trade frontend)
   tradingConfig.fullAutoEnabled = false;
   tradingConfig.autoRSIEnabled = false;
   tradingConfig.simulateOnly = false;
   tradingConfig.maxTradesPerPair = 5;
   tradingConfig.maxConcurrentTrades = 5;
-  if (tradingConfig.uiShortPayloadReference) tradingConfig.uiShortPayloadReference[1] = "0xe99655E262eF4C20eBeC4805B3963dad52a1538e";
-  if (tradingConfig.uiLongPayloadReference) tradingConfig.uiLongPayloadReference[1] = "0xe99655E262eF4C20eBeC4805B3963dad52a1538e";
+  if (tradingConfig.uiShortPayloadReference) tradingConfig.uiShortPayloadReference[1] = WETH_ADDRESS;
+  if (tradingConfig.uiLongPayloadReference) tradingConfig.uiLongPayloadReference[1] = WETH_ADDRESS;
   loadAccounts();
   loadProxies();
   const provider = getProvider(SEPOLIA_RPC_URL, SEPOLIA_CHAIN_ID, proxies[selectedWalletIndex % proxies.length] || null);
@@ -2953,7 +4715,20 @@ if (IS_CLI) {
   addLog(`[CLI] Starting ${side} position...`, "warn");
   addLog(`[CLI] Wallet: ${wallet.address}`, "info");
   addLog(`[CLI] defaultCollateralToken: ${tradingConfig.defaultCollateralToken}`, "info");
-  openLeveragedPosition(side).then(() => {
+
+  // Discover tokens, markets, and swap pairs for CLI mode
+  discoverTokenList(provider).then(async (tokenList) => {
+    discoveredTokenList = tokenList;
+    discoveredMarkets = await discoverSupportedMarkets(provider, tokenList);
+    addLog(`[CLI] Discovered ${discoveredMarkets.length} supported markets`, "success");
+    try {
+      discoveredSwapPairs = await discoverSupportedSwapPairs(provider);
+      addLog(`[CLI] Discovered ${discoveredSwapPairs.length} supported swap pairs`, "success");
+    } catch (e) {
+      addLog(`[CLI] Swap pair discovery failed: ${e.message}`, "warn");
+    }
+    return openLeveragedPosition(side);
+  }).then(() => {
     addLog("[CLI] === DONE ===", "success");
     process.exit(0);
   }).catch(e => {
