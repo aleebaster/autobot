@@ -181,21 +181,21 @@
   "autoClose": false,
   "closePercent": 100,
   "closeManager": "0x33Cf85B6Dc6318E62a85A5014d3c6134633aa8BA",
-  "closePositionId": "813",
+  "closePositionId": "820",
   "fallbackAmountOutMin": "0",
   "maxArg6Delta": "10",
   "activePositions": [
     {
       "side": "LONG",
-      "positionId": "813",
+      "positionId": "820",
       "managerAddress": "0x33Cf85B6Dc6318E62a85A5014d3c6134633aa8BA",
       "symbol": "ETH/USDT",
       "marketToken": "0x7b79995e5f793A07Bc00c21412e50Ecae098E7f9",
       "collateralToken": "0x7b79995e5f793A07Bc00c21412e50Ecae098E7f9",
       "closeTarget": "0x33Cf85B6Dc6318E62a85A5014d3c6134633aa8BA",
       "openTarget": "0x33Cf85B6Dc6318E62a85A5014d3c6134633aa8BA",
-      "txHash": "0x2b0c213fd2f4d85797b02bce88256816c00668c19487326ff81a0ce262aef2fb",
-      "openedAt": 1785868683
+      "txHash": "0xbe42b44f951bef713b1df195ace8e3215781bce1ca40856dde3154e3026cab2c",
+      "openedAt": 1785870519
     }
   ],
   "uiPayloadReference": null,

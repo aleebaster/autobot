@@ -73,6 +73,11 @@ let SWAP_PAIRS = [];
 // Used by: TUI, CLI, Auto RSI, Full Auto, Cyclic Swap Engine.
 let discoveredSwapPairs = [];
 
+// ─── ADAPTIVE COLLATERAL RULES — auto-discovered from on-chain events ───
+// At startup, scans recent MAM_PositionCreated events across all managers
+// to determine which collateral tokens produce LONG vs SHORT positions.
+let collateralRules = { LONG: [], SHORT: [], lastDiscovery: 0, eventCount: 0 };
+
 const ROUTER_ABI = [
   "function swapExactETHForTokens(uint256 amountOutMin, address[] calldata path, address to, uint256 deadline) payable returns (uint256[] memory)",
   "function swapExactTokensForETH(uint256 amountIn, uint256 amountOutMin, address[] calldata path, address to, uint256 deadline) returns (uint256[] memory)",
@@ -1918,11 +1923,17 @@ function normalizeCollateralToken(token) {
 // ═══════════════════════════════════════════════════════════════════════════════
 function resolveCollateralForSide(side) {
   if (side === "LONG") {
-    // LONG requires WETH collateral (native ETH, wrapped to WETH)
-    return "native"; // normalizeCollateralToken("native") → WETH_ADDRESS
+    const longTokens = collateralRules.LONG;
+    if (longTokens.length > 0) {
+      const best = longTokens[0];
+      if (best.address.toLowerCase() === WETH_ADDRESS.toLowerCase()) return "native";
+      return best.address;
+    }
+    return "native"; // fallback
   } else if (side === "SHORT") {
-    // SHORT requires non-WETH collateral (USDT is the primary choice)
-    return USDT_ADDRESS;
+    const shortTokens = collateralRules.SHORT;
+    if (shortTokens.length > 0) return shortTokens[0].address;
+    return USDT_ADDRESS; // fallback
   }
   throw new Error(`resolveCollateralForSide: unknown side "${side}"`);
 }
@@ -2151,6 +2162,84 @@ async function discoverSupportedMarkets(provider, tokenList) {
   addLog(`[DISCOVER] Total supported markets: ${markets.length}`, "success");
   return markets;
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ADAPTIVE COLLATERAL RULE DISCOVERY — scans on-chain events
+// ═══════════════════════════════════════════════════════════════════════════════
+async function discoverCollateralRules(provider) {
+  addLog("[RULES] Scanning on-chain events to determine collateral rules...", "info");
+  const managerSet = new Set();
+  for (const market of discoveredMarkets) {
+    if (market.managerAddress) managerSet.add(market.managerAddress.toLowerCase());
+  }
+  const knownManagers = [
+    "0x33Cf85B6Dc6318E62a85A5014d3c6134633aa8BA",
+    "0x53bb0fFBdA04E5982fa08D846aA265Ff6cFE068e",
+    "0x1376b7A0663e83bfaed1c009f3472B133Ac8c4D7",
+    "0x490Cfc261B74B5Bcff223aE15f36faEdBa7b6f69",
+    "0x0beE5643CEb63984a33200DB0eEad001cfad1f19",
+    "0x21e07B3f9ecFE27988b7aDdaedf9CebD09B90946"
+  ];
+  for (const m of knownManagers) managerSet.add(m.toLowerCase());
+  if (managerSet.size === 0) { applyFallbackRules(); return; }
+  const EVENT_SIG = ethers.id("MAM_PositionCreated(uint256,address,bool,address,uint256,uint256,uint256,uint256,uint256)");
+  const blockNum = await provider.getBlockNumber();
+  const collateralMap = {};
+  let totalEvents = 0;
+  for (const mgrAddr of managerSet) {
+    try {
+      const logs = await provider.getLogs({ address: mgrAddr, topics: [EVENT_SIG], fromBlock: blockNum - 5000, toBlock: blockNum });
+      for (const log of logs) {
+        try {
+          const data = log.data.slice(2);
+          const isLong = BigInt("0x" + data.slice(0, 64)) !== 0n;
+          const collateralAddr = "0x" + data.slice(88, 128);
+          const colLower = collateralAddr.toLowerCase();
+          if (!collateralMap[colLower]) {
+            const tokenInfo = TOKENS[Object.keys(TOKENS).find(k => TOKENS[k].address.toLowerCase() === colLower)];
+            collateralMap[colLower] = { address: collateralAddr, symbol: tokenInfo?.symbol || colLower.slice(0, 8), decimals: tokenInfo?.decimals || 6, long: 0, short: 0 };
+          }
+          if (isLong) collateralMap[colLower].long++; else collateralMap[colLower].short++;
+          totalEvents++;
+        } catch (e) { /* skip */ }
+      }
+    } catch (e) { /* skip */ }
+  }
+  const longTokens = [], shortTokens = [];
+  for (const [addr, info] of Object.entries(collateralMap)) {
+    if (info.long > 0 && info.short === 0) longTokens.push({ address: info.address, symbol: info.symbol, decimals: info.decimals, confidence: info.long });
+    else if (info.short > 0 && info.long === 0) shortTokens.push({ address: info.address, symbol: info.symbol, decimals: info.decimals, confidence: info.short });
+    else if (info.long > 0 && info.short > 0) {
+      if (info.long >= info.short) longTokens.push({ address: info.address, symbol: info.symbol, decimals: info.decimals, confidence: info.long });
+      else shortTokens.push({ address: info.address, symbol: info.symbol, decimals: info.decimals, confidence: info.short });
+    }
+  }
+  if (longTokens.length === 0 && shortTokens.length === 0) { applyFallbackRules(); return; }
+  collateralRules = { LONG: longTokens.sort((a, b) => b.confidence - a.confidence), SHORT: shortTokens.sort((a, b) => b.confidence - a.confidence), lastDiscovery: Date.now(), eventCount: totalEvents };
+  addLog(`[RULES] Discovered from ${totalEvents} events: LONG=${longTokens.map(t => t.symbol).join(",") || "none"} SHORT=${shortTokens.map(t => t.symbol).join(",") || "none"}`, "success");
+}
+
+function applyFallbackRules() {
+  collateralRules = { LONG: [{ address: WETH_ADDRESS, symbol: "WETH", decimals: 18, confidence: 0 }], SHORT: [{ address: USDT_ADDRESS, symbol: "USDT", decimals: 6, confidence: 0 }], lastDiscovery: Date.now(), eventCount: 0 };
+  addLog("[RULES] Applied fallback: LONG=WETH, SHORT=USDT", "warn");
+}
+
+async function verifyPositionDirection(positionId, expectedSide, managerAddr, provider) {
+  try {
+    const mc = new ethers.Contract(managerAddr, ["function getPosition(uint256) view returns (bool,address,address,uint256,uint256,uint256,uint256)"], provider);
+    const pos = await mc.getPosition(positionId);
+    const actualSide = pos[0] ? "LONG" : "SHORT";
+    if (actualSide !== expectedSide) {
+      addLog(`[RULES] MISMATCH! pos ${positionId}: expected ${expectedSide}, got ${actualSide} — re-researching rules...`, "error");
+      await discoverCollateralRules(provider);
+      return false;
+    }
+    addLog(`[RULES] pos ${positionId} direction verified: ${actualSide} ✅`, "success");
+    return true;
+  } catch (e) { addLog(`[RULES] Verify error: ${e.message}`); return false; }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 
 /**
  * Build a token map from discovered token list (indexed by symbol and address).
@@ -2639,6 +2728,10 @@ async function validateAndSendLeveragedTx(wallet, tx, side, provider) {
       openedAt: Math.floor(Date.now() / 1000)
     });
     saveConfig();
+    // --- SELF-HEALING: Verify position direction matches expectation ---
+    if (side === "LONG" || side === "SHORT") {
+      await verifyPositionDirection(Number(openedPositionId), side, tx.manager || tx.to, provider);
+    }
     addLog("[OPEN] confirmed", "success");
     addLog(`[${side}] active positionId=${openedPositionId} manager=${getShortAddress(tx.manager || tx.to)}`, "success");
   }
@@ -4686,6 +4779,7 @@ async function initialize() {
         const tokenMap = buildTokenMap(discoveredTokenList);
         discoveredMarkets = await discoverSupportedMarkets(provider, discoveredTokenList);
         addLog(`[INIT] Discovered ${discoveredMarkets.length} supported markets`, "success");
+        await discoverCollateralRules(provider);
       } catch (error) {
         addLog(`[INIT] Market discovery failed: ${error.message}, using fallback list`, "warn");
         discoveredMarkets = [...MARKET_CANDIDATES_FALLBACK];
@@ -4749,6 +4843,7 @@ if (IS_CLI) {
     discoveredTokenList = tokenList;
     discoveredMarkets = await discoverSupportedMarkets(provider, tokenList);
     addLog(`[CLI] Discovered ${discoveredMarkets.length} supported markets`, "success");
+    await discoverCollateralRules(provider);
     try {
       discoveredSwapPairs = await discoverSupportedSwapPairs(provider);
       addLog(`[CLI] Discovered ${discoveredSwapPairs.length} supported swap pairs`, "success");
