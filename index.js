@@ -200,7 +200,7 @@ let dailyActivityConfig = {
 let tradingConfig = {
   enableLong: true,
   enableShort: true,
-  enableClose: false,
+  enableClose: true,
   simulateOnly: true,
   firstTxMode: true,
   defaultCollateralToken: "native",
@@ -217,8 +217,8 @@ let tradingConfig = {
   deadlineSeconds: 1200,
   rsiLong: 30,
   rsiShort: 70,
-  cooldownSeconds: 300,
-  maxOpenPositions: 1,
+  cooldownSeconds: 30,
+  maxOpenPositions: 5,
   longPercent: 50,
   shortPercent: 50,
   // ─── Natural behavior: randomized trade amounts ───
@@ -244,12 +244,12 @@ let tradingConfig = {
   selectedMarkets: [],
   availableMarkets: [],
   balanceDistribution: "fixed",
-  maxTradesPerPair: 1,
-  maxConcurrentTrades: 1,
+  maxTradesPerPair: 2,
+  maxConcurrentTrades: 3,
   maxExposurePerMarket: "0.01",
-  maxDailyTrades: 10,
+  maxDailyTrades: 100,
   maxLossPerMarket: "0",
-  cooldownPerMarket: 300,
+  cooldownPerMarket: 30,
   blacklistMarkets: [],
   autoClose: false,
   closePercent: 100,
@@ -1473,7 +1473,7 @@ async function hasSufficientBalance(wallet, provider, tokenSymbol, amount) {
  * Main cyclic swap engine.
  * Rotates through ALL supported pairs with configurable interval.
  * 
- * @param {object} options - { intervalSeconds, maxCycles, onSwapComplete }
+ * @param {object} options - { intervalSeconds, onSwapComplete }
  */
 async function runCyclicSwapEngine(options = {}) {
   if (cyclicSwapRunning) {
@@ -1483,55 +1483,88 @@ async function runCyclicSwapEngine(options = {}) {
   cyclicSwapRunning = true;
   cyclicSwapStopRequested = false;
 
-  const intervalSeconds = options.intervalSeconds || dailyActivityConfig.swapIntervalSeconds || 20;
-  const maxCycles = options.maxCycles || Infinity;
+  const intervalSeconds = options.intervalSeconds || 3;
   const onSwapComplete = options.onSwapComplete || (() => {});
+  const MAX_SWAP_ETH = 0.1; // Maximum swap amount: 0.1 ETH equivalent
 
   const allPairs = getAllSwapPairs();
-  addLog(`[SWAP ENGINE] Starting cyclic engine: ${allPairs.length} pairs, interval=${intervalSeconds}s`, "success");
+  addLog(`[SWAP ENGINE] Starting AUTOMATIC SWAPS: ${allPairs.length} pairs, interval=${intervalSeconds}s`, "success");
+  addLog(`[SWAP ENGINE] Max swap amount: ${MAX_SWAP_ETH} ETH equivalent`, "info");
+
+  // Build bidirectional pair list: for each pair, we do both A→B and B→A
+  // The discoveredSwapPairs already contains both directions for ETH↔Token pairs
+  // For Token→Token pairs, we add reverse direction too
+  const bidirectionalPairs = [];
+  for (const pair of allPairs) {
+    bidirectionalPairs.push(pair);
+    // Add reverse direction if not already present
+    const reverseExists = allPairs.some(p => p.from === pair.to && p.to === pair.from);
+    if (!reverseExists) {
+      bidirectionalPairs.push({ from: pair.to, to: pair.from });
+    }
+  }
+  addLog(`[SWAP ENGINE] Bidirectional pairs: ${bidirectionalPairs.length}`, "info");
 
   let cycleCount = 0;
-  let pairIndex = 0;  try {
-    while (!cyclicSwapStopRequested && cycleCount < maxCycles) {
-      const pair = allPairs[pairIndex];
+  let pairIndex = 0;
+  let totalSwaps = 0;
+  let totalSkipped = 0;
+  let totalErrors = 0;
+
+  try {
+    // INFINITE LOOP — runs until explicitly stopped
+    while (!cyclicSwapStopRequested) {
+      const pair = bidirectionalPairs[pairIndex];
 
       // ── Pre-swap SAFETY: validate addresses won't collide ──
       try {
         const fromInfo = normalizeToken(pair.from);
         const toInfo = normalizeToken(pair.to);
         if (fromInfo.address.toLowerCase() === toInfo.address.toLowerCase()) {
-          addLog(`[SWAP ENGINE] SKIP ${pair.from} → ${pair.to}: identical addresses (${getShortAddress(fromInfo.address)})`, "warn");
-          // skip to next pair without calling router
-          pairIndex++;
-          if (pairIndex >= allPairs.length) { pairIndex = 0; cycleCount++; }
+          pairIndex = (pairIndex + 1) % bidirectionalPairs.length;
+          if (pairIndex === 0) cycleCount++;
+          totalSkipped++;
           continue;
         }
       } catch (resolveErr) {
-        addLog(`[SWAP ENGINE] SKIP ${pair.from} → ${pair.to}: ${resolveErr.message}`, "warn");
-        pairIndex++;
-        if (pairIndex >= allPairs.length) { pairIndex = 0; cycleCount++; }
+        addLog(`[SWAP] SKIP ${pair.from} → ${pair.to}: ${resolveErr.message}`, "warn");
+        pairIndex = (pairIndex + 1) % bidirectionalPairs.length;
+        if (pairIndex === 0) cycleCount++;
+        totalSkipped++;
         continue;
       }
 
-      // ── AUTO: Generate random amount from token balance (no manual input) ──
+      // ── Generate random amount (max 0.1 ETH equivalent) ──
       let amount;
       try {
-        const amtStr = await getRandomSwapAmount(pair.from, { tokenOut: pair.to });
-        amount = Number(amtStr);
+        // For ETH: random between 0.001 and 0.1
+        // For tokens: proportional amounts based on token decimals
+        const isEth = pair.from.toUpperCase() === "ETH" || pair.from.toUpperCase() === "WETH";
+        if (isEth) {
+          // Random ETH amount: 0.001 to 0.1
+          amount = 0.001 + Math.random() * (MAX_SWAP_ETH - 0.001);
+          // Randomize decimal places for natural look (3-5 digits)
+          const decimals = 3 + Math.floor(Math.random() * 3);
+          amount = Number(amount.toFixed(decimals));
+        } else {
+          // For tokens: use existing random amount generator with cap
+          const amtStr = await getRandomSwapAmount(pair.from, { tokenOut: pair.to });
+          amount = Number(amtStr);
+          // Cap at proportional equivalent of 0.1 ETH
+          const maxToken = MAX_SWAP_ETH * 2000; // rough ETH price equivalent
+          amount = Math.min(amount, maxToken);
+        }
       } catch (e) {
-        addLog(`[SWAP ENGINE] Failed to generate amount for ${pair.from}: ${e.message}, using fallback`, "warn");
-        amount = 0.00001;
+        amount = 0.001; // fallback small amount
       }
 
-      // ── Pre-swap SAFETY: amount must be > 0 ──
+      // ── Ensure amount > 0 ──
       if (!Number.isFinite(amount) || amount <= 0) {
-        addLog(`[SWAP ENGINE] SKIP ${pair.from} → ${pair.to}: amount is ${amount} (must be > 0)`, "warn");
-        pairIndex++;
-        if (pairIndex >= allPairs.length) { pairIndex = 0; cycleCount++; }
+        pairIndex = (pairIndex + 1) % bidirectionalPairs.length;
+        if (pairIndex === 0) cycleCount++;
+        totalSkipped++;
         continue;
       }
-
-      addLog(`[SWAP ENGINE] Cycle ${cycleCount + 1} | Pair ${pairIndex + 1}/${allPairs.length}: ${pair.from} → ${pair.to} (amount=${amount})`, "info");
 
       // Get wallet and provider
       const accountIndex = 0;
@@ -1542,40 +1575,40 @@ async function runCyclicSwapEngine(options = {}) {
       // Check balance before attempting swap
       const hasBalance = await hasSufficientBalance(wallet, provider, pair.from, amount);
       if (!hasBalance) {
-        addLog(`[SWAP ENGINE] SKIP ${pair.from} → ${pair.to}: insufficient ${pair.from} balance`, "warn");
+        totalSkipped++;
       } else {
         try {
-          const result = await executeSwap(wallet, pair.from, pair.to, amount, { proxyUrl, slippageBps: 50, deadlineSeconds: 600 });
-          addLog(`[SWAP ENGINE] SUCCESS ${pair.from} → ${pair.to} | tx=${result.txHash}`, "success");
+          const result = await executeSwap(wallet, pair.from, pair.to, String(amount), { proxyUrl, slippageBps: 50, deadlineSeconds: 600 });
+          totalSwaps++;
+          addLog(`[SWAP] ✓ ${totalSwaps}. ${pair.from} → ${pair.to} amount=${amount.toFixed(6)} | tx=${result.txHash}`, "success");
           onSwapComplete(result);
         } catch (error) {
+          totalErrors++;
           const msg = String(error.message || "");
-          // Skip silently on expected errors
           if (msg.includes("insufficient") || msg.includes("Invalid quote") || msg.includes("zero output") || msg.includes("getAmountsOut failed") || msg.includes("identical tokens") || msg.includes("identical addresses")) {
-            addLog(`[SWAP ENGINE] SKIP ${pair.from} → ${pair.to}: ${msg.slice(0, 80)}`, "warn");
+            totalSkipped++;
           } else {
-            addLog(`[SWAP ENGINE] ERROR ${pair.from} → ${pair.to}: ${msg.slice(0, 120)} `, "error");
+            addLog(`[SWAP] ERROR ${pair.from} → ${pair.to}: ${msg.slice(0, 100)}`, "error");
           }
         }
       }
 
-      // Move to next pair
-      pairIndex++;
-      if (pairIndex >= allPairs.length) {
-        pairIndex = 0;
+      // Move to next pair immediately (no unnecessary waiting)
+      pairIndex = (pairIndex + 1) % bidirectionalPairs.length;
+      if (pairIndex === 0) {
         cycleCount++;
-        addLog(`[SWAP ENGINE] Completed cycle ${cycleCount}, restarting from pair 1...`, "success");
+        addLog(`[SWAP] ─── Cycle ${cycleCount} complete │ Total: ${totalSwaps} swaps, ${totalSkipped} skipped, ${totalErrors} errors ───`, "success");
       }
 
-      // Wait interval before next swap (unless stopping)
+      // Minimal delay between swaps (1-3 seconds for natural behavior)
       if (!cyclicSwapStopRequested) {
-        addLog(`[SWAP ENGINE] Waiting ${intervalSeconds}s before next swap...`, "info");
-        await sleep(intervalSeconds * 1000);
+        const delay = 1000 + Math.random() * 2000; // 1-3 seconds
+        await sleep(delay);
       }
     }
   } finally {
     cyclicSwapRunning = false;
-    addLog("[SWAP ENGINE] Stopped", "warn");
+    addLog(`[SWAP ENGINE] STOPPED │ Final stats: ${totalSwaps} swaps, ${totalSkipped} skipped, ${totalErrors} errors, ${cycleCount} cycles`, "warn");
   }
 }
 
@@ -3374,7 +3407,7 @@ const recentlyClosedPositionIds = new Set();
 let lastRsiTradeAt = 0;
 let lastMarketTradeAt = {};
 let dailyTradeCounter = { day: "", count: 0 };
-const BAD_MARKET_COOLDOWN_MS = 60 * 60 * 1000;
+const BAD_MARKET_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes instead of 60 minutes
 const badMarkets = new Map();
 const marketHealth = new Map();
 
@@ -3431,14 +3464,17 @@ function sortMarketsByHealth(markets) {
 function selectAutoSide(rsiValue) {
   if (rsiValue < tradingConfig.rsiLong && tradingConfig.enableLong) return "LONG";
   if (rsiValue > tradingConfig.rsiShort && tradingConfig.enableShort) return "SHORT";
-  if (!fullAutoRunning) return null;
-  if (!tradingConfig.enableLong) return tradingConfig.enableShort ? "SHORT" : null;
-  if (!tradingConfig.enableShort) return tradingConfig.enableLong ? "LONG" : null;
-  const longWeight = Math.max(0, Number(tradingConfig.longPercent) || 0);
-  const shortWeight = Math.max(0, Number(tradingConfig.shortPercent) || 0);
-  const total = longWeight + shortWeight;
-  if (total <= 0) return null;
-  return Math.random() * total < longWeight ? "LONG" : "SHORT";
+  // In Full Auto mode: ALWAYS pick a side even if RSI is neutral
+  if (fullAutoRunning) {
+    if (!tradingConfig.enableLong) return tradingConfig.enableShort ? "SHORT" : null;
+    if (!tradingConfig.enableShort) return tradingConfig.enableLong ? "LONG" : null;
+    const longWeight = Math.max(0, Number(tradingConfig.longPercent) || 50);
+    const shortWeight = Math.max(0, Number(tradingConfig.shortPercent) || 50);
+    const total = longWeight + shortWeight;
+    if (total <= 0) return null;
+    return Math.random() * total < longWeight ? "LONG" : "SHORT";
+  }
+  return null;
 }
 
 function finishAutoRsiTrading() {
@@ -3492,7 +3528,7 @@ async function runAutoCloseCycle() {
 
 function startAutoCloseMonitor() {
   if (autoCloseInterval) return;
-  const intervalMs = Math.max(60, Number(tradingConfig.cooldownSeconds) || 300) * 1000;
+  const intervalMs = Math.max(15, Number(tradingConfig.cooldownSeconds) || 30) * 1000;
   autoCloseInterval = setInterval(runAutoCloseCycle, intervalMs);
   runAutoCloseCycle();
 }
@@ -3587,7 +3623,7 @@ async function runAutoRsiTrading() {
       addLog(`Auto RSI trading failed: ${error.message}. Stopping RSI mode.`, "error");
       finishAutoRsiTrading();
     }
-  }, 60000);
+  }, 15000);
 }
 
 function getSwapAmount(pair) {
@@ -3810,8 +3846,8 @@ const menuBox = blessed.list({
     item: { fg: "white" }
   },
   items:   fullAutoRunning || isCycleRunning
-    ? ["[1] Stop Full Auto Trading", "[2] Open LONG Now", "[3] Open SHORT Now", "[4] Close Position", "[5] Auto RSI Trading", "[6] Set Manual Config", "[7] Refresh Wallet", "[8] Exit", "[9] Stop Auto RSI Trading", "[10] Liquidity Pool Mode", "[11] Token Swap", "[12] Stop Cyclic Swap"]
-    : ["[1] Start Full Auto Trading", "[2] Open LONG Now", "[3] Open SHORT Now", "[4] Close Position", "[5] Auto RSI Trading", "[6] Set Manual Config", "[7] Refresh Wallet", "[8] Exit", "[9] Stop Auto RSI Trading", "[10] Liquidity Pool Mode", "[11] Token Swap", "[12] Start Cyclic Swap"],
+    ? ["[1] Stop Full Auto Trading", "[2] Open LONG Now", "[3] Open SHORT Now", "[4] Close Position", "[5] Auto RSI Trading", "[6] Set Manual Config", "[7] Refresh Wallet", "[8] Exit", "[9] Stop Auto RSI Trading", "[10] Liquidity Pool Mode", "[11] Automatic Swaps", "[12] Stop Automatic Swaps"]
+    : ["[1] Start Full Auto Trading", "[2] Open LONG Now", "[3] Open SHORT Now", "[4] Close Position", "[5] Auto RSI Trading", "[6] Set Manual Config", "[7] Refresh Wallet", "[8] Exit", "[9] Stop Auto RSI Trading", "[10] Liquidity Pool Mode", "[11] Automatic Swaps", "[12] Start Automatic Swaps"],
   padding: { left: 1, top: 1 }
 });
 
@@ -4086,8 +4122,8 @@ function updateMenu() {
   try {
     menuBox.setItems(
       fullAutoRunning || isCycleRunning
-        ? ["[1] Stop Full Auto Trading", "[2] Open LONG Now", "[3] Open SHORT Now", "[4] Close Position", "[5] Auto RSI Trading", "[6] Set Manual Config", "[7] Refresh Wallet", "[8] Exit", "[9] Stop Auto RSI Trading", "[10] Liquidity Pool Mode", "[11] Token Swap", "[12] Stop Cyclic Swap"]
-        : ["[1] Start Full Auto Trading", "[2] Open LONG Now", "[3] Open SHORT Now", "[4] Close Position", "[5] Auto RSI Trading", "[6] Set Manual Config", "[7] Refresh Wallet", "[8] Exit", "[9] Stop Auto RSI Trading", "[10] Liquidity Pool Mode", "[11] Token Swap", "[12] Start Cyclic Swap"]
+        ? ["[1] Stop Full Auto Trading", "[2] Open LONG Now", "[3] Open SHORT Now", "[4] Close Position", "[5] Auto RSI Trading", "[6] Set Manual Config", "[7] Refresh Wallet", "[8] Exit", "[9] Stop Auto RSI Trading", "[10] Liquidity Pool Mode", "[11] Automatic Swaps", "[12] Stop Automatic Swaps"]
+        : ["[1] Start Full Auto Trading", "[2] Open LONG Now", "[3] Open SHORT Now", "[4] Close Position", "[5] Auto RSI Trading", "[6] Set Manual Config", "[7] Refresh Wallet", "[8] Exit", "[9] Stop Auto RSI Trading", "[10] Liquidity Pool Mode", "[11] Automatic Swaps", "[12] Start Automatic Swaps"]
     );
     safeRender();
   } catch (error) {
@@ -4103,11 +4139,20 @@ async function runFullAutoTrading({ resume = false } = {}) {
   tradingConfig.fullAutoEnabled = true;
   tradingConfig.autoRSIEnabled = true;
   saveConfig();
+  addLog("[AUTO] ═══ FULL AUTO TRADING STARTED ═══", "success");
+  addLog("[AUTO] Components: Swaps + LONG + SHORT + Close", "info");
   addLog("[AUTO] Running restart recovery close scan...", "info");
   await runAutoCloseCycle();
   startAutoCloseMonitor();
-  addLog("[AUTO] Starting swaps...", "info");
-  addLog("[AUTO] Starting RSI trading...", "info");
+  // Start automatic swaps in background
+  addLog("[AUTO] Starting Automatic Swaps (continuous cycle)...", "info");
+  if (!cyclicSwapRunning) {
+    runCyclicSwapEngine({
+      intervalSeconds: 3,
+      onSwapComplete: () => { updateWallets(); }
+    }).catch(e => addLog(`[AUTO] Swap engine error: ${e.message}`, "error"));
+  }
+  addLog("[AUTO] Starting Auto RSI trading (LONG/SHORT)...", "info");
   if (!rsiRunning && !rsiTradingInterval) await runAutoRsiTrading();
   updateMenu();
   updateStatus();
@@ -4127,9 +4172,10 @@ function stopFullAutoTrading() {
   }
   requestStopAutoRsiTrading();
   stopAutoCloseMonitor();
+  stopCyclicSwapEngine();
   updateMenu();
   updateStatus();
-  addLog("[AUTO] Full auto trading stopped.", "success");
+  addLog("[AUTO] ═══ FULL AUTO TRADING STOPPED ═══", "success");
 }
 
 function getLpManager() {
@@ -4310,26 +4356,26 @@ menuBox.on("select", async (item) => {
       addLog("Data refreshed.", "success");
       break;
 
-    case "[11] Token Swap":
-    case "Token Swap":
+    case "[11] Automatic Swaps":
+    case "Automatic Swaps":
       await promptTokenSwap();
       break;
 
-    case "[12] Start Cyclic Swap":
-    case "Start Cyclic Swap":
+    case "[12] Start Automatic Swaps":
+    case "Start Automatic Swaps":
       if (cyclicSwapRunning) {
-        addLog("[SWAP] Cyclic swap already running", "warn");
+        addLog("[SWAP] Automatic swaps already running", "warn");
       } else {
-        addLog("[SWAP] Starting cyclic swap engine...", "success");
+        addLog("[SWAP] Starting automatic swap engine...", "success");
         runCyclicSwapEngine({
-          intervalSeconds: dailyActivityConfig.swapIntervalSeconds || 20,
+          intervalSeconds: 3,
           onSwapComplete: () => { updateWallets(); }
         }).catch(e => addLog(`[SWAP] Engine error: ${e.message}`, "error"));
       }
       break;
 
-    case "[12] Stop Cyclic Swap":
-    case "Stop Cyclic Swap":
+    case "[12] Stop Automatic Swaps":
+    case "Stop Automatic Swaps":
       stopCyclicSwapEngine();
       break;
 
