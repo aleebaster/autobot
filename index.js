@@ -13,18 +13,18 @@ import { LpManager } from "./lpManager.js";
 const SEPOLIA_RPC_URL = "https://ethereum-sepolia-rpc.publicnode.com/557d07a988c4164482ef0c56a10f98ee0e3073440fd72fbe89cd7f6fef809388";
 const SEPOLIA_CHAIN_ID = 11155111;
 
-const NEMESIS_ROUTER  = "0x0C88262f03B183DD183C2fC7A78578dBcE1e664C";
-const WETH_ADDRESS    = "0x7b79995e5f793A07Bc00c21412e50Ecae098E7f9";
-const USDC_ADDRESS    = "0xbeCe1313784742fc57168892d5d8ff8BEb2f4774";  // QA USD Coin (from nemesis.trade frontend)
-const DAI_ADDRESS     = "0xD8a5222924daE3D3C6b08AdB95d929845F1f5Dd7";  // QA Dai (from nemesis.trade frontend)
-const UNI_ADDRESS     = "0xae1150b6b6147DA6Ebc0acB638febC234398CD1E";  // QA Uniswap (from nemesis.trade frontend)
-const NEMESIS_ADDRESS = "0x05B78daf98024a3b896FD8558EfDCA6DAdC076c4";  // QA Nemesis (from nemesis.trade frontend)
-const USDT_ADDRESS    = "0xb66f21dC4E6701d686Dee90C3c71b03D8069C844";  // QA Tether USD (from nemesis.trade frontend)
-const LINK_ADDRESS    = "0x3b147AeEd769AA24bE059c5135506693c70327Be";  // QA Chainlink (from nemesis.trade frontend)
+const NEMESIS_ROUTER  = "0x33270EC1870eD96fa2DC151fc0AeC79ce5737793";  // PROVEN: nemesis.trade UI router (ref tx 0x4f35...580c)
+const WETH_ADDRESS    = "0x7b79995e5f793A07Bc00c21412e50Ecae098E7f9";  // PROVEN: same in bot and UI
+const USDC_ADDRESS    = "0x5dcf1Db10F87CB7839640F9B85C4ECfA29b56e80";  // PROVEN: nemesis.trade frontend JS
+const DAI_ADDRESS     = "0xa3215a5cA659e0Bd57c0B33d5EAD71901A24d3d6";  // PROVEN: nemesis.trade frontend JS
+const UNI_ADDRESS     = "0xEaBEcd70AC3330d65e09e429824C49d0D8812952";  // PROVEN: nemesis.trade frontend JS
+const NEMESIS_ADDRESS = "0x18D18A40614b6d8C6154309F517acf9829308842";  // PROVEN: nemesis.trade ref tx 0x4f35...580c
+const USDT_ADDRESS    = "0x5f2E83cCDEa73D60aF400e03F1Cd8Fb9eaB07b20";  // PROVEN: nemesis.trade ref tx 0xe7dd...fcdc
+const LINK_ADDRESS    = "0x1132087D2D97b55E5fe1B0FcA7b99348B5f07e28";  // PROVEN: nemesis.trade frontend JS
 const EXPECTED_WALLET = "0x315E5193633A962B3F369F9C3833D973D0588cCD";
-const LEVERAGED_FACTORY = "0xDd3D572f8B74dC4F83d268f50f962A7fE1C57c14";
-const LEVERAGED_ROUTER = "0x0C88262f03B183DD183C2fC7A78578dBcE1e664C";
-const LEVERAGED_DAI_ADDRESS = "0xb66f21dC4E6701d686Dee90C3c71b03D8069C844";  // QA USDT (from nemesis.trade frontend) — default collateral
+const LEVERAGED_FACTORY = "0x20908a1238E94b6417cc1F4f45CD8421003E4B3a";  // PROVEN: nemesis.trade frontend NEXT_PUBLIC_FACTORY_ADDRESS
+const LEVERAGED_ROUTER = "0x33270EC1870eD96fa2DC151fc0AeC79ce5737793";  // PROVEN: nemesis.trade frontend NEXT_PUBLIC_ROUTER_ADDRESS
+const LEVERAGED_DAI_ADDRESS = "0x5f2E83cCDEa73D60aF400e03F1Cd8Fb9eaB07b20";  // PROVEN: USDT — default collateral for SHORT
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 const BPS = 10000n;
 const NEMESIS_SUBGRAPH_URL = "https://nemesis.trade/api/subgraph";
@@ -2205,7 +2205,13 @@ async function discoverCollateralRules(provider) {
   for (const market of discoveredMarkets) {
     if (market.managerAddress) managerSet.add(market.managerAddress.toLowerCase());
   }
+  // PROVEN: managers from NEW Factory (0x2090...) + old managers for backward compat
   const knownManagers = [
+    // NEW managers (from nemesis.trade UI — verified via factory.getManager())
+    "0x3937c0a8B12F51812A5Bcd91920Aca8390dEdEE9",  // ETH/USDT (NEW)
+    "0xC20De3394BFd88d2FAC7E43dbbf2ba3dDe06dE81",  // ETH/USDC (NEW)
+    "0x316f1CB64441b38877d1b549386731d7639F1e21",  // ETH/NEMESIS (NEW)
+    // Old managers (kept for existing position tracking)
     "0x33Cf85B6Dc6318E62a85A5014d3c6134633aa8BA",
     "0x53bb0fFBdA04E5982fa08D846aA265Ff6cFE068e",
     "0x1376b7A0663e83bfaed1c009f3472B133Ac8c4D7",
