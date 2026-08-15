@@ -1955,18 +1955,30 @@ function normalizeCollateralToken(token) {
 //  ALL code paths must use it: Open LONG, Open SHORT, Auto RSI, Full Auto, CLI, TUI.
 // ═══════════════════════════════════════════════════════════════════════════════
 function resolveCollateralForSide(side) {
+  // NEW DEPLOYMENT RULE (verified 2026-08-15):
+  // - LONG  → use the pool's token0 (the collateral/quote token, e.g. USDT, NEMESIS)
+  // - SHORT → use WETH (the base token, token1 in most pools)
+  // This is the OPPOSITE of the old deployment where LONG=WETH, SHORT=USDT.
+  // The MAM_PositionDirectionMismatch error confirms this on the new managers.
+  //
+  // We use the first available market's collateral token for LONG,
+  // which is token0 of the pool (USDT, NEMESIS, etc).
   if (side === "LONG") {
-    const longTokens = collateralRules.LONG;
-    if (longTokens.length > 0) {
-      const best = longTokens[0];
+    // For LONG, use the collateral token from the first active market (token0)
+    const markets = tradingConfig.availableMarkets || [];
+    if (markets.length > 0 && markets[0].collateralToken) {
+      return markets[0].collateralToken;
+    }
+    return USDT_ADDRESS; // fallback: USDT is token0 for ETH/USDT pool
+  } else if (side === "SHORT") {
+    // For SHORT, use WETH (token1 in most pools)
+    const shortTokens = collateralRules.SHORT;
+    if (shortTokens.length > 0) {
+      const best = shortTokens[0];
       if (best.address.toLowerCase() === WETH_ADDRESS.toLowerCase()) return "native";
       return best.address;
     }
-    return "native"; // fallback
-  } else if (side === "SHORT") {
-    const shortTokens = collateralRules.SHORT;
-    if (shortTokens.length > 0) return shortTokens[0].address;
-    return USDT_ADDRESS; // fallback
+    return "native"; // fallback: WETH for SHORT
   }
   throw new Error(`resolveCollateralForSide: unknown side "${side}"`);
 }
