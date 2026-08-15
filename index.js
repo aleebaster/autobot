@@ -1956,16 +1956,28 @@ function normalizeCollateralToken(token) {
 // ═══════════════════════════════════════════════════════════════════════════════
 function resolveCollateralForSide(side) {
   // NEW DEPLOYMENT RULE (verified 2026-08-15):
-  // - LONG  → use the pool's token0 (the collateral/quote token, e.g. USDT, NEMESIS)
+  // - LONG  → use a non-self-collateral token (e.g. USDT, NEMESIS on USDT pool)
   // - SHORT → use WETH (the base token, token1 in most pools)
   // This is the OPPOSITE of the old deployment where LONG=WETH, SHORT=USDT.
   // The MAM_PositionDirectionMismatch error confirms this on the new managers.
   //
-  // We use the first available market's collateral token for LONG,
-  // which is token0 of the pool (USDT, NEMESIS, etc).
+  // NOTE: Some managers reject self-collateralization (NEMESIS on NEMESIS pool).
+  // We skip tokens that are the same as the pool's market base token.
   if (side === "LONG") {
-    // For LONG, use the collateral token from the first active market (token0)
+    // For LONG, find the first market where collateral works
+    // Prefer USDT as it's the most reliable collateral for LONG
     const markets = tradingConfig.availableMarkets || [];
+    for (const m of markets) {
+      if (m.collateralToken && m.collateralSymbol?.toUpperCase() === "USDT") {
+        return m.collateralToken;
+      }
+    }
+    // Fallback: first market that isn't NEMESIS (to avoid self-collateral)
+    for (const m of markets) {
+      if (m.collateralToken && m.collateralSymbol?.toUpperCase() !== "NEMESIS") {
+        return m.collateralToken;
+      }
+    }
     if (markets.length > 0 && markets[0].collateralToken) {
       return markets[0].collateralToken;
     }
