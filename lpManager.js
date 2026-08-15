@@ -21,7 +21,11 @@ export class LpManager {
     return { provider, wallet };
   }
 
-  getPairToken(config = this.deps.getConfig()) {
+  /**
+   * Resolve the pool pair token address from config.
+   * For the new Nemesis ecosystem, this is the collateral token (e.g., DAI).
+   */
+  getPairTokenAddress(config = this.deps.getConfig()) {
     const pair = String(config.lpPair || "ETH/DAI").toUpperCase();
     const tokenB = String(config.lpTokenB || pair.split("/")[1] || "DAI").toUpperCase();
     if (pair === "ETH/DAI" || tokenB === "DAI") return this.deps.tokenMap.DAI;
@@ -33,12 +37,31 @@ export class LpManager {
     throw new Error(`Unsupported LP pair ${config.lpPair}. Use ETH/DAI, ETH/USDC, or CUSTOM with lpCustomTokenAddress.`);
   }
 
+  /**
+   * Resolve pool and manager addresses for the given token pair.
+   * Uses the Nemesis Factory to look up the pool, then the manager.
+   */
+  async resolvePoolAndManager(provider, tokenAAddress, tokenBAddress) {
+    const FACTORY_ABI = [
+      "function getPool(address tokenA,address tokenB) view returns (address)",
+      "function getManager(address pool) view returns (address)"
+    ];
+    const factoryAddress = this.deps.leveragedFactory;
+    if (!factoryAddress) throw new Error("No factory address configured");
+
+    const [tokenA, tokenB] = [tokenAAddress, tokenBAddress].sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
+    const factory = new ethers.Contract(factoryAddress, FACTORY_ABI, provider);
+    const pool = await factory.getPool(tokenA, tokenB);
+    if (!pool || pool === ethers.ZeroAddress) throw new Error(`No pool found for ${tokenA}/${tokenB}`);
+    const manager = await factory.getManager(pool);
+    if (!manager || manager === ethers.ZeroAddress) throw new Error(`No manager found for pool ${pool}`);
+    return { pool, manager, factoryAddress };
+  }
+
   getParams() {
     const config = this.deps.getConfig();
     return {
       config,
-      routerAddress: this.deps.routerAddress,
-      tokenAddress: this.getPairToken(config),
       chainId: this.deps.chainId,
       getFeeParams: this.deps.getFeeParams,
       getNextNonce: this.deps.getNextNonce,
@@ -87,30 +110,61 @@ export class LpManager {
     throw lastError;
   }
 
+  /**
+   * Add Liquidity using the Nemesis Manager contract.
+   * Resolves pool/manager from Factory, then calls the unified addLiquidity function.
+   */
   async addLiquidity() {
     const { provider, wallet } = this.getRuntime();
     const config = this.deps.getConfig();
+    const WETH_ADDRESS = this.deps.tokenMap?.WETH || "0x7b79995e5f793A07Bc00c21412e50Ecae098E7f9";
+
     this.proof(`[LP] MENU PATH [10] Liquidity Pool Mode -> [1] Add Liquidity`);
     this.proof(`[LP] Add Liquidity starting pair=${config.lpPair} amountMode=${config.lpAmountMode}`);
-    const result = await this.withRetry("Add Liquidity", () => addLiquidity({ provider, wallet, ...this.getParams() }));
-    const ui = await this.fetchUiLp(wallet.address, result.poolAddress);
+
+    // Resolve pair token address (e.g., DAI)
+    const pairTokenAddress = this.getPairTokenAddress(config);
+    this.deps.log(`[LP] Resolving pool: WETH (${WETH_ADDRESS}) / pairToken (${pairTokenAddress})`, "info");
+
+    // Resolve pool and manager from the Nemesis Factory
+    const { pool, manager } = await this.resolvePoolAndManager(provider, WETH_ADDRESS, pairTokenAddress);
+    this.deps.log(`[LP] Pool=${pool} Manager=${manager}`, "info");
+
+    // Run the unified addLiquidity function
+    const result = await this.withRetry("Add Liquidity", () =>
+      addLiquidity({
+        provider,
+        wallet,
+        config,
+        managerAddress: manager,
+        poolAddress: pool,
+        tokenAAddress: WETH_ADDRESS,
+        tokenBAddress: pairTokenAddress,
+        ...this.getParams()
+      })
+    );
+
+    // Fetch UI position
+    const ui = await this.fetchUiLp(wallet.address, pool);
     this.proof("[LP] Add Liquidity proof", {
       txHash: result.txHash,
       receiptStatus: result.receiptStatus,
-      routerAddress: result.routerAddress,
+      managerAddress: result.managerAddress,
       poolAddress: result.poolAddress,
-      tokenAmountDesired: result.tokenAmountDesired,
-      ethAmountDesired: result.ethAmountDesired,
-      tokenAmountDisplay: result.tokenAmountDisplay,
-      ethAmountDisplay: result.ethAmountDisplay,
-      expectedLiquidity: result.expectedLiquidity,
-      amountTokenMin: result.amountTokenMin,
-      amountEthMin: result.amountEthMin,
-      beforeLpBalance: result.beforeLpBalance,
-      afterLpBalance: result.afterLpBalance,
-      liquidityDelta: result.liquidityDelta,
+      tokenA: result.tokenA,
+      tokenB: result.tokenB,
+      amountADesired: result.amountADesired,
+      amountBDesired: result.amountBDesired,
+      amountADesiredDisplay: result.amountADesiredDisplay,
+      amountBDesiredDisplay: result.amountBDesiredDisplay,
+      lpBalanceBefore: result.lpBalanceBefore,
+      lpBalanceAfter: result.lpBalanceAfter,
+      lpDelta: result.lpDelta,
+      lpTokensReceived: result.lpTokensReceived,
       ui
     });
+
+    // Auto-remove if configured
     if (Number(config.lpAutoRemoveMinutes) > 0) {
       if (this.autoRemoveTimer) clearTimeout(this.autoRemoveTimer);
       this.autoRemoveTimer = setTimeout(() => {
@@ -118,25 +172,35 @@ export class LpManager {
       }, Number(config.lpAutoRemoveMinutes) * 60 * 1000);
       this.deps.log(`[LP] Auto remove scheduled in ${config.lpAutoRemoveMinutes} minutes.`, "warn");
     }
+
     return result;
   }
 
   async removeLiquidity() {
     const { provider, wallet } = this.getRuntime();
-    this.deps.log("[LP] Remove Liquidity starting ETH/DAI.", "info");
-    return removeLiquidity({ provider, wallet, ...this.getParams() });
+    const config = this.deps.getConfig();
+    const WETH_ADDRESS = this.deps.tokenMap?.WETH || "0x7b79995e5f793A07Bc00c21412e50Ecae098E7f9";
+    const pairTokenAddress = this.getPairTokenAddress(config);
+    const { pool, manager } = await this.resolvePoolAndManager(provider, WETH_ADDRESS, pairTokenAddress);
+
+    this.deps.log("[LP] Remove Liquidity starting.", "info");
+    return removeLiquidity({
+      provider, wallet, config,
+      managerAddress: manager,
+      poolAddress: pool,
+      ...this.getParams()
+    });
   }
 
   async status() {
     const { provider, wallet } = this.getRuntime();
-    const params = this.getParams();
-    const status = await getLpStatus({
-      provider,
-      walletAddress: wallet.address,
-      routerAddress: params.routerAddress,
-      tokenAddress: params.tokenAddress
-    });
-    this.deps.log(`[LP] Status pair=${status.pairAddress} lp=${status.lpBalance.toString()} total=${status.totalSupply.toString()}`, status.exists ? "success" : "warn");
+    const config = this.deps.getConfig();
+    const WETH_ADDRESS = this.deps.tokenMap?.WETH || "0x7b79995e5f793A07Bc00c21412e50Ecae098E7f9";
+    const pairTokenAddress = this.getPairTokenAddress(config);
+    const { pool } = await this.resolvePoolAndManager(provider, WETH_ADDRESS, pairTokenAddress);
+
+    const status = await getLpStatus({ provider, walletAddress: wallet.address, poolAddress: pool });
+    this.deps.log(`[LP] Status pool=${status.poolAddress} lp=${status.lpBalance.toString()} total=${status.totalSupply.toString()}`, status.exists ? "success" : "warn");
     return status;
   }
 
@@ -152,7 +216,6 @@ export class LpManager {
       this.deps.log("[LP] Auto LP Cycle already running.", "warn");
       return;
     }
-
     this.autoRunning = true;
     this.stopRequested = false;
     const config = this.deps.getConfig();
