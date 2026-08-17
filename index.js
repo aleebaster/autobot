@@ -1954,25 +1954,39 @@ function normalizeCollateralToken(token) {
 //  This function is the SINGLE place that determines collateral for a side.
 //  ALL code paths must use it: Open LONG, Open SHORT, Auto RSI, Full Auto, CLI, TUI.
 // ═══════════════════════════════════════════════════════════════════════════════
-function resolveCollateralForSide(side) {
-  // NEW DEPLOYMENT RULE (verified 2026-08-15):
-  // - LONG  → use a non-self-collateral token (e.g. USDT, NEMESIS on USDT pool)
-  // - SHORT → use WETH (the base token, token1 in most pools)
-  // This is the OPPOSITE of the old deployment where LONG=WETH, SHORT=USDT.
-  // The MAM_PositionDirectionMismatch error confirms this on the new managers.
+function resolveCollateralForSide(side, market = null) {
+  // ═══════════════════════════════════════════════════════════════════════════════
+  //  POOL-AWARE COLLATERAL RESOLUTION (verified via MAM_PositionDirectionMismatch):
+  //  Each pool has token0 and token1. The manager enforces:
+  //    token0 collateral → isLong=true  (LONG position)
+  //    token1 collateral → isLong=false (SHORT position)
+  //  If isLong doesn't match the token position, the manager reverts with
+  //  MAM_PositionDirectionMismatch.
+  // ═══════════════════════════════════════════════════════════════════════════════
   //
-  // NOTE: Some managers reject self-collateralization (NEMESIS on NEMESIS pool).
-  // We skip tokens that are the same as the pool's market base token.
+  //  If a specific market is provided AND it has poolToken0 cached:
+  //    LONG  → use poolToken0
+  //    SHORT → use poolToken1 (the other token)
+  if (market && market.poolToken0) {
+    const collateralIsToken0 = market.collateralToken.toLowerCase() === market.poolToken0.toLowerCase();
+    if (side === "LONG") {
+      // LONG needs token0
+      return collateralIsToken0 ? market.collateralToken : WETH_ADDRESS;
+    } else if (side === "SHORT") {
+      // SHORT needs token1 (the other token)
+      return collateralIsToken0 ? WETH_ADDRESS : market.collateralToken;
+    }
+  }
+  //
+  //  FALLBACK (no market or no poolToken0): use global heuristic
+  //  For most pools: collateral token is token0 → LONG, WETH is token1 → SHORT
   if (side === "LONG") {
-    // For LONG, find the first market where collateral works
-    // Prefer USDT as it's the most reliable collateral for LONG
     const markets = tradingConfig.availableMarkets || [];
     for (const m of markets) {
       if (m.collateralToken && m.collateralSymbol?.toUpperCase() === "USDT") {
         return m.collateralToken;
       }
     }
-    // Fallback: first market that isn't NEMESIS (to avoid self-collateral)
     for (const m of markets) {
       if (m.collateralToken && m.collateralSymbol?.toUpperCase() !== "NEMESIS") {
         return m.collateralToken;
@@ -1981,16 +1995,9 @@ function resolveCollateralForSide(side) {
     if (markets.length > 0 && markets[0].collateralToken) {
       return markets[0].collateralToken;
     }
-    return USDT_ADDRESS; // fallback: USDT is token0 for ETH/USDT pool
+    return USDT_ADDRESS;
   } else if (side === "SHORT") {
-    // For SHORT, use WETH (token1 in most pools)
-    const shortTokens = collateralRules.SHORT;
-    if (shortTokens.length > 0) {
-      const best = shortTokens[0];
-      if (best.address.toLowerCase() === WETH_ADDRESS.toLowerCase()) return "native";
-      return best.address;
-    }
-    return "native"; // fallback: WETH for SHORT
+    return "native"; // WETH for SHORT (fallback)
   }
   throw new Error(`resolveCollateralForSide: unknown side "${side}"`);
 }
@@ -2729,9 +2736,11 @@ async function validateAndSendLeveragedTx(wallet, tx, side, provider) {
   if (isOpenTx) assertUiPayloadMatch(tx, side);
   try {
     await provider.call({ from: wallet.address, to: tx.to, data: tx.data, value: tx.value });
+    addLog(`[${side}] pre-flight simulation PASSED`, "success");
   } catch (error) {
-    addLog(`[${side}] provider.call revert (simulation), will attempt real send: ${decodeContractError(error)}`, "warn");
-    // Don't throw here — some Nemesis managers accept real TXs that fail simulation
+    const decodedErr = decodeContractError(error);
+    addLog(`[${side}] PRE-FLIGHT REVERT — NOT sending transaction: ${decodedErr}`, "error");
+    throw new Error(`Pre-flight reverted: ${decodedErr}`);
   }
   let gasEstimate;
   try {
@@ -2895,17 +2904,17 @@ async function openLeveragedPosition(side, market = null, amountOverride = null)
     }
   }
   // ═══════════════════════════════════════════════════════════════════════════════
-  //  UNIVERSAL RULE (verified across 870+ events from 4 managers):
-  //    - WETH collateral = LONG position
-  //    - ANY other token = SHORT position
-  //  The isLong parameter is IGNORED by the contract.
-  //  Use resolveCollateralForSide() as the SINGLE source of truth.
+  //  POOL-AWARE COLLATERAL RULE (verified via MAM_PositionDirectionMismatch):
+  //  Each pool's manager enforces: token0 → LONG, token1 → SHORT.
+  //  Use resolveCollateralForSide(side, market) which queries pool.token0()
+  //  to determine the correct collateral for the requested side.
   // ═══════════════════════════════════════════════════════════════════════════════
-  const resolvedCollateral = resolveCollateralForSide(side);
   if (!resolvedMarket) {
-    resolvedMarket = { collateralToken: resolvedCollateral, marketToken: WETH_ADDRESS, symbol: "ETH/USDT" };
+    resolvedMarket = { collateralToken: WETH_ADDRESS, marketToken: WETH_ADDRESS, symbol: "ETH/USDT" };
   }
   const normalizedMarket = normalizeMarketConfig(resolvedMarket || {});
+  // Resolve collateral AFTER market is known — pass market for pool.token0() lookup
+  const resolvedCollateral = resolveCollateralForSide(side, normalizedMarket);
   if (side === "LONG" && !tradingConfig.enableLong) throw new Error("LONG disabled in config");
   if (side === "SHORT" && !tradingConfig.enableShort) throw new Error("SHORT disabled in config");
   if (closePending) throw new Error("[SKIP] close pending; waiting before opening new position");
@@ -2933,9 +2942,12 @@ async function openLeveragedPosition(side, market = null, amountOverride = null)
   const leverage = getRandomLeverage();
 
   addLog(`[OPEN] ${side} ${normalizedMarket.symbol} amount=${amount} leverage=${leverage}x (mode=${tradingConfig.tradeAmountMode})`, "warn");
+  addLog(`[COLLATERAL] market.collateralToken=${normalizedMarket.collateralSymbol || normalizedMarket.collateralToken} resolvedCollateral=${resolvedCollateral}`, "info");
+  // ── USE resolvedCollateral (from resolveCollateralForSide) ──
+  // NOT normalizedMarket.collateralToken — the resolved collateral is the one the manager actually accepts.
   const tx = side === "LONG"
-    ? await buildLongTx(amount, normalizedMarket.collateralToken, leverage, undefined, provider, normalizedMarket)
-    : await buildShortTx(amount, normalizedMarket.collateralToken, leverage, undefined, provider, normalizedMarket);
+    ? await buildLongTx(amount, resolvedCollateral, leverage, undefined, provider, normalizedMarket)
+    : await buildShortTx(amount, resolvedCollateral, leverage, undefined, provider, normalizedMarket);
   await ensureLeveragedApproval(wallet, tx.collateralToken, tx.to, tx.collateralAmount, tx.nativeCollateral, provider);
   await validateAndSendLeveragedTx(wallet, tx, side, provider);
 }
@@ -3384,8 +3396,16 @@ async function discoverAvailableMarkets(provider) {
       const contract = new ethers.Contract(manager, POSITION_ABI, provider);
       const liquidity = await contract.getAvailableLiquidity().catch(() => 0n);
       if (BigInt(liquidity) <= 0n) throw new Error("no leverage liquidity");
-      addLog(`[MARKET] ${candidate.symbol} pool=${getShortAddress(pool)} manager=${getShortAddress(manager)} liquidity=${liquidity}`, "info");
-      const market = { ...candidate, collateralToken: collateral, marketToken, pool, managerAddress: manager, liquidity: liquidity.toString(), isActive: true, health: "WORKING" };
+      // Query pool.token0() — determines LONG/SHORT direction per manager rule:
+      //   token0 collateral → isLong=true  (LONG)
+      //   token1 collateral → isLong=false (SHORT)
+      let poolToken0 = null;
+      try {
+        const poolContract = new ethers.Contract(pool, POOL_ABI, provider);
+        poolToken0 = await poolContract.token0();
+      } catch (e) { /* pool may not support token0() */ }
+      addLog(`[MARKET] ${candidate.symbol} pool=${getShortAddress(pool)} manager=${getShortAddress(manager)} liquidity=${liquidity} token0=${poolToken0 ? getShortAddress(poolToken0) : "?"}`, "info");
+      const market = { ...candidate, collateralToken: collateral, marketToken, pool, managerAddress: manager, liquidity: liquidity.toString(), isActive: true, health: "WORKING", poolToken0 };
       setMarketHealth(market, "WORKING");
       found.push(market);
     } catch (error) {
