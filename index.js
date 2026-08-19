@@ -9,33 +9,98 @@ import { HttpsProxyAgent } from "https-proxy-agent";
 import { SocksProxyAgent } from "socks-proxy-agent";
 import { DEFAULT_LP_CONFIG, loadLpConfig, serializeLpConfig } from "./lpConfig.js";
 import { LpManager } from "./lpManager.js";
+import {
+  getActiveDeployment,
+  setActiveDeployment,
+  getActiveDeploymentId,
+  isV1,
+  isV2Plus,
+  getFactoryAddress,
+  getRouterAddress,
+  getTokenAddress,
+  getAllTokens,
+  getKnownMarkets,
+  getConfirmedPools,
+  getAllDeployments,
+  autoDetectDeployment,
+} from "./deployments/index.js";
 
 const SEPOLIA_RPC_URL = "https://ethereum-sepolia-rpc.publicnode.com/557d07a988c4164482ef0c56a10f98ee0e3073440fd72fbe89cd7f6fef809388";
 const SEPOLIA_CHAIN_ID = 11155111;
 
-const NEMESIS_ROUTER  = "0xE787c35F6A875567409C4970BA7B41A0CB9d1B4D";  // CURRENT: nemesis.trade frontend NEXT_PUBLIC_ROUTER_ADDRESS (verified 2026-08-15)
-const WETH_ADDRESS    = "0x7b79995e5f793A07Bc00c21412e50Ecae098E7f9";  // PROVEN: same in bot and UI
-const USDC_ADDRESS    = "0x5dcf1Db10F87CB7839640F9B85C4ECfA29b56e80";  // PROVEN: nemesis.trade frontend JS
-const DAI_ADDRESS     = "0xa3215a5cA659e0Bd57c0B33d5EAD71901A24d3d6";  // PROVEN: nemesis.trade frontend JS
-const UNI_ADDRESS     = "0xEaBEcd70AC3330d65e09e429824C49d0D8812952";  // PROVEN: nemesis.trade frontend JS
-const NEMESIS_ADDRESS = "0x18D18A40614b6d8C6154309F517acf9829308842";  // PROVEN: nemesis.trade ref tx 0x4f35...580c
-const USDT_ADDRESS    = "0x5f2E83cCDEa73D60aF400e03F1Cd8Fb9eaB07b20";  // PROVEN: nemesis.trade ref tx 0xe7dd...fcdc
-const LINK_ADDRESS    = "0x1132087D2D97b55E5fe1B0FcA7b99348B5f07e28";  // PROVEN: nemesis.trade frontend JS
-const EXPECTED_WALLET = "0x315E5193633A962B3F369F9C3833D973D0588cCD";
-const LEVERAGED_FACTORY = "0x0e733d055dbE7020f42D4f692Bc4fff15E5f2E7d";  // CURRENT: nemesis.trade frontend NEXT_PUBLIC_FACTORY_ADDRESS (verified 2026-08-15)
-const LEVERAGED_ROUTER = "0xE787c35F6A875567409C4970BA7B41A0CB9d1B4D";  // CURRENT: nemesis.trade frontend NEXT_PUBLIC_ROUTER_ADDRESS (verified 2026-08-15)
-const LEVERAGED_DAI_ADDRESS = "0x5f2E83cCDEa73D60aF400e03F1Cd8Fb9eaB07b20";  // PROVEN: USDT — default collateral for SHORT
+// ═══ Deployment-aware constants — resolved from active deployment profile ═══
+function getDeploymentConstants() {
+  const profile = getActiveDeployment();
+  const tokens = profile.tokens;
+  return {
+    NEMESIS_ROUTER: profile.router,
+    WETH_ADDRESS: tokens.WETH,
+    USDC_ADDRESS: tokens.USDC,
+    DAI_ADDRESS: tokens.DAI,
+    UNI_ADDRESS: tokens.UNI,
+    NEMESIS_ADDRESS: tokens.NEMESIS,
+    USDT_ADDRESS: tokens.USDT,
+    LINK_ADDRESS: tokens.LINK,
+    LEVERAGED_FACTORY: profile.factory,
+    LEVERAGED_ROUTER: profile.router,
+    LEVERAGED_DAI_ADDRESS: tokens.USDT, // default collateral for SHORT
+  };
+}
+
+// Initialize from default (V1) — updated when deployment changes
+const _dc = getDeploymentConstants();
+let NEMESIS_ROUTER    = _dc.NEMESIS_ROUTER;
+let WETH_ADDRESS      = _dc.WETH_ADDRESS;
+let USDC_ADDRESS      = _dc.USDC_ADDRESS;
+let DAI_ADDRESS       = _dc.DAI_ADDRESS;
+let UNI_ADDRESS       = _dc.UNI_ADDRESS;
+let NEMESIS_ADDRESS   = _dc.NEMESIS_ADDRESS;
+let USDT_ADDRESS      = _dc.USDT_ADDRESS;
+let LINK_ADDRESS      = _dc.LINK_ADDRESS;
+let EXPECTED_WALLET   = "0x315E5193633A962B3F369F9C3833D973D0588cCD";
+let LEVERAGED_FACTORY = _dc.LEVERAGED_FACTORY;
+let LEVERAGED_ROUTER  = _dc.LEVERAGED_ROUTER;
+let LEVERAGED_DAI_ADDRESS = _dc.LEVERAGED_DAI_ADDRESS;
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 const BPS = 10000n;
 const NEMESIS_SUBGRAPH_URL = "https://nemesis.trade/api/subgraph";
 const GOLDSKY_SUBGRAPH_URL = "https://api.goldsky.com/api/public/project_cmma0sxdrnwdx01ym126h3z8q/subgraphs/nemesis-eth-sepolia/prod/gn";
 
+/**
+ * Refresh all deployment-aware constants from the active deployment profile.
+ * Call this when switching deployments via TUI.
+ */
+function refreshDeploymentConstants() {
+  const dc = getDeploymentConstants();
+  NEMESIS_ROUTER    = dc.NEMESIS_ROUTER;
+  WETH_ADDRESS      = dc.WETH_ADDRESS;
+  USDC_ADDRESS      = dc.USDC_ADDRESS;
+  DAI_ADDRESS       = dc.DAI_ADDRESS;
+  UNI_ADDRESS       = dc.UNI_ADDRESS;
+  NEMESIS_ADDRESS   = dc.NEMESIS_ADDRESS;
+  USDT_ADDRESS      = dc.USDT_ADDRESS;
+  LINK_ADDRESS      = dc.LINK_ADDRESS;
+  LEVERAGED_FACTORY = dc.LEVERAGED_FACTORY;
+  LEVERAGED_ROUTER  = dc.LEVERAGED_ROUTER;
+  LEVERAGED_DAI_ADDRESS = dc.LEVERAGED_DAI_ADDRESS;
+  // Refresh TOKENS map
+  TOKENS.WETH    = { address: WETH_ADDRESS,    decimals: 18, symbol: "WETH" };
+  TOKENS.ETH     = { address: WETH_ADDRESS,    decimals: 18, symbol: "ETH" };
+  TOKENS.DAI     = { address: DAI_ADDRESS,     decimals: 6,  symbol: "DAI" };
+  TOKENS.USDC    = { address: USDC_ADDRESS,    decimals: 6,  symbol: "USDC" };
+  TOKENS.USDT    = { address: USDT_ADDRESS,    decimals: 6,  symbol: "USDT" };
+  TOKENS.UNI     = { address: UNI_ADDRESS,     decimals: 6,  symbol: "UNI" };
+  TOKENS.LINK    = { address: LINK_ADDRESS,    decimals: 6,  symbol: "LINK" };
+  TOKENS.NEMESIS = { address: NEMESIS_ADDRESS, decimals: 6,  symbol: "NEMESIS" };
+  addLog(`[DEPLOY] Switched to ${getActiveDeployment().name} — Factory=${getShortAddress(LEVERAGED_FACTORY)} Router=${getShortAddress(NEMESIS_ROUTER)}`, "success");
+}
+
 const CONFIG_FILE = "config.json";
 const isDebug = false;
 const IS_CLI = process.argv.includes("--long") || process.argv.includes("--short");
 
-// ─── Universal TOKENS map (expanded with all known Sepolia tokens) ───
-const TOKENS = {
+// ─── Universal TOKENS map (populated from active deployment profile) ───
+let TOKENS = {
   WETH:    { address: WETH_ADDRESS,    decimals: 18, symbol: "WETH" },
   ETH:     { address: WETH_ADDRESS,    decimals: 18, symbol: "ETH" },
   DAI:     { address: DAI_ADDRESS,     decimals: 6,  symbol: "DAI" },
@@ -109,6 +174,8 @@ const POSITION_ABI = [
   "function PROTOCOL_FEE_BPS() view returns (uint256)",
   "function LTV_BPS() view returns (uint256)",
   "function getAvailableLiquidity() view returns (uint256)",
+  "function previewOpenPosition(bool isLong,address collateralToken,uint256 collateralAmount,uint256 borrowAmount,uint256 leverageX10) view returns (uint256,uint256,uint256,uint256,uint256,uint256,bool,bool)",
+  "function previewOpenMarginFee(address collateralToken,uint256 collateralAmount,uint256 borrowAmount,uint256 leverageX10) view returns (uint256,uint256,uint256,uint256)",
   "error MAM_InvalidLeverage()",
   "error MAM_InsufficientLiquidity()",
   "error MAM_InsufficientCollateral()",
@@ -128,6 +195,8 @@ const POSITION_ABI = [
   "error MAM_NotOwner()",
   "error MAM_OracleUnavailable()",
   "error MAM_ZeroOraclePrice()",
+  "error MAM_OpenOracleDivergence(uint256 spotPrice,uint256 riskPrice,uint256 deviationBps)",
+  "error MAM_OpenOracleDivergence()",
   "event MAM_PositionCreated(uint256 indexed positionId,address indexed user,bool isLong,address collateralToken,uint256 collateralAmount,uint256 borrowAmount,uint256 debtAmount,uint256 leverageX10,uint256 deadline)",
   "event MAM_LoopPositionCreated(uint256 indexed positionId,address indexed user,uint256 leverageX10)",
   "event MAM_PositionClosed(uint256 indexed positionId,uint256 collateralReturned,int256 lossCollateral,uint256 borrowAmount)",
@@ -144,7 +213,13 @@ const POOL_ABI = [
   "function totalSupply() view returns (uint256)",
   "function token0() view returns (address)",
   "function getOraclePrice() view returns (uint256,uint256)",
-  "function swapFeeBps() view returns (uint256)"
+  "function swapFeeBps() view returns (uint256)",
+  "function getRiskPrice() view returns (uint256 price0Avg,uint256 price1Avg)",
+  "function checkpointOracle()",
+  "function emaInitialized() view returns (bool)",
+  "function emaInitTimestamp() view returns (uint256)",
+  "function MIN_TWAP_WINDOW() view returns (uint256)",
+  "error Pool_RiskOracleUnavailable()"
 ];
 
 const POSITION_IFACE = new ethers.Interface(POSITION_ABI);
@@ -2162,11 +2237,86 @@ async function discoverTokenList(provider) {
  * Returns an array of market candidates with pool/manager resolved.
  */
 async function discoverSupportedMarkets(provider, tokenList) {
-  const factory = new ethers.Contract(LEVERAGED_FACTORY, FACTORY_ABI, provider);
+  const profile = getActiveDeployment();
   const markets = [];
   const seen = new Set();
 
-  // WETH is always the marketToken (the token you go long/short on)
+  // ── V2: Use subgraph-based discovery or confirmed pools from deployment profile ──
+  if (isV2Plus()) {
+    addLog("[DISCOVER] V2 mode: using subgraph/confirmed pools", "info");
+
+    // Use known markets from deployment profile
+    const knownMarkets = getKnownMarkets();
+    for (const m of knownMarkets) {
+      const collateral = m.collateralToken;
+      const pairKey = [WETH_ADDRESS, collateral].sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase())).join(":");
+      if (seen.has(pairKey)) continue;
+      seen.add(pairKey);
+
+      // Try to find pool/manager from confirmed pools
+      const confirmedPools = getConfirmedPools();
+      let pool = null, manager = null;
+      for (const [key, info] of Object.entries(confirmedPools)) {
+        if (info.pool && info.manager) {
+          pool = info.pool;
+          manager = info.manager;
+          break;
+        }
+      }
+
+      // If no confirmed pool, try Factory (may work for some V2 pools)
+      if (!pool || !manager) {
+        try {
+          const factory = new ethers.Contract(LEVERAGED_FACTORY, FACTORY_ABI, provider);
+          const [tokenA, tokenB] = sortTokenPair(WETH_ADDRESS, collateral);
+          pool = await factory.getPool(tokenA, tokenB);
+          if (pool && pool !== ZERO_ADDRESS) {
+            manager = await factory.getManager(pool);
+          }
+        } catch { /* V2 Factory may not respond */ }
+      }
+
+      if (!pool || pool === ZERO_ADDRESS || !manager || manager === ZERO_ADDRESS) {
+        addLog(`[DISCOVER] V2: No pool for ${m.symbol}, skipping`, "debug");
+        continue;
+      }
+
+      // Health check
+      try {
+        const mgrContract = new ethers.Contract(manager, POSITION_ABI, provider);
+        const liquidity = await mgrContract.getAvailableLiquidity();
+        if (liquidity <= 0n) {
+          addLog(`[DISCOVER] V2 Manager ${getShortAddress(manager)} has zero liquidity, skipping`, "debug");
+          continue;
+        }
+        addLog(`[DISCOVER] V2 Manager ${getShortAddress(manager)} liquidity=${liquidity.toString()}`, "debug");
+      } catch (healthErr) {
+        addLog(`[DISCOVER] V2 Manager ${getShortAddress(manager)} failed health check: ${healthErr.message}, skipping`, "warn");
+        continue;
+      }
+
+      markets.push({
+        symbol: m.symbol,
+        marketToken: WETH_ADDRESS,
+        collateralToken: collateral,
+        collateralSymbol: m.collateralSymbol,
+        collateralDecimals: m.collateralDecimals,
+        poolAddress: pool,
+        managerAddress: manager,
+        supportsLong: true,
+        supportsShort: true,
+        rsiSymbol: "ETHUSDT",
+        poolToken0: m.poolToken0,
+      });
+      addLog(`[DISCOVER] ✓ V2 ${m.symbol} pool=${getShortAddress(pool)} manager=${getShortAddress(manager)}`, "info");
+    }
+
+    addLog(`[DISCOVER] V2 Total supported markets: ${markets.length}`, "success");
+    return markets;
+  }
+
+  // ── V1: Factory-based discovery ──
+  const factory = new ethers.Contract(LEVERAGED_FACTORY, FACTORY_ABI, provider);
   const marketToken = WETH_ADDRESS;
 
   for (const token of tokenList) {
@@ -2414,6 +2564,81 @@ async function promptCollateralAndOpen(side) {
 }
 
 /**
+ * Prompt user to switch between deployment profiles (V1/V2/V3/V4/Auto Detect).
+ */
+async function promptDeploymentSwitch() {
+  const deployments = getAllDeployments();
+  const currentId = getActiveDeploymentId();
+  const items = [
+    `[1] V1 — ETH/X Pools${currentId === "v1" ? " (ACTIVE)" : ""}`,
+    `[2] V2 — Token/USDT Pools${currentId === "v2" ? " (ACTIVE)" : ""}`,
+    `[3] V3 — NOT CONFIGURED${currentId === "v3" ? " (ACTIVE)" : ""}`,
+    `[4] V4 — NOT CONFIGURED${currentId === "v4" ? " (ACTIVE)" : ""}`,
+    `[5] Auto Detect`,
+    "[0] Back to Main Menu"
+  ];
+  return new Promise((resolve) => {
+    const selectBox = blessed.list({
+      label: " Deployment Switcher ",
+      items,
+      keys: true, vi: true,
+      style: { border: { fg: "cyan" }, selected: { bg: "blue", fg: "white" }, item: { fg: "white" } },
+      width: "60%", height: items.length + 4,
+      top: "center", left: "center"
+    });
+    selectBox.on("select", async (item) => {
+      selectBox.hide(); screen.remove(selectBox); safeRender();
+      const text = item.getText();
+      const match = text.match(/^\[(\d+)\]/);
+      const idx = match ? parseInt(match[1], 10) : -1;
+      if (idx === 0 || idx < 1 || idx > 5) {
+        addLog("[DEPLOY] Cancelled", "info");
+        resolve();
+        return;
+      }
+      try {
+        if (idx === 5) {
+          // Auto Detect
+          addLog("[DEPLOY] Auto-detecting deployment...", "warn");
+          const provider = getProvider(SEPOLIA_RPC_URL, SEPOLIA_CHAIN_ID, proxies[selectedWalletIndex % proxies.length] || null);
+          const detected = await autoDetectDeployment(provider);
+          if (detected === "unknown") {
+            addLog("[DEPLOY] Could not detect deployment — using V1 as fallback", "warn");
+          } else {
+            addLog(`[DEPLOY] Detected: ${detected}`, "success");
+          }
+          setActiveDeployment(detected === "unknown" ? "v1" : detected);
+          refreshDeploymentConstants();
+          addLog(`[DEPLOY] Active deployment: ${getActiveDeployment().name}`, "success");
+        } else {
+          const targetId = `v${idx}`;
+          const profile = getDeploymentProfile(targetId);
+          if (!profile) throw new Error(`Unknown deployment: ${targetId}`);
+          if (profile.status === "unknown") {
+            addLog(`[DEPLOY] ${profile.name} is not configured — no contract addresses available`, "error");
+            resolve();
+            return;
+          }
+          setActiveDeployment(targetId);
+          refreshDeploymentConstants();
+          addLog(`[DEPLOY] Switched to: ${profile.name}`, "success");
+        }
+        // Refresh wallet display
+        await updateWallets();
+        updateMenu();
+        updateStatus();
+        safeRender();
+      } catch (error) {
+        addLog(`[DEPLOY] Switch failed: ${error.message}`, "error");
+      }
+      resolve();
+    });
+    selectBox.on("cancel", () => { selectBox.hide(); screen.remove(selectBox); safeRender(); resolve(); });
+    screen.append(selectBox); safeRender(); screen.focusPush(selectBox);
+  });
+}
+
+/**
  * Prompt user to select TokenIn, TokenOut, and amount for a swap.
  * Uses the universal executeSwap function.
  */
@@ -2500,9 +2725,7 @@ async function getLeveragedContext(provider, collateralToken, marketTokenArg = n
   const collateral = normalizeCollateralToken(collateralToken);
   const marketToken = normalizeCollateralToken(marketTokenArg || tradingConfig.marketToken);
   const pairToken = normalizeCollateralToken(tradingConfig.pairToken || USDT_ADDRESS);
-  // NOTE: Collateral CAN equal market token (e.g., WETH collateral for LONG ETH)
-  // The Nemesis UI allows this - user provides ETH as collateral to go long on ETH
-  // When collateral == marketToken, we need to find the pool that includes both
+  const profile = getActiveDeployment();
 
   // ── PREFERRED: use market config's known pool/manager if available ──
   // This avoids re-querying Factory which may return a different (broken) pool
@@ -2511,7 +2734,36 @@ async function getLeveragedContext(provider, collateralToken, marketTokenArg = n
     return { collateral, marketToken, pairToken, pool: marketConfig.poolAddress, manager: marketConfig.managerAddress, path: [collateral, marketToken] };
   }
 
-  // ── FALLBACK: query Factory for pool/manager ──
+  // ── V2: Factory doesn't respond to getPool(address,address) — use subgraph/confirmed pools ──
+  if (isV2Plus()) {
+    // Try confirmed pools from deployment profile
+    const confirmedPools = getConfirmedPools();
+    const marketKey = `${getShortAddress(collateral)}/${getShortAddress(pairToken)}`;
+    for (const [key, info] of Object.entries(confirmedPools)) {
+      if (isValidContractTarget(info.pool) && isValidContractTarget(info.manager)) {
+        addLog(`[CONTEXT] V2 confirmed pool=${getShortAddress(info.pool)} mgr=${getShortAddress(info.manager)}`, "info");
+        return { collateral, marketToken, pairToken, pool: info.pool, manager: info.manager, path: [collateral, marketToken] };
+      }
+    }
+    // V2 fallback: try Factory anyway (some V2 pools may respond)
+    const factory = new ethers.Contract(LEVERAGED_FACTORY, FACTORY_ABI, provider);
+    if (collateral.toLowerCase() === marketToken.toLowerCase()) {
+      const [tokenA, tokenB] = sortTokenPair(collateral, pairToken);
+      try {
+        const pool = await factory.getPool(tokenA, tokenB);
+        if (isValidContractTarget(pool)) {
+          const manager = await factory.getManager(pool);
+          if (isValidContractTarget(manager)) {
+            addLog(`[CONTEXT] V2 Factory pool=${getShortAddress(pool)} mgr=${getShortAddress(manager)}`, "info");
+            return { collateral, marketToken, pairToken, pool, manager, path: [collateral, marketToken] };
+          }
+        }
+      } catch { /* V2 Factory may not respond */ }
+    }
+    throw new Error(`V2: No confirmed pool for collateral=${getShortAddress(collateral)}. Use subgraph discovery first.`);
+  }
+
+  // ── V1: query Factory for pool/manager ──
   const factory = new ethers.Contract(LEVERAGED_FACTORY, FACTORY_ABI, provider);
   let pool, manager;
   
@@ -2573,6 +2825,7 @@ async function quoteLeveragedAmountOutMin(provider, { pool, manager, collateralT
   const amountOutMinRaw = lpBorrowToExpectedOut({ lpBorrowAmount, collateralToken, reserve0, reserve1, totalSupply, token0, swapFeeBps: BigInt(swapFeeBps) });
   const amountOutMinFinal = applySlippage(amountOutMinRaw);
   if (amountOutMinRaw <= 0n || amountOutMinFinal <= 0n) throw new Error("Leveraged amountOutMin is zero");
+  addLog(`[QUOTE] collateralLp=${collateralLp} lpBorrowAmount=${lpBorrowAmount} amountOutMinRaw=${amountOutMinRaw}`, "info");
   if (!isLong) {
     addLog(`shortQuoteInput=${lpBorrowAmount}`, "info");
     addLog(`shortQuoteOutput=${amountOutMinRaw}`, "info");
@@ -2580,7 +2833,7 @@ async function quoteLeveragedAmountOutMin(provider, { pool, manager, collateralT
     addLog(`amountOutMinRaw=${amountOutMinRaw}`, "info");
     addLog(`amountOutMinFinal=${amountOutMinFinal}`, "info");
   }
-  return amountOutMinFinal;
+  return { amountOutMinFinal, borrowAmount: lpBorrowAmount };
 }
 
 async function buildLeveragedTx(provider, isLong, amount, token, leverage, deadline, market = null) {
@@ -2593,7 +2846,7 @@ async function buildLeveragedTx(provider, isLong, amount, token, leverage, deadl
   addLog(`tokenDecimals=${decimals}`, "info");
   addLog(`scaledCollateralAmount=${collateralAmount}`, "info");
   const encodedLeverage = encodeLeverage(leverage);
-  const amountOutMin = await quoteLeveragedAmountOutMin(provider, {
+  const quoteResult = await quoteLeveragedAmountOutMin(provider, {
     pool: context.pool,
     manager: context.manager,
     collateralToken: context.collateral,
@@ -2604,9 +2857,14 @@ async function buildLeveragedTx(provider, isLong, amount, token, leverage, deadl
   }).catch(error => {
     throw new Error(`Leveraged quote failed: ${error.message}`);
   });
+  const amountOutMin = quoteResult.amountOutMinFinal;
+  const borrowAmount = quoteResult.borrowAmount;
   if (amountOutMin <= 0n) throw new Error("Leveraged amountOutMin is zero");
-  const data = POSITION_IFACE.encodeFunctionData("openPosition", [isLong, context.collateral, collateralAmount, 0n, encodedLeverage, amountOutMin, BigInt(deadline)]);
-  return { to: context.manager, manager: context.manager, pool: context.pool, data, value: 0n, nativeCollateral, collateralToken: context.collateral, marketToken: context.marketToken, symbol: normalizedMarket.symbol, collateralAmount, leverage: encodedLeverage, amountOutMin };
+  addLog(`[QUOTE] borrowAmount=${borrowAmount}`, "info");
+  const data = POSITION_IFACE.encodeFunctionData("openPosition", [isLong, context.collateral, collateralAmount, borrowAmount, encodedLeverage, amountOutMin, BigInt(deadline)]);
+  const profile = getActiveDeployment();
+  const openTarget = profile.positionTarget === "manager" ? context.manager : context.pool;
+  return { to: openTarget, manager: context.manager, pool: context.pool, data, value: 0n, nativeCollateral, collateralToken: context.collateral, marketToken: context.marketToken, symbol: normalizedMarket.symbol, collateralAmount, leverage: encodedLeverage, amountOutMin, borrowAmount };
 }
 
 function buildLongTx(amount, token = tradingConfig.defaultCollateralToken, leverage = tradingConfig.leverage, deadline = Math.floor(Date.now() / 1000) + tradingConfig.deadlineSeconds, providerArg, market = null) {
@@ -2656,6 +2914,142 @@ async function ensureLeveragedApproval(wallet, token, spender, amount, nativeCol
   addLog(`Leveraged approve txHash=${tx.hash}`, "warn");
   const receipt = await waitForTx(tx);
   if (receipt.status === 0) throw new Error("Leveraged approve reverted");
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  ORACLE CHECKPOINT FLOW
+//  Mirrors the Nemesis frontend: checkpointOracle → confirmations →
+//  getRiskPrice → verify deviation → previewOpenPosition
+// ═══════════════════════════════════════════════════════════════════
+const ORACLE_MAX_DIVERGENCE_BPS = 500n;   // 5% max divergence
+const ORACLE_CHECKPOINT_CONFIRMATIONS = 4; // safety delay (matches frontend)
+
+async function ensureOracleReady(wallet, poolAddress, side, provider) {
+  if (!isValidContractTarget(poolAddress)) {
+    addLog(`[${side}] [ORACLE] Pool address invalid — skipping oracle check`, "warn");
+    return;
+  }
+
+  const pool = new ethers.Contract(poolAddress, POOL_ABI, provider);
+  addLog(`[${side}] [ORACLE] Checking oracle state for pool=${getShortAddress(poolAddress)}`, "info");
+
+  // Step 1: Check emaInitialized
+  let emaInitialized = false;
+  try {
+    emaInitialized = await pool.emaInitialized();
+  } catch { /* function may not exist on older pools */ }
+  addLog(`[${side}] [ORACLE] emaInitialized=${emaInitialized}`, "info");
+
+  if (!emaInitialized) {
+    addLog(`[${side}] [ORACLE] EMA not initialized — oracle warmup incomplete`, "warn");
+    return;
+  }
+
+  // Step 2: Check if MIN_TWAP_WINDOW has elapsed since emaInitTimestamp
+  try {
+    const [initTs, minWindow] = await Promise.all([
+      pool.emaInitTimestamp(),
+      pool.MIN_TWAP_WINDOW()
+    ]);
+    const now = Math.floor(Date.now() / 1000);
+    const remaining = Math.max(0, Number(minWindow) - (now - Number(initTs)));
+    addLog(`[${side}] [ORACLE] TWAP warmup remaining=${remaining}s`, "info");
+    if (remaining > 0) {
+      addLog(`[${side}] [ORACLE] Oracle still warming up — ${remaining}s left`, "warn");
+      return;
+    }
+  } catch {
+    addLog(`[${side}] [ORACLE] Could not read TWAP warmup state`, "warn");
+  }
+
+  // Step 3: Try getRiskPrice — if it reverts with Pool_RiskOracleUnavailable, checkpoint needed
+  let riskPrice0 = 0n, riskPrice1 = 0n;
+  let needsCheckpoint = false;
+  try {
+    const rp = await pool.getRiskPrice();
+    riskPrice0 = rp[0];
+    riskPrice1 = rp[1];
+    addLog(`[${side}] [ORACLE] getRiskPrice OK: price0Avg=${riskPrice0} price1Avg=${riskPrice1}`, "info");
+    if (riskPrice0 === 0n && riskPrice1 === 0n) {
+      needsCheckpoint = true;
+      addLog(`[${side}] [ORACLE] getRiskPrice returned zero — checkpoint needed`, "warn");
+    }
+  } catch (rpErr) {
+    const errStr = decodeContractError(rpErr);
+    if (errStr.includes("Pool_RiskOracleUnavailable")) {
+      needsCheckpoint = true;
+      addLog(`[${side}] [ORACLE] getRiskPrice reverted: Pool_RiskOracleUnavailable — checkpoint needed`, "warn");
+    } else {
+      addLog(`[${side}] [ORACLE] getRiskPrice error: ${errStr}`, "warn");
+    }
+  }
+
+  // Step 4: Check oracle deviation if we have both prices
+  if (!needsCheckpoint && riskPrice0 > 0n) {
+    try {
+      const [spotPrice0, oraclePrice0] = await pool.getOraclePrice();
+      addLog(`[${side}] [ORACLE] getOraclePrice: spot=${spotPrice0} risk=${riskPrice0}`, "info");
+      if (spotPrice0 > 0n && riskPrice0 > 0n) {
+        const deviationBps = spotPrice0 > riskPrice0
+          ? (spotPrice0 - riskPrice0) * 10000n / riskPrice0
+          : (riskPrice0 - spotPrice0) * 10000n / spotPrice0;
+        addLog(`[${side}] [ORACLE] deviation=${deviationBps} bps (max=${ORACLE_MAX_DIVERGENCE_BPS})`, "info");
+        if (deviationBps > ORACLE_MAX_DIVERGENCE_BPS) {
+          needsCheckpoint = true;
+          addLog(`[${side}] [ORACLE] Deviation ${deviationBps} bps exceeds max ${ORACLE_MAX_DIVERGENCE_BPS} — checkpoint needed`, "warn");
+        }
+      }
+    } catch {
+      addLog(`[${side}] [ORACLE] Could not read getOraclePrice for deviation check`, "warn");
+    }
+  }
+
+  if (!needsCheckpoint) {
+    addLog(`[${side}] [ORACLE] Oracle is ready — no checkpoint needed`, "success");
+    return;
+  }
+
+  // Step 5: Send checkpointOracle transaction
+  addLog(`[${side}] [ORACLE] Sending Pool.checkpointOracle()...`, "warn");
+  const poolWrite = new ethers.Contract(poolAddress, POOL_ABI, wallet);
+  const feeParams = await getFeeParams(provider);
+  const nonce = await getNextNonce(provider, wallet.address, SEPOLIA_CHAIN_ID);
+  let checkpointTx;
+  try {
+    checkpointTx = await poolWrite.checkpointOracle({
+      gasLimit: 500000n,
+      nonce,
+      ...feeParams
+    });
+    addLog(`[${side}] [ORACLE] checkpointOracle tx hash=${checkpointTx.hash}`, "warn");
+  } catch (cpErr) {
+    const decodedErr = decodeContractError(cpErr);
+    addLog(`[${side}] [ORACLE] checkpointOracle FAILED: ${decodedErr}`, "error");
+    throw new Error(`checkpointOracle failed: ${decodedErr}`);
+  }
+
+  // Step 6: Wait for confirmations (safety delay — matches frontend)
+  addLog(`[${side}] [ORACLE] Waiting for ${ORACLE_CHECKPOINT_CONFIRMATIONS} confirmations...`, "wait");
+  try {
+    await checkpointTx.wait(ORACLE_CHECKPOINT_CONFIRMATIONS);
+    addLog(`[${side}] [ORACLE] Checkpoint confirmed after ${ORACLE_CHECKPOINT_CONFIRMATIONS} blocks`, "success");
+  } catch (confErr) {
+    addLog(`[${side}] [ORACLE] Checkpoint confirmation failed: ${confErr.message}`, "error");
+    throw new Error(`checkpointOracle confirmation failed: ${confErr.message}`);
+  }
+
+  // Step 7: Re-read getRiskPrice to verify
+  try {
+    const rpAfter = await pool.getRiskPrice();
+    addLog(`[${side}] [ORACLE] Post-checkpoint getRiskPrice: price0Avg=${rpAfter[0]} price1Avg=${rpAfter[1]}`, "info");
+    if (rpAfter[0] === 0n && rpAfter[1] === 0n) {
+      addLog(`[${side}] [ORACLE] WARNING: getRiskPrice still zero after checkpoint`, "warn");
+    }
+  } catch {
+    addLog(`[${side}] [ORACLE] Could not re-read getRiskPrice after checkpoint`, "warn");
+  }
+
+  addLog(`[${side}] [ORACLE] Oracle checkpoint complete`, "success");
 }
 
 async function validateAndSendLeveragedTx(wallet, tx, side, provider) {
@@ -2734,6 +3128,36 @@ async function validateAndSendLeveragedTx(wallet, tx, side, provider) {
   if (isOpenTx) await assertContractTarget(provider, tx.to, "leveraged open target");
   if (isCloseTx) await assertContractTarget(provider, tx.to, "close manager");
   if (isOpenTx) assertUiPayloadMatch(tx, side);
+  if (isOpenTx) {
+    // ── Step 1: Ensure oracle is ready (checkpoint if needed) ──
+    if (tx.pool) {
+      await ensureOracleReady(wallet, tx.pool, side, provider);
+    }
+
+    // ── Step 2: previewOpenPosition with correct field mapping ──
+    try {
+      const decoded = POSITION_IFACE.decodeFunctionData("openPosition", tx.data);
+      const previewManager = new ethers.Contract(tx.to, POSITION_ABI, provider);
+      const previewResult = await previewManager.previewOpenPosition(decoded.isLong, decoded.collateralToken, decoded.collateralAmount, decoded.borrowAmount, decoded.leverageX10);
+      addLog(`[${side}] previewOpenPosition PASSED`, "success");
+      // V2 ABI: returns (uint256 x6, bool projectedLiquidatable, bool oracleReady)
+      const projectedLiquidatable = !!previewResult[6];
+      const oracleReady = !!previewResult[7];
+      addLog(`[${side}] oracleReady=${oracleReady} projectedLiquidatable=${projectedLiquidatable}`, "warn");
+      if (!oracleReady) {
+        addLog(`[${side}] REJECT: Risk oracle not ready — position would be auto-liquidated`, "error");
+        throw new Error(`Risk oracle not ready for this pool`);
+      }
+      if (projectedLiquidatable) {
+        addLog(`[${side}] REJECT: Position projected to be immediately liquidatable`, "error");
+        throw new Error(`Position would be immediately liquidatable`);
+      }
+    } catch (previewErr) {
+      const decodedErr = decodeContractError(previewErr);
+      addLog(`[${side}] previewOpenPosition REVERT — NOT sending: ${decodedErr}`, "error");
+      throw new Error(`previewOpenPosition reverted: ${decodedErr}`);
+    }
+  }
   try {
     await provider.call({ from: wallet.address, to: tx.to, data: tx.data, value: tx.value });
     addLog(`[${side}] pre-flight simulation PASSED`, "success");
@@ -2747,7 +3171,7 @@ async function validateAndSendLeveragedTx(wallet, tx, side, provider) {
     gasEstimate = await provider.estimateGas({ from: wallet.address, to: tx.to, data: tx.data, value: tx.value });
   } catch (error) {
     addLog(`[${side}] estimateGas failed, using fallback gas limit: ${decodeContractError(error)}`, "warn");
-    gasEstimate = 1000000n; // fallback gas limit for Nemesis openPosition (800000 was too low)
+    gasEstimate = 2000000n; // V2 Manager needs ~1.1M gas; V1 fallback was 1M
   }
   const feeParams = await getFeeParams(provider);
   const nonce = await getNextNonce(provider, wallet.address, SEPOLIA_CHAIN_ID);
@@ -2824,12 +3248,23 @@ async function validateAndSendLeveragedTx(wallet, tx, side, provider) {
 //  KNOWN NEMESIS CUSTOM ERROR SELECTORS
 //  Discovered via on-chain simulation of each Manager contract.
 //  These are proprietary errors — source not verified on Etherscan.
+//  V2 NOTE: 0x499ad952 maps to Router_InsufficientOutputAmount in V2
 // ═══════════════════════════════════════════════════════════════════
-const KNOWN_NEMESIS_ERRORS = {
+const KNOWN_NEMESIS_ERRORS_V1 = {
   "0x7939f424": "NEMESIS_MANAGER_BROKEN_PROXY (Manager implementation has empty bytecode — pool/manager pair is defunct)",
   "0x24811982": "NEMESIS_WRONG_COLLATERAL_TOKEN (collateral token does not match this Manager's expected token)",
-  "0x499ad952": "NEMESIS_POSITION_NOT_ALLOWED (position cannot be opened — likely broken proxy or unsupported market config)",
+  "0x499ad952": "POSITION_NOT_ALLOWED (position cannot be opened — likely broken proxy or unsupported market config)",
 };
+const KNOWN_NEMESIS_ERRORS_V2 = {
+  "0x7939f424": "MAM_BROKEN_PROXY (Manager implementation has empty bytecode — pool/manager pair is defunct)",
+  "0x24811982": "MAM_WRONG_COLLATERAL_TOKEN (collateral token does not match this Manager's expected token)",
+  "0x499ad952": "Router_InsufficientOutputAmount (V2: slippage too tight or zero output)",
+  "0x56e7f09d": "MAM_OpenOracleDivergence (spot vs risk oracle divergence exceeds max threshold — call checkpointOracle)",
+  "0xb8868327": "Pool_RiskOracleUnavailable (risk oracle not yet checkpointed — call Pool.checkpointOracle())",
+};
+function getKnownErrors() {
+  return isV1() ? KNOWN_NEMESIS_ERRORS_V1 : KNOWN_NEMESIS_ERRORS_V2;
+}
 
 function decodeContractError(error) {
   const data = error?.data || error?.info?.error?.data || error?.error?.data;
@@ -2839,10 +3274,11 @@ function decodeContractError(error) {
       return `${parsed.name}(${parsed.args.map(String).join(",")})`;
     } catch {
       const selector = String(data).slice(0, 10);
-      // Check known Nemesis error map
-      if (KNOWN_NEMESIS_ERRORS[selector]) {
-        addLog(`[ERROR] Custom error ${selector}: ${KNOWN_NEMESIS_ERRORS[selector]}`, "error");
-        return KNOWN_NEMESIS_ERRORS[selector];
+      // Check known Nemesis error map (V1 or V2 depending on active deployment)
+      const knownErrors = getKnownErrors();
+      if (knownErrors[selector]) {
+        addLog(`[ERROR] Custom error ${selector}: ${knownErrors[selector]}`, "error");
+        return knownErrors[selector];
       }
       // Unknown selector — log details for debugging
       addLog(`[ERROR] Unknown custom error selector ${selector} — raw data: ${data}`, "error");
@@ -3899,8 +4335,8 @@ const menuBox = blessed.list({
     item: { fg: "white" }
   },
   items:   fullAutoRunning || isCycleRunning
-    ? ["[1] Stop Full Auto Trading", "[2] Open LONG Now", "[3] Open SHORT Now", "[4] Close Position", "[5] Auto RSI Trading", "[6] Set Manual Config", "[7] Refresh Wallet", "[8] Exit", "[9] Stop Auto RSI Trading", "[10] Liquidity Pool Mode", "[11] Automatic Swaps", "[12] Stop Automatic Swaps"]
-    : ["[1] Start Full Auto Trading", "[2] Open LONG Now", "[3] Open SHORT Now", "[4] Close Position", "[5] Auto RSI Trading", "[6] Set Manual Config", "[7] Refresh Wallet", "[8] Exit", "[9] Stop Auto RSI Trading", "[10] Liquidity Pool Mode", "[11] Automatic Swaps", "[12] Start Automatic Swaps"],
+    ? ["[1] Stop Full Auto Trading", "[2] Open LONG Now", "[3] Open SHORT Now", "[4] Close Position", "[5] Auto RSI Trading", "[6] Set Manual Config", "[7] Refresh Wallet", "[8] Exit", "[9] Stop Auto RSI Trading", "[10] Liquidity Pool Mode", "[11] Automatic Swaps", "[12] Stop Automatic Swaps", `[13] Deployment: ${getActiveDeployment().name}`]
+    : ["[1] Start Full Auto Trading", "[2] Open LONG Now", "[3] Open SHORT Now", "[4] Close Position", "[5] Auto RSI Trading", "[6] Set Manual Config", "[7] Refresh Wallet", "[8] Exit", "[9] Stop Auto RSI Trading", "[10] Liquidity Pool Mode", "[11] Automatic Swaps", "[12] Start Automatic Swaps", `[13] Deployment: ${getActiveDeployment().name}`],
   padding: { left: 1, top: 1 }
 });
 
@@ -4175,8 +4611,8 @@ function updateMenu() {
   try {
     menuBox.setItems(
       fullAutoRunning || isCycleRunning
-        ? ["[1] Stop Full Auto Trading", "[2] Open LONG Now", "[3] Open SHORT Now", "[4] Close Position", "[5] Auto RSI Trading", "[6] Set Manual Config", "[7] Refresh Wallet", "[8] Exit", "[9] Stop Auto RSI Trading", "[10] Liquidity Pool Mode", "[11] Automatic Swaps", "[12] Stop Automatic Swaps"]
-        : ["[1] Start Full Auto Trading", "[2] Open LONG Now", "[3] Open SHORT Now", "[4] Close Position", "[5] Auto RSI Trading", "[6] Set Manual Config", "[7] Refresh Wallet", "[8] Exit", "[9] Stop Auto RSI Trading", "[10] Liquidity Pool Mode", "[11] Automatic Swaps", "[12] Start Automatic Swaps"]
+        ? ["[1] Stop Full Auto Trading", "[2] Open LONG Now", "[3] Open SHORT Now", "[4] Close Position", "[5] Auto RSI Trading", "[6] Set Manual Config", "[7] Refresh Wallet", "[8] Exit", "[9] Stop Auto RSI Trading", "[10] Liquidity Pool Mode", "[11] Automatic Swaps", "[12] Stop Automatic Swaps", `[13] Deployment: ${getActiveDeployment().name}`]
+        : ["[1] Start Full Auto Trading", "[2] Open LONG Now", "[3] Open SHORT Now", "[4] Close Position", "[5] Auto RSI Trading", "[6] Set Manual Config", "[7] Refresh Wallet", "[8] Exit", "[9] Stop Auto RSI Trading", "[10] Liquidity Pool Mode", "[11] Automatic Swaps", "[12] Start Automatic Swaps", `[13] Deployment: ${getActiveDeployment().name}`]
     );
     safeRender();
   } catch (error) {
@@ -4430,6 +4866,14 @@ menuBox.on("select", async (item) => {
     case "[12] Stop Automatic Swaps":
     case "Stop Automatic Swaps":
       stopCyclicSwapEngine();
+      break;
+
+    case "[13] Deployment: V1 — ETH/X Pools":
+    case "[13] Deployment: V2 — Token/USDT Pools":
+    case "[13] Deployment: V3 — NOT CONFIGURED":
+    case "[13] Deployment: V4 — NOT CONFIGURED":
+    case "Deployment Switcher":
+      await promptDeploymentSwitch();
       break;
 
     case "[8] Exit":
