@@ -9,6 +9,7 @@ import { HttpsProxyAgent } from "https-proxy-agent";
 import { SocksProxyAgent } from "socks-proxy-agent";
 import { DEFAULT_LP_CONFIG, loadLpConfig, serializeLpConfig } from "./lpConfig.js";
 import { LpManager } from "./lpManager.js";
+import { TokenInventory, generateInventoryAwarePairs, logSwapDetails, DEFAULT_ETH_GUARD } from "./tokenInventory.js";
 import {
   getActiveDeployment,
   setActiveDeployment,
@@ -137,6 +138,9 @@ let SWAP_PAIRS = [];
 // Only pairs where: Factory.getPool() returns non-zero address AND getAmountsOut() succeeds.
 // Used by: TUI, CLI, Auto RSI, Full Auto, Cyclic Swap Engine.
 let discoveredSwapPairs = [];
+
+// ─── Token Inventory Manager — ETH guard + inventory-aware swap selection ───
+const inventory = new TokenInventory({ ethGuard: {} });
 
 // ─── ADAPTIVE COLLATERAL RULES — auto-discovered from on-chain events ───
 // At startup, scans recent MAM_PositionCreated events across all managers
@@ -435,6 +439,28 @@ function loadConfig() {
       tradingConfig.autoRSIEnabled = cfg.autoRSIEnabled === true;
       tradingConfig.fullAutoEnabled = cfg.fullAutoEnabled === true;
       lpConfig = loadLpConfig(cfg);
+      // ── Load ETH guard limits from config ──
+      if (cfg.ethGuard) {
+        Object.assign(inventory.ethGuard.limits, {
+          MAX_ETH_SWAP_PER_TX:       Number(cfg.ethGuard.MAX_ETH_SWAP_PER_TX)       || inventory.ethGuard.limits.MAX_ETH_SWAP_PER_TX,
+          MAX_ETH_SWAP_PER_SESSION:  Number(cfg.ethGuard.MAX_ETH_SWAP_PER_SESSION)  || inventory.ethGuard.limits.MAX_ETH_SWAP_PER_SESSION,
+          MIN_ETH_GAS_RESERVE:       Number(cfg.ethGuard.MIN_ETH_GAS_RESERVE)       || inventory.ethGuard.limits.MIN_ETH_GAS_RESERVE,
+          MAX_TOTAL_ETH_EXPOSURE:    Number(cfg.ethGuard.MAX_TOTAL_ETH_EXPOSURE)    || inventory.ethGuard.limits.MAX_TOTAL_ETH_EXPOSURE,
+          ETH_BLOCK_THRESHOLD:       Number(cfg.ethGuard.ETH_BLOCK_THRESHOLD)       || inventory.ethGuard.limits.ETH_BLOCK_THRESHOLD,
+        });
+        addLog("[CONFIG] ETH guard limits loaded from config", "info");
+      }
+      // ── Load token inventory targets from config ──
+      if (cfg.tokenInventory) {
+        for (const [sym, target] of Object.entries(cfg.tokenInventory)) {
+          if (inventory.targets[sym]) {
+            inventory.targets[sym].minimum = Number(target.minimum) || inventory.targets[sym].minimum;
+            inventory.targets[sym].target  = Number(target.target)  || inventory.targets[sym].target;
+            inventory.targets[sym].maximum = Number(target.maximum) || inventory.targets[sym].maximum;
+          }
+        }
+        addLog("[CONFIG] Token inventory targets loaded from config", "info");
+      }
     } else {
       addLog("No config file found, using default settings.", "info");
     }
@@ -1240,6 +1266,9 @@ async function performSwap(wallet, fromToken, toToken, amount, proxyUrl) {
 let cyclicSwapRunning = false;
 let cyclicSwapStopRequested = false;
 
+// ─── Session ETH tracker (aliased for convenience) ───
+const sessionEth = inventory.ethGuard;
+
 /**
  * Discover ALL supported swap pairs by probing the Nemesis Factory contract.
  *
@@ -1560,82 +1589,132 @@ async function runCyclicSwapEngine(options = {}) {
 
   const intervalSeconds = options.intervalSeconds || 3;
   const onSwapComplete = options.onSwapComplete || (() => {});
-  const MAX_SWAP_ETH = 0.1; // Maximum swap amount: 0.1 ETH equivalent
+  const MAX_SWAP_ETH = DEFAULT_ETH_GUARD.MAX_ETH_SWAP_PER_TX; // Use ETH guard limit
+
+  // ── Refresh inventory balances before starting ──
+  try {
+    const invProvider = getProvider(SEPOLIA_RPC_URL, SEPOLIA_CHAIN_ID, proxies[0 % proxies.length] || null);
+    const walletAddr = accounts.length > 0 ? new ethers.Wallet(accounts[0].privateKey).address : "";
+    if (walletAddr) {
+      await inventory.refreshBalances(invProvider, walletAddr, TOKENS, addLog);
+      inventory.logStatus(addLog);
+    }
+  } catch (e) {
+    addLog(`[SWAP ENGINE] Inventory refresh failed: ${e.message}, using all pairs`, "warn");
+  }
 
   const allPairs = getAllSwapPairs();
-  addLog(`[SWAP ENGINE] Starting AUTOMATIC SWAPS: ${allPairs.length} pairs, interval=${intervalSeconds}s`, "success");
-  addLog(`[SWAP ENGINE] Max swap amount: ${MAX_SWAP_ETH} ETH equivalent`, "info");
 
-  // Build bidirectional pair list: for each pair, we do both A→B and B→A
-  // The discoveredSwapPairs already contains both directions for ETH↔Token pairs
-  // For Token→Token pairs, we add reverse direction too
-  const bidirectionalPairs = [];
-  for (const pair of allPairs) {
-    bidirectionalPairs.push(pair);
-    // Add reverse direction if not already present
-    const reverseExists = allPairs.some(p => p.from === pair.to && p.to === pair.from);
-    if (!reverseExists) {
-      bidirectionalPairs.push({ from: pair.to, to: pair.from });
-    }
+  // ── Generate inventory-aware pairs (token→token preferred, ETH→token last resort) ──
+  let swapPairs = generateInventoryAwarePairs(inventory, allPairs, addLog);
+  if (swapPairs.length === 0) {
+    addLog("[SWAP ENGINE] Inventory generated 0 pairs, falling back to all discovered pairs", "warn");
+    swapPairs = allPairs.map(p => ({ ...p, priority: 99, reason: "fallback" }));
   }
-  addLog(`[SWAP ENGINE] Bidirectional pairs: ${bidirectionalPairs.length}`, "info");
+
+  addLog(`[SWAP ENGINE] Starting INVENTORY-AWARE SWAPS: ${swapPairs.length} prioritized pairs, interval=${intervalSeconds}s`, "success");
+  addLog(`[SWAP ENGINE] ETH guard: maxPerTx=${MAX_SWAP_ETH} ETH, maxSession=${DEFAULT_ETH_GUARD.MAX_ETH_SWAP_PER_SESSION} ETH, gasReserve=${DEFAULT_ETH_GUARD.MIN_ETH_GAS_RESERVE} ETH`, "info");
 
   let cycleCount = 0;
   let pairIndex = 0;
   let totalSwaps = 0;
   let totalSkipped = 0;
   let totalErrors = 0;
+  let ethSwapsThisCycle = 0;
+  let tokenSwapsThisCycle = 0;
 
   try {
     // INFINITE LOOP — runs until explicitly stopped
     while (!cyclicSwapStopRequested) {
-      const pair = bidirectionalPairs[pairIndex];
+      // ── Refresh inventory balances every cycle ──
+      try {
+        const invProvider = getProvider(SEPOLIA_RPC_URL, SEPOLIA_CHAIN_ID, proxies[0 % proxies.length] || null);
+        const walletAddr = accounts.length > 0 ? new ethers.Wallet(accounts[0].privateKey).address : "";
+        if (walletAddr) await inventory.refreshBalances(invProvider, walletAddr, TOKENS, addLog);
+      } catch (e) { /* continue with stale balances */ }
+
+      // ── Regenerate pairs with fresh balances at cycle boundary ──
+      if (pairIndex === 0 && cycleCount > 0) {
+        swapPairs = generateInventoryAwarePairs(inventory, allPairs, addLog);
+        if (swapPairs.length === 0) {
+          swapPairs = allPairs.map(p => ({ ...p, priority: 99, reason: "fallback" }));
+        }
+        addLog(`[SWAP] ─── Cycle ${cycleCount} complete │ swaps=${totalSwaps} (ETH=${ethSwapsThisCycle}, token=${tokenSwapsThisCycle}) skipped=${totalSkipped} errors=${totalErrors} ───`, "success");
+        addLog(`[SWAP] Session ETH: ${sessionEth.getSummary().split("\n").join(" | ")}`, "info");
+        ethSwapsThisCycle = 0;
+        tokenSwapsThisCycle = 0;
+      }
+
+      if (pairIndex >= swapPairs.length) {
+        pairIndex = 0;
+        cycleCount++;
+        continue;
+      }
+
+      const pair = swapPairs[pairIndex];
 
       // ── Pre-swap SAFETY: validate addresses won't collide ──
       try {
         const fromInfo = normalizeToken(pair.from);
         const toInfo = normalizeToken(pair.to);
         if (fromInfo.address.toLowerCase() === toInfo.address.toLowerCase()) {
-          pairIndex = (pairIndex + 1) % bidirectionalPairs.length;
+          pairIndex = (pairIndex + 1) % swapPairs.length;
           if (pairIndex === 0) cycleCount++;
           totalSkipped++;
           continue;
         }
       } catch (resolveErr) {
         addLog(`[SWAP] SKIP ${pair.from} → ${pair.to}: ${resolveErr.message}`, "warn");
-        pairIndex = (pairIndex + 1) % bidirectionalPairs.length;
+        pairIndex = (pairIndex + 1) % swapPairs.length;
         if (pairIndex === 0) cycleCount++;
         totalSkipped++;
         continue;
       }
 
-      // ── Generate random amount (max 0.1 ETH equivalent) ──
+      // ── ETH GUARD: Block ETH→token swaps if guard triggered ──
+      const isEthSource = pair.from.toUpperCase() === "ETH" || pair.from.toUpperCase() === "WETH";
+      if (isEthSource) {
+        const ethBalance = inventory.balances.ETH ? inventory.balances.ETH.float : 0;
+        const blockCheck = sessionEth.checkBlockThreshold(ethBalance);
+        if (blockCheck.blocked) {
+          addLog(`[SWAP ENGINE] 🚫 ETH SWAP BLOCKED: ${blockCheck.reason}`, "warn");
+          pairIndex = (pairIndex + 1) % swapPairs.length;
+          if (pairIndex === 0) cycleCount++;
+          totalSkipped++;
+          continue;
+        }
+      }
+
+      // ── Generate amount ──
       let amount;
       try {
-        // For ETH: random between 0.001 and 0.1
-        // For tokens: proportional amounts based on token decimals
-        const isEth = pair.from.toUpperCase() === "ETH" || pair.from.toUpperCase() === "WETH";
-        if (isEth) {
-          // Random ETH amount: 0.001 to 0.1
-          amount = 0.001 + Math.random() * (MAX_SWAP_ETH - 0.001);
-          // Randomize decimal places for natural look (3-5 digits)
-          const decimals = 3 + Math.floor(Math.random() * 3);
+        if (isEthSource) {
+          // ETH amounts capped by guard
+          const maxAllowed = Math.min(MAX_SWAP_ETH, sessionEth.limits.MAX_ETH_SWAP_PER_SESSION - sessionEth.totalSwapValueETH);
+          if (maxAllowed <= 0) {
+            addLog("[SWAP ENGINE] ETH session limit reached, skipping ETH swaps", "warn");
+            pairIndex = (pairIndex + 1) % swapPairs.length;
+            if (pairIndex === 0) cycleCount++;
+            totalSkipped++;
+            continue;
+          }
+          amount = 0.0005 + Math.random() * Math.max(0, maxAllowed - 0.0005);
+          const decimals = 4 + Math.floor(Math.random() * 2);
           amount = Number(amount.toFixed(decimals));
         } else {
-          // For tokens: use existing random amount generator with cap
+          // Token amounts from inventory-aware generator
           const amtStr = await getRandomSwapAmount(pair.from, { tokenOut: pair.to });
           amount = Number(amtStr);
-          // Cap at proportional equivalent of 0.1 ETH
-          const maxToken = MAX_SWAP_ETH * 2000; // rough ETH price equivalent
+          const maxToken = MAX_SWAP_ETH * 2000;
           amount = Math.min(amount, maxToken);
         }
       } catch (e) {
-        amount = 0.001; // fallback small amount
+        amount = isEthSource ? 0.001 : 1;
       }
 
       // ── Ensure amount > 0 ──
       if (!Number.isFinite(amount) || amount <= 0) {
-        pairIndex = (pairIndex + 1) % bidirectionalPairs.length;
+        pairIndex = (pairIndex + 1) % swapPairs.length;
         if (pairIndex === 0) cycleCount++;
         totalSkipped++;
         continue;
@@ -1647,6 +1726,23 @@ async function runCyclicSwapEngine(options = {}) {
       const provider = getProvider(SEPOLIA_RPC_URL, SEPOLIA_CHAIN_ID, proxyUrl);
       const wallet = new ethers.Wallet(accounts[accountIndex].privateKey, provider);
 
+      // ── Pre-swap detailed logging ──
+      const deploymentProfile = getActiveDeployment();
+      logSwapDetails({
+        source: pair.from,
+        dest: pair.to,
+        amountIn: `${amount} ${pair.from}`,
+        amountOutExpected: "(pending quote)",
+        priceImpact: "(pending)",
+        slippage: `50 bps (0.5%)`,
+        deployment: deploymentProfile ? deploymentProfile.name : "unknown",
+        pool: "(auto-discovered)",
+        router: getShortAddress(NEMESIS_ROUTER),
+        ethSpentSwap: isEthSource ? `${amount} ETH` : "0 ETH",
+        ethSpentGas: "(pending)",
+        totalSessionEth: `${sessionEth.totalSpent.toFixed(6)} ETH`,
+      }, addLog);
+
       // Check balance before attempting swap
       const hasBalance = await hasSufficientBalance(wallet, provider, pair.from, amount);
       if (!hasBalance) {
@@ -1655,7 +1751,34 @@ async function runCyclicSwapEngine(options = {}) {
         try {
           const result = await executeSwap(wallet, pair.from, pair.to, String(amount), { proxyUrl, slippageBps: 50, deadlineSeconds: 600 });
           totalSwaps++;
-          addLog(`[SWAP] ✓ ${totalSwaps}. ${pair.from} → ${pair.to} amount=${amount.toFixed(6)} | tx=${result.txHash}`, "success");
+
+          // ── Track ETH spending ──
+          if (isEthSource) {
+            sessionEth.recordEthSwap(amount);
+            ethSwapsThisCycle++;
+          } else {
+            tokenSwapsThisCycle++;
+          }
+
+          // Record gas
+          if (result.receipt && result.receipt.gasUsed) {
+            try {
+              const feeData = await provider.getFeeData();
+              const gasPrice = feeData.gasPrice || feeData.maxFeePerGas || 1n;
+              sessionEth.recordGas(result.receipt.gasUsed, gasPrice);
+            } catch (gasErr) { /* non-critical */ }
+          }
+
+          // Record in history
+          sessionEth.addHistory({
+            source: pair.from,
+            dest: pair.to,
+            amount,
+            txHash: result.txHash,
+            isEthSwap: isEthSource,
+          });
+
+          addLog(`[SWAP] ✓ ${totalSwaps}. ${pair.from} → ${pair.to} amount=${amount.toFixed(6)} | tx=${result.txHash} | reason: ${pair.reason || ""}`, "success");
           onSwapComplete(result);
         } catch (error) {
           totalErrors++;
@@ -1669,11 +1792,8 @@ async function runCyclicSwapEngine(options = {}) {
       }
 
       // Move to next pair immediately (no unnecessary waiting)
-      pairIndex = (pairIndex + 1) % bidirectionalPairs.length;
-      if (pairIndex === 0) {
-        cycleCount++;
-        addLog(`[SWAP] ─── Cycle ${cycleCount} complete │ Total: ${totalSwaps} swaps, ${totalSkipped} skipped, ${totalErrors} errors ───`, "success");
-      }
+      pairIndex = (pairIndex + 1) % swapPairs.length;
+      if (pairIndex === 0) cycleCount++;
 
       // Minimal delay between swaps (1-3 seconds for natural behavior)
       if (!cyclicSwapStopRequested) {
@@ -1683,7 +1803,8 @@ async function runCyclicSwapEngine(options = {}) {
     }
   } finally {
     cyclicSwapRunning = false;
-    addLog(`[SWAP ENGINE] STOPPED │ Final stats: ${totalSwaps} swaps, ${totalSkipped} skipped, ${totalErrors} errors, ${cycleCount} cycles`, "warn");
+    addLog(`[SWAP ENGINE] STOPPED │ Final stats: ${totalSwaps} swaps (ETH=${ethSwapsThisCycle}, token=${tokenSwapsThisCycle}), ${totalSkipped} skipped, ${totalErrors} errors, ${cycleCount} cycles`, "warn");
+    addLog(`[SWAP ENGINE] ${sessionEth.getSummary()}`, "warn");
   }
 }
 
@@ -4116,14 +4237,34 @@ async function runAutoRsiTrading() {
 }
 
 function getSwapAmount(pair) {
+  let amount;
   switch (pair.from) {
-    case "ETH":  return getRandomAmount(dailyActivityConfig.ethRange.min,  dailyActivityConfig.ethRange.max);
-    case "USDC": return getRandomAmount(dailyActivityConfig.usdcRange.min, dailyActivityConfig.usdcRange.max);
-    case "DAI":  return getRandomAmount(dailyActivityConfig.daiRange.min,  dailyActivityConfig.daiRange.max);
-    case "UNI": return getRandomAmount(dailyActivityConfig.uniRange.min, dailyActivityConfig.uniRange.max);
-    case "NEMESIS": return getRandomAmount(dailyActivityConfig.nemesisRange.min, dailyActivityConfig.nemesisRange.max);
-    default: return 0;
+    case "ETH":  amount = getRandomAmount(dailyActivityConfig.ethRange.min,  dailyActivityConfig.ethRange.max); break;
+    case "USDC": amount = getRandomAmount(dailyActivityConfig.usdcRange.min, dailyActivityConfig.usdcRange.max); break;
+    case "USDT": amount = getRandomAmount(dailyActivityConfig.usdtRange.min, dailyActivityConfig.usdtRange.max); break;
+    case "DAI":  amount = getRandomAmount(dailyActivityConfig.daiRange.min,  dailyActivityConfig.daiRange.max); break;
+    case "UNI": amount = getRandomAmount(dailyActivityConfig.uniRange.min, dailyActivityConfig.uniRange.max); break;
+    case "LINK": amount = getRandomAmount(dailyActivityConfig.linkRange.min, dailyActivityConfig.linkRange.max); break;
+    case "NEMESIS": amount = getRandomAmount(dailyActivityConfig.nemesisRange.min, dailyActivityConfig.nemesisRange.max); break;
+    default: amount = 0;
   }
+  // ── ETH GUARD: cap ETH swap amount to per-tx limit ──
+  if ((pair.from === "ETH" || pair.from === "WETH") && amount > 0) {
+    const maxTx = inventory.ethGuard.limits.MAX_ETH_SWAP_PER_TX;
+    if (amount > maxTx) {
+      addLog(`[AMOUNT] Capping ETH swap ${amount.toFixed(6)} → ${maxTx} (per-tx limit)`, "warn");
+      amount = maxTx * (0.8 + Math.random() * 0.19); // 80-99% of limit for natural look
+    }
+    // Check session limit
+    const remaining = inventory.ethGuard.limits.MAX_ETH_SWAP_PER_SESSION - inventory.ethGuard.totalSwapValueETH;
+    if (remaining <= 0) {
+      addLog(`[AMOUNT] ETH session limit reached, setting amount to 0`, "warn");
+      amount = 0;
+    } else if (amount > remaining) {
+      amount = remaining * 0.9;
+    }
+  }
+  return amount;
 }
 
 async function runDailyActivity() {
@@ -4159,18 +4300,45 @@ async function runDailyActivity() {
       addLog(`Processing account ${accountIndex + 1}: ${getShortAddress(wallet.address)}`, "wait");
 
       const providerForPairs = getProvider(SEPOLIA_RPC_URL, SEPOLIA_CHAIN_ID, proxyUrl);
-      const dynamicPairs = await buildDynamicSwapPairs(providerForPairs, wallet.address);
-      const activePairs = dynamicPairs.length > 0 ? dynamicPairs : SWAP_PAIRS;
+      // ── INVENTORY-AWARE: refresh balances and generate prioritized pairs ──
+      await inventory.refreshBalances(providerForPairs, wallet.address, TOKENS, addLog);
+      const allSwapPairs = getAllSwapPairs();
+      const invPairs = generateInventoryAwarePairs(inventory, allSwapPairs, addLog);
+      const activePairs = invPairs.length > 0
+        ? invPairs.map(p => ({ from: p.from, to: p.to }))
+        : (await buildDynamicSwapPairs(providerForPairs, wallet.address)).length > 0
+          ? await buildDynamicSwapPairs(providerForPairs, wallet.address)
+          : SWAP_PAIRS;
       const shuffledPairs = [...activePairs].sort(() => Math.random() - 0.5);
 
       for (let swapCount = 0; swapCount < dailyActivityConfig.activityRepetitions && !shouldStop; swapCount++) {
         const pair   = shuffledPairs[swapCount % shuffledPairs.length];
         const amount = getSwapAmount(pair);
+        const isEthSwap = pair.from.toUpperCase() === "ETH" || pair.from.toUpperCase() === "WETH";
 
-        addLog(`Account ${accountIndex + 1} - Swap ${swapCount + 1}/${dailyActivityConfig.activityRepetitions}: ${amount} ${pair.from} → ${pair.to}`, "warn");
+        // ── ETH GUARD: block ETH swaps if guard triggered ──
+        if (isEthSwap) {
+          const ethBalance = inventory.balances.ETH ? inventory.balances.ETH.float : 0;
+          const blockCheck = sessionEth.checkBlockThreshold(ethBalance);
+          if (blockCheck.blocked) {
+            addLog(`[DAILY] 🚫 ETH SWAP BLOCKED: ${blockCheck.reason}`, "warn");
+            continue;
+          }
+          const limitCheck = sessionEth.checkSwapLimit(amount);
+          if (!limitCheck.allowed) {
+            addLog(`[DAILY] 🚫 ETH LIMIT: ${limitCheck.reason}`, "warn");
+            continue;
+          }
+        }
+
+        addLog(`Account ${accountIndex + 1} - Swap ${swapCount + 1}/${dailyActivityConfig.activityRepetitions}: ${amount} ${pair.from} → ${pair.to}${isEthSwap ? " [ETH]" : " [TOKEN]"}`, "warn");
 
         try {
           await performSwap(wallet, pair.from, pair.to, amount, proxyUrl);
+          // Track ETH spending
+          if (isEthSwap) {
+            sessionEth.recordEthSwap(amount);
+          }
         } catch (error) {
           addLog(`Account ${accountIndex + 1} - Swap ${swapCount + 1} Failed: ${error.message}. Skipping.`, "error");
           const nonceKey = `${SEPOLIA_CHAIN_ID}_${wallet.address.toLowerCase()}`;
@@ -5345,6 +5513,16 @@ async function initialize() {
       await printStartupDiagnostics(diagProvider);
       // Remove invalid tokens from TOKENS map to prevent errors in swap/trade engines
       await cleanupInvalidTokens(diagProvider);
+      // ── Initialize token inventory manager ──
+      try {
+        const walletAddr = accounts.length > 0 ? new ethers.Wallet(accounts[0].privateKey).address : "";
+        if (walletAddr) {
+          await inventory.refreshBalances(diagProvider, walletAddr, TOKENS, addLog);
+          inventory.logStatus(addLog);
+        }
+      } catch (e) {
+        addLog(`[INIT] Inventory init failed: ${e.message}`, "warn");
+      }
     }
     addLog(`You Can Change the Default Config on set manual Config Menu`, "warn");
     safeRender();
