@@ -2374,27 +2374,27 @@ async function discoverSupportedMarkets(provider, tokenList) {
       if (seen.has(pairKey)) continue;
       seen.add(pairKey);
 
-      // Try to find pool/manager from confirmed pools
-      const confirmedPools = getConfirmedPools();
+      // Find pool/manager: try V2 Factory first (direct on-chain lookup)
       let pool = null, manager = null;
-      for (const [key, info] of Object.entries(confirmedPools)) {
-        if (info.pool && info.manager) {
-          pool = info.pool;
-          manager = info.manager;
-          break;
+      try {
+        const factory = new ethers.Contract(LEVERAGED_FACTORY, FACTORY_ABI, provider);
+        const [tokenA, tokenB] = sortTokenPair(WETH_ADDRESS, collateral);
+        pool = await factory.getPool(tokenA, tokenB);
+        if (pool && pool !== ZERO_ADDRESS) {
+          manager = await factory.getManager(pool);
         }
-      }
+      } catch { /* V2 Factory may not respond for some pairs */ }
 
-      // If no confirmed pool, try Factory (may work for some V2 pools)
-      if (!pool || !manager) {
-        try {
-          const factory = new ethers.Contract(LEVERAGED_FACTORY, FACTORY_ABI, provider);
-          const [tokenA, tokenB] = sortTokenPair(WETH_ADDRESS, collateral);
-          pool = await factory.getPool(tokenA, tokenB);
-          if (pool && pool !== ZERO_ADDRESS) {
-            manager = await factory.getManager(pool);
+      // Fallback: try confirmed pools from deployment profile
+      if (!pool || pool === ZERO_ADDRESS || !manager || manager === ZERO_ADDRESS) {
+        const confirmedPools = getConfirmedPools();
+        for (const [key, info] of Object.entries(confirmedPools)) {
+          if (key.includes(collateral.toLowerCase().slice(0, 10)) && info.pool && info.manager) {
+            pool = info.pool;
+            manager = info.manager;
+            break;
           }
-        } catch { /* V2 Factory may not respond */ }
+        }
       }
 
       if (!pool || pool === ZERO_ADDRESS || !manager || manager === ZERO_ADDRESS) {
@@ -3159,15 +3159,53 @@ async function ensureOracleReady(wallet, poolAddress, side, provider) {
     throw new Error(`checkpointOracle confirmation failed: ${confErr.message}`);
   }
 
-  // Step 7: Re-read getRiskPrice to verify
+  // Step 7: Wait for TWAP window to elapse so EMA converges
+  // Use 2× MIN_TWAP_WINDOW + 30s buffer (EMA needs multiple updates to converge)
   try {
-    const rpAfter = await pool.getRiskPrice();
+    const minWindow = await pool.MIN_TWAP_WINDOW();
+    const waitSeconds = Number(minWindow) * 2 + 30; // 2× window + 30s buffer
+    addLog(`[${side}] [ORACLE] Waiting ${waitSeconds}s for EMA convergence (2× TWAP + 30s buffer)...`, "wait");
+    await new Promise(resolve => setTimeout(resolve, waitSeconds * 1000));
+    addLog(`[${side}] [ORACLE] TWAP wait complete`, "success");
+  } catch {
+    addLog(`[${side}] [ORACLE] Could not read MIN_TWAP_WINDOW — waiting 150s default`, "warn");
+    await new Promise(resolve => setTimeout(resolve, 150000));
+  }
+
+  // Step 8: Re-read getRiskPrice and getOraclePrice to verify divergence is acceptable
+  try {
+    const [rpAfter, opAfter] = await Promise.all([
+      pool.getRiskPrice().catch(() => [0n, 0n]),
+      pool.getOraclePrice().catch(() => [0n, 0n]),
+    ]);
     addLog(`[${side}] [ORACLE] Post-checkpoint getRiskPrice: price0Avg=${rpAfter[0]} price1Avg=${rpAfter[1]}`, "info");
+    addLog(`[${side}] [ORACLE] Post-checkpoint getOraclePrice: price0=${opAfter[0]} price1=${opAfter[1]}`, "info");
+
+    // Check both token0 and token1 divergence
+    if (rpAfter[0] > 0n && opAfter[0] > 0n) {
+      const dev0 = opAfter[0] > rpAfter[0]
+        ? (opAfter[0] - rpAfter[0]) * 10000n / rpAfter[0]
+        : (rpAfter[0] - opAfter[0]) * 10000n / opAfter[0];
+      addLog(`[${side}] [ORACLE] Token0 divergence: ${dev0} bps (${Number(dev0) / 100}%)`, "info");
+      if (dev0 > ORACLE_MAX_DIVERGENCE_BPS) {
+        addLog(`[${side}] [ORACLE] WARNING: Token0 divergence ${dev0} bps still exceeds max ${ORACLE_MAX_DIVERGENCE_BPS} — openPosition may revert`, "warn");
+      }
+    }
+    if (rpAfter[1] > 0n && opAfter[1] > 0n) {
+      const dev1 = opAfter[1] > rpAfter[1]
+        ? (opAfter[1] - rpAfter[1]) * 10000n / rpAfter[1]
+        : (rpAfter[1] - opAfter[1]) * 10000n / opAfter[1];
+      addLog(`[${side}] [ORACLE] Token1 divergence: ${dev1} bps (${Number(dev1) / 100}%)`, "info");
+      if (dev1 > ORACLE_MAX_DIVERGENCE_BPS) {
+        addLog(`[${side}] [ORACLE] WARNING: Token1 divergence ${dev1} bps still exceeds max ${ORACLE_MAX_DIVERGENCE_BPS} — openPosition may revert`, "warn");
+      }
+    }
+
     if (rpAfter[0] === 0n && rpAfter[1] === 0n) {
       addLog(`[${side}] [ORACLE] WARNING: getRiskPrice still zero after checkpoint`, "warn");
     }
   } catch {
-    addLog(`[${side}] [ORACLE] Could not re-read getRiskPrice after checkpoint`, "warn");
+    addLog(`[${side}] [ORACLE] Could not re-read oracle after checkpoint`, "warn");
   }
 
   addLog(`[${side}] [ORACLE] Oracle checkpoint complete`, "success");

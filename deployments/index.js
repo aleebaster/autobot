@@ -15,7 +15,7 @@ const DEPLOYMENTS = {
   v4: V4_PROFILE,
 };
 
-let activeDeploymentId = "v1"; // Default to V1 (current bot behavior)
+let activeDeploymentId = "v2"; // Default to V2 (active Nemesis deployment)
 
 /**
  * Get all available deployment profiles
