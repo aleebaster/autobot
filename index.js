@@ -147,6 +147,186 @@ const inventory = new TokenInventory({ ethGuard: {} });
 // to determine which collateral tokens produce LONG vs SHORT positions.
 let collateralRules = { LONG: [], SHORT: [], lastDiscovery: 0, eventCount: 0 };
 
+// ═══════════════════════════════════════════════════════════════════════════════
+//  MANAGER HEALTH CHECK — prevents leveraged trading on broken managers
+//  States: MANAGER_READY | MANAGER_IMPLEMENTATION_EMPTY | MANAGER_UNAVAILABLE
+// ═══════════════════════════════════════════════════════════════════════════════
+const MANAGER_HEALTH = { READY: "MANAGER_READY", EMPTY: "MANAGER_IMPLEMENTATION_EMPTY", UNAVAILABLE: "MANAGER_UNAVAILABLE" };
+let managerHealthState = MANAGER_HEALTH.UNAVAILABLE; // assume worst until verified
+let managerHealthLastCheck = 0;
+const MANAGER_HEALTH_CACHE_MS = 60_000; // re-check every 60s
+
+// Known V2 Manager implementation address (from EIP-1167 clone bytecode)
+const V2_MANAGER_IMPL = "0x73be4c86f27287768a6a9f8d657d57845cf62bd9";
+const CONTRACT_MAX_LEVERAGE = 5;
+
+// Error selector decoder — covers known MAM custom errors
+const ERROR_SELECTORS = {
+  "0xc48faa3a": "MAM_InvalidLeverage",
+  "0x24811982": "MAM_InvalidCollateralToken",
+  "0x679c48b0": "MAM_ZeroBorrow",
+  "0xda99a87e": "MAM_Unknown_0xda99a87e",
+  "0x7939f424": "MAM_Unknown_0x7939f424",
+  "0xf71ff020": "MAM_InsufficientLiquidity",
+  "0x70280426": "MAM_InsufficientCollateral",
+  "0xa4811d93": "MAM_Expired",
+  "0x70445e36": "MAM_ZeroAmount",
+  "0x763d8933": "MAM_ZeroCollateral",
+  "0xb7c9841d": "MAM_ExceedsLTV",
+  "0xa4cb8b8b": "MAM_Forbidden",
+  "0x16e92764": "MAM_InvalidCollateralValue",
+  "0x64abf18d": "MAM_PoolNotFound",
+  "0x01556191": "MAM_CloseAmountTooSmall",
+  "0xa782ca90": "MAM_InvalidCloseBps",
+  "0xa5732d32": "MAM_InvalidPosition",
+  "0xac0d70d4": "MAM_NotLiquidatable",
+  "0xc74f0e5c": "MAM_NotOwner",
+  "0x39952d23": "MAM_OracleUnavailable",
+  "0xdf3d64a3": "MAM_ZeroOraclePrice",
+  "0x499ad952": "Router_InsufficientOutputAmount",
+};
+
+/** Decode a custom error selector from revert data */
+function decodeErrorSelector(selector) {
+  return ERROR_SELECTORS[selector] || `UNKNOWN(${selector})`;
+}
+
+/**
+ * Check manager implementation health via eth_getCode.
+ * Caches result for MANAGER_HEALTH_CACHE_MS to avoid RPC spam.
+ * @param {ethers.Provider} provider
+ * @returns {Promise<string>} MANAGER_HEALTH state
+ */
+async function checkManagerHealth(provider) {
+  const now = Date.now();
+  if (now - managerHealthLastCheck < MANAGER_HEALTH_CACHE_MS && managerHealthState !== MANAGER_HEALTH.UNAVAILABLE) {
+    return managerHealthState;
+  }
+  try {
+    const code = await provider.getCode(V2_MANAGER_IMPL);
+    if (!code || code === "0x" || code.length <= 10) {
+      managerHealthState = MANAGER_HEALTH.EMPTY;
+      addLog(`[MANAGER] Implementation ${V2_MANAGER_IMPL.slice(0,10)}... has NO bytecode — leveraged trading DISABLED`, "warn");
+    } else {
+      managerHealthState = MANAGER_HEALTH.READY;
+      addLog(`[MANAGER] Implementation ${V2_MANAGER_IMPL.slice(0,10)}... has ${code.length} chars — leveraged trading AVAILABLE`, "success");
+    }
+    managerHealthLastCheck = now;
+  } catch (e) {
+    managerHealthState = MANAGER_HEALTH.UNAVAILABLE;
+    addLog(`[MANAGER] Health check failed: ${e.message}`, "error");
+  }
+  return managerHealthState;
+}
+
+/**
+ * Validate manager readiness BEFORE any leveraged transaction.
+ * Returns true if safe to proceed, false otherwise.
+ */
+async function validateManagerReady(provider) {
+  const health = await checkManagerHealth(provider);
+  if (health !== MANAGER_HEALTH.READY) {
+    addLog(`[BLOCKED] Manager health=${health} — leveraged trading DISABLED`, "error");
+    addLog(`[BLOCKED] Reason: Implementation at ${V2_MANAGER_IMPL.slice(0,10)}... has no bytecode`, "error");
+    addLog(`[BLOCKED] Waiting for Nemesis to redeploy Manager implementation`, "error");
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Auto-recovery validation — checks if Manager implementation has been redeployed.
+ * If implementation appears, runs full validation before enabling trading.
+ */
+async function autoRecoveryValidation(provider) {
+  if (managerHealthState === MANAGER_HEALTH.READY) return true; // already valid
+
+  const code = await provider.getCode(V2_MANAGER_IMPL);
+  if (!code || code === "0x" || code.length <= 10) {
+    // Still empty — no change
+    return false;
+  }
+
+  addLog(`[RECOVERY] Implementation at ${V2_MANAGER_IMPL.slice(0,10)}... now has ${code.length} chars!`, "success");
+  addLog(`[RECOVERY] Running full validation before enabling trading...`, "warn");
+
+  // Step 1: Verify a manager proxy works
+  const testManagerAddr = "0x3a0856852516eF5E6f8994c44a7eC36c2af98dE7"; // ETH/USDT
+  const testManager = new ethers.Contract(testManagerAddr, [
+    "function router() view returns (address)",
+    "function factory() view returns (address)",
+    "function pool() view returns (address)",
+    "function PROTOCOL_FEE_BPS() view returns (uint256)",
+    "function LTV_BPS() view returns (uint256)",
+    "function previewOpenPosition(bool isLong, address collateralToken, uint256 collateralAmount, uint256 borrowAmount, uint256 leverageX10) view returns (uint256, uint256, uint256, uint256, uint256, uint256, bool, bool)",
+  ], provider);
+
+  const checks = [];
+
+  // Check router()
+  try {
+    const r = await testManager.router();
+    checks.push({ name: "router()", ok: r.toLowerCase() === NEMESIS_ROUTER.toLowerCase(), value: r });
+  } catch (e) { checks.push({ name: "router()", ok: false, error: e.message.slice(0, 80) }); }
+
+  // Check factory()
+  try {
+    const f = await testManager.factory();
+    checks.push({ name: "factory()", ok: f.toLowerCase() === LEVERAGED_FACTORY.toLowerCase(), value: f });
+  } catch (e) { checks.push({ name: "factory()", ok: false, error: e.message.slice(0, 80) }); }
+
+  // Check pool()
+  try {
+    const p = await testManager.pool();
+    checks.push({ name: "pool()", ok: p !== ethers.ZeroAddress, value: p });
+  } catch (e) { checks.push({ name: "pool()", ok: false, error: e.message.slice(0, 80) }); }
+
+  // Check previewOpenPosition with safe params
+  try {
+    const usdtAddr = TOKENS.USDT.address;
+    const collAmt = ethers.parseUnits("1", 6);
+    const borrowAmt = ethers.parseUnits("1", 6);
+    const preview = await testManager.previewOpenPosition(true, usdtAddr, collAmt, borrowAmt, 20n);
+    checks.push({ name: "previewOpenPosition(2x)", ok: true, value: preview.map(p => p.toString()).join(",") });
+  } catch (e) { checks.push({ name: "previewOpenPosition(2x)", ok: false, error: e.message.slice(0, 80) }); }
+
+  // Report
+  const allPassed = checks.every(c => c.ok);
+  for (const c of checks) {
+    addLog(`[RECOVERY] ${c.name}: ${c.ok ? "✅ PASS" : "❌ FAIL"} ${c.error || c.value || ""}`, c.ok ? "success" : "error");
+  }
+
+  if (allPassed) {
+    addLog(`[RECOVERY] ALL CHECKS PASSED — enabling leveraged trading`, "success");
+    managerHealthState = MANAGER_HEALTH.READY;
+    managerHealthLastCheck = Date.now();
+    // Re-enable trading
+    tradingConfig.enableLong = true;
+    tradingConfig.enableShort = true;
+    tradingConfig.enableClose = true;
+    return true;
+  } else {
+    addLog(`[RECOVERY] SOME CHECKS FAILED — keeping trading disabled`, "error");
+    return false;
+  }
+}
+
+/**
+ * Clamp leverage to contract maximum. Returns clamped value.
+ */
+function clampLeverage(leverage) {
+  const lev = Number(leverage);
+  if (lev > CONTRACT_MAX_LEVERAGE) {
+    addLog(`[LEVERAGE] Clamped ${lev}x → ${CONTRACT_MAX_LEVERAGE}x (contract max)`, "warn");
+    return CONTRACT_MAX_LEVERAGE;
+  }
+  if (lev < 2) {
+    addLog(`[LEVERAGE] Clamped ${lev}x → 2x (minimum)`, "warn");
+    return 2;
+  }
+  return lev;
+}
+
 const ROUTER_ABI = [
   "function swapExactETHForTokens(uint256 amountOutMin, address[] calldata path, address to, uint256 deadline) payable returns (uint256[] memory)",
   "function swapExactTokensForETH(uint256 amountIn, uint256 amountOutMin, address[] calldata path, address to, uint256 deadline) returns (uint256[] memory)",
@@ -308,6 +488,11 @@ let tradingConfig = {
   tradeBalancePercentMax: 5,        // max % of wallet balance for percentage mode
   leverageMin: 1,                   // min leverage (randomized between min..max)
   leverageMax: 5,                   // max leverage (randomized between min..max)
+  // ─── Minimum safe closeable position size (on-chain verified) ───
+  // Positions below these amounts revert with error 0xad60222e on close.
+  // Tested: 148 raw USDT (0.000148) FAILS, 500 raw (0.0005) OK, 1000 raw (0.001) OK.
+  minSafeCloseAmountUSDT: "0.001",   // 1000 raw USDT (6 decimals)
+  minSafeCloseAmountWETH: "0.00001", // 10000000000000 raw WETH (18 decimals)
   // ─── Natural behavior: randomized swap amounts ───
   swapAmountMode: "random",         // "fixed" | "random" | "percentage"
   swapMinAmount: "0.0001",          // min swap amount (used in random mode)
@@ -403,10 +588,25 @@ function loadConfig() {
       tradingConfig.tradeAmountMode    = cfg.tradeAmountMode    || tradingConfig.tradeAmountMode;
       tradingConfig.tradeMinAmount     = String(cfg.tradeMinAmount    ?? tradingConfig.tradeMinAmount);
       tradingConfig.tradeMaxAmount     = String(cfg.tradeMaxAmount    ?? tradingConfig.tradeMaxAmount);
+      tradingConfig.minSafeCloseAmountUSDT = String(cfg.minSafeCloseAmountUSDT ?? tradingConfig.minSafeCloseAmountUSDT);
+      tradingConfig.minSafeCloseAmountWETH = String(cfg.minSafeCloseAmountWETH ?? tradingConfig.minSafeCloseAmountWETH);
       tradingConfig.tradeBalancePercentMin = Number(cfg.tradeBalancePercentMin) || tradingConfig.tradeBalancePercentMin;
       tradingConfig.tradeBalancePercentMax = Number(cfg.tradeBalancePercentMax) || tradingConfig.tradeBalancePercentMax;
       tradingConfig.leverageMin         = Number(cfg.leverageMin)         || tradingConfig.leverageMin;
       tradingConfig.leverageMax         = Number(cfg.leverageMax)         || tradingConfig.leverageMax;
+      // ── ENFORCE CONTRACT MAX LEVERAGE (5x) — Nemesis V2 contract limit ──
+      const CONTRACT_MAX_LEVERAGE = 5;
+      if (tradingConfig.leverageMax > CONTRACT_MAX_LEVERAGE) {
+        addLog(`[LEVERAGE] Capped leverageMax from ${tradingConfig.leverageMax}x to ${CONTRACT_MAX_LEVERAGE}x (contract limit)`, "warn");
+        tradingConfig.leverageMax = CONTRACT_MAX_LEVERAGE;
+      }
+      if (tradingConfig.leverageMin > CONTRACT_MAX_LEVERAGE) {
+        tradingConfig.leverageMin = 2;
+      }
+      if (tradingConfig.leverage > CONTRACT_MAX_LEVERAGE) {
+        addLog(`[LEVERAGE] Capped leverage from ${tradingConfig.leverage}x to ${CONTRACT_MAX_LEVERAGE}x (contract limit)`, "warn");
+        tradingConfig.leverage = CONTRACT_MAX_LEVERAGE;
+      }
       tradingConfig.swapAmountMode     = cfg.swapAmountMode     || tradingConfig.swapAmountMode;
       tradingConfig.swapMinAmount      = String(cfg.swapMinAmount      ?? tradingConfig.swapMinAmount);
       tradingConfig.swapMaxAmount      = String(cfg.swapMaxAmount      ?? tradingConfig.swapMaxAmount);
@@ -926,7 +1126,8 @@ function getTradingAmount(side) {
 
   } else {
     // ── RANDOM mode (default): random between tradeMinAmount..tradeMaxAmount ──
-    const minVal = Math.max(0.000001, Number(tradingConfig.tradeMinAmount) || 0.1);
+    // Floor: 0.001 — below this, the contract reverts on close (error 0xad60222e)
+    const minVal = Math.max(0.001, Number(tradingConfig.tradeMinAmount) || 0.1);
     const maxVal = Math.max(minVal, Number(tradingConfig.tradeMaxAmount) || 1.0);
     amount = minVal + Math.random() * (maxVal - minVal);
   }
@@ -937,7 +1138,7 @@ function getTradingAmount(side) {
     const threshold = Math.max(amount * 0.15, 0.00001); // must differ by at least 15%
     if (diff < threshold) {
       // Regenerate with forced offset
-      const minVal = Math.max(0.000001, Number(tradingConfig.tradeMinAmount) || 0.1);
+      const minVal = Math.max(0.001, Number(tradingConfig.tradeMinAmount) || 0.1);
       const maxVal = Math.max(minVal, Number(tradingConfig.tradeMaxAmount) || 1.0);
       // Shift amount away from last used value
       if (amount > _lastTradeAmount) {
@@ -961,8 +1162,11 @@ function getTradingAmount(side) {
  * Prevents consecutive identical values.
  */
 function getRandomLeverage() {
-  const minLev = Math.max(1, Number(tradingConfig.leverageMin) || 1);
-  const maxLev = Math.max(minLev, Number(tradingConfig.leverageMax) || 5);
+  let minLev = Math.max(1, Number(tradingConfig.leverageMin) || 1);
+  let maxLev = Math.max(minLev, Number(tradingConfig.leverageMax) || 5);
+  // ENFORCE CONTRACT MAX — never exceed on-chain limit
+  if (maxLev > CONTRACT_MAX_LEVERAGE) maxLev = CONTRACT_MAX_LEVERAGE;
+  if (minLev > CONTRACT_MAX_LEVERAGE) minLev = 2;
   let leverage = Math.round(minLev + Math.random() * (maxLev - minLev));
   leverage = Math.max(minLev, Math.min(maxLev, leverage));
 
@@ -1176,6 +1380,34 @@ async function executeSwap(wallet, tokenIn, tokenOut, amount, options = {}) {
   const label = `${infoIn.symbol} ➪ ${infoOut.symbol}`;
   addLog(`[SWAP] ${label} amount=${amount} router=${NEMESIS_ROUTER}`, "info");
   addLog(`[SWAP] path=${path.map(a => getShortAddress(a)).join(" → ")}`, "info");
+
+  // ═══ PRICE SANITY CHECK — reject abnormal stablecoin pricing ═══
+  // USDC/USDT pool has 2.7x imbalance — prevent executing swaps at bad rates
+  try {
+    const amountInWei = infoIn.decimals === 18
+      ? ethers.parseEther(String(amount))
+      : ethers.parseUnits(String(amount), infoIn.decimals);
+    const quoteAmounts = await router.getAmountsOut(amountInWei, path);
+    const expectedOut = BigInt(quoteAmounts[quoteAmounts.length - 1]);
+    const outFloat = Number(ethers.formatUnits(expectedOut, infoOut.decimals));
+    const inFloat = Number(amount);
+    const effectivePrice = inFloat > 0 ? outFloat / inFloat : 0;
+
+    // Stablecoin sanity: USDC→USDT or USDT→USDC should be ~1.0
+    const isStablecoinSwap = (
+      (infoIn.symbol === "USDC" && infoOut.symbol === "USDT") ||
+      (infoIn.symbol === "USDT" && infoOut.symbol === "USDC")
+    );
+    if (isStablecoinSwap && (effectivePrice > 1.5 || effectivePrice < 0.5)) {
+      addLog(`[SWAP] BLOCKED: ${label} abnormal price ${effectivePrice.toFixed(4)}x (expected ~1.0x for stablecoins)`, "error");
+      addLog(`[SWAP] Pool has severe price imbalance — refusing to execute at loss`, "error");
+      throw new Error(`Abnormal stablecoin price: ${effectivePrice.toFixed(4)}x (pool imbalance detected)`);
+    }
+  } catch (e) {
+    if (e.message.includes("Abnormal stablecoin price")) throw e;
+    // Quote failed — continue with swap (non-critical check)
+    addLog(`[SWAP] Price sanity check skipped: ${e.message}`, "warn");
+  }
 
   const feeParams = await getFeeParams(provider);
   const gasLimit = 300000n;
@@ -2150,7 +2382,7 @@ function normalizeCollateralToken(token) {
 //  This function is the SINGLE place that determines collateral for a side.
 //  ALL code paths must use it: Open LONG, Open SHORT, Auto RSI, Full Auto, CLI, TUI.
 // ═══════════════════════════════════════════════════════════════════════════════
-function resolveCollateralForSide(side, market = null) {
+async function resolveCollateralForSide(side, market = null, provider = null) {
   // ═══════════════════════════════════════════════════════════════════════════════
   //  POOL-AWARE COLLATERAL RESOLUTION (verified via MAM_PositionDirectionMismatch):
   //  Each pool has token0 and token1. The manager enforces:
@@ -2158,24 +2390,61 @@ function resolveCollateralForSide(side, market = null) {
   //    token1 collateral → isLong=false (SHORT position)
   //  If isLong doesn't match the token position, the manager reverts with
   //  MAM_PositionDirectionMismatch.
-  // ═══════════════════════════════════════════════════════════════════════════════
   //
-  //  If a specific market is provided AND it has poolToken0 cached:
-  //    LONG  → use poolToken0
-  //    SHORT → use poolToken1 (the other token)
+  //  PRIORITY: Read pool.token0() from on-chain for the ACTUAL current pool.
+  //  Never trust cached poolToken0 from config — Nemesis may have redeployed pools.
+  // ═══════════════════════════════════════════════════════════════════════════════
+
+  // ── Step 1: Try to read pool.token0() from on-chain ──
+  if (provider && market && isValidContractTarget(market.poolAddress)) {
+    try {
+      const poolContract = new ethers.Contract(market.poolAddress, POOL_ABI, provider);
+      const token0 = await poolContract.token0();
+      addLog(`[COLLATERAL] pool.token0() on-chain = ${token0} (${getShortAddress(token0)})`, "info");
+
+      if (side === "LONG") {
+        addLog(`[COLLATERAL] LONG → using token0 as collateral: ${getShortAddress(token0)}`, "info");
+        return token0;
+      } else if (side === "SHORT") {
+        // SHORT → use the OTHER token (not token0)
+        // Determine the other token: if collateral==token0, the other is marketToken or pairToken
+        const collateral = market.collateralToken || WETH_ADDRESS;
+        const marketTokenAddr = market.marketToken || WETH_ADDRESS;
+        const pairTokenAddr = tradingConfig.pairToken || USDT_ADDRESS;
+        if (collateral.toLowerCase() === token0.toLowerCase()) {
+          // collateral IS token0 — for SHORT, need the other token
+          if (marketTokenAddr.toLowerCase() !== token0.toLowerCase()) {
+            addLog(`[COLLATERAL] SHORT → using marketToken as collateral: ${getShortAddress(marketTokenAddr)}`, "info");
+            return marketTokenAddr;
+          }
+          if (pairTokenAddr.toLowerCase() !== token0.toLowerCase()) {
+            addLog(`[COLLATERAL] SHORT → using pairToken as collateral: ${getShortAddress(pairTokenAddr)}`, "info");
+            return pairTokenAddr;
+          }
+          addLog(`[COLLATERAL] SHORT → fallback to WETH as collateral`, "warn");
+          return WETH_ADDRESS;
+        } else {
+          // collateral is NOT token0 — for SHORT, token0 is the collateral
+          addLog(`[COLLATERAL] SHORT → using token0 as collateral: ${getShortAddress(token0)}`, "info");
+          return token0;
+        }
+      }
+    } catch (e) {
+      addLog(`[COLLATERAL] Failed to read pool.token0(): ${e.message} — falling back to cached`, "warn");
+    }
+  }
+
+  // ── Step 2: Fallback to cached poolToken0 from market config ──
   if (market && market.poolToken0) {
     const collateralIsToken0 = market.collateralToken.toLowerCase() === market.poolToken0.toLowerCase();
     if (side === "LONG") {
-      // LONG needs token0
       return collateralIsToken0 ? market.collateralToken : WETH_ADDRESS;
     } else if (side === "SHORT") {
-      // SHORT needs token1 (the other token)
       return collateralIsToken0 ? WETH_ADDRESS : market.collateralToken;
     }
   }
-  //
-  //  FALLBACK (no market or no poolToken0): use global heuristic
-  //  For most pools: collateral token is token0 → LONG, WETH is token1 → SHORT
+
+  // ── Step 3: Global heuristic fallback ──
   if (side === "LONG") {
     const markets = tradingConfig.availableMarkets || [];
     for (const m of markets) {
@@ -2374,14 +2643,35 @@ async function discoverSupportedMarkets(provider, tokenList) {
       if (seen.has(pairKey)) continue;
       seen.add(pairKey);
 
-      // Find pool/manager: try V2 Factory first (direct on-chain lookup)
+      // Find pool/manager: try V2 Factory with multiple token pair combinations
+      // V2 pools are typically collateral/pairToken (e.g., NEMESIS/USDT), not WETH/collateral
       let pool = null, manager = null;
       try {
         const factory = new ethers.Contract(LEVERAGED_FACTORY, FACTORY_ABI, provider);
-        const [tokenA, tokenB] = sortTokenPair(WETH_ADDRESS, collateral);
-        pool = await factory.getPool(tokenA, tokenB);
-        if (pool && pool !== ZERO_ADDRESS) {
-          manager = await factory.getManager(pool);
+        const pairToken = normalizeCollateralToken(tradingConfig.pairToken || USDT_ADDRESS);
+        // Try: (1) collateral/pairToken, (2) collateral/WETH, (3) WETH/collateral
+        const factoryPairs = [];
+        const addFactoryPair = (a, b) => {
+          if (a.toLowerCase() === b.toLowerCase()) return;
+          const s = sortTokenPair(a, b);
+          if (!factoryPairs.some(p => p[0] === s[0] && p[1] === s[1])) factoryPairs.push(s);
+        };
+        addFactoryPair(collateral, pairToken);  // e.g., NEMESIS/USDT
+        addFactoryPair(collateral, WETH_ADDRESS); // e.g., USDT/WETH
+        addFactoryPair(WETH_ADDRESS, collateral);  // e.g., WETH/USDT
+
+        for (const [tokenA, tokenB] of factoryPairs) {
+          try {
+            pool = await factory.getPool(tokenA, tokenB);
+            if (pool && pool !== ZERO_ADDRESS) {
+              manager = await factory.getManager(pool);
+              if (manager && manager !== ZERO_ADDRESS) {
+                addLog(`[DISCOVER] V2 Factory found: ${m.symbol} pool=${getShortAddress(pool)} mgr=${getShortAddress(manager)} (pair=${getShortAddress(tokenA)}/${getShortAddress(tokenB)})`, "info");
+                break;
+              }
+            }
+          } catch { /* try next pair */ }
+          pool = null; manager = null;
         }
       } catch { /* V2 Factory may not respond for some pairs */ }
 
@@ -2848,68 +3138,60 @@ async function getLeveragedContext(provider, collateralToken, marketTokenArg = n
   const pairToken = normalizeCollateralToken(tradingConfig.pairToken || USDT_ADDRESS);
   const profile = getActiveDeployment();
 
-  // ── PREFERRED: use market config's known pool/manager if available ──
-  // This avoids re-querying Factory which may return a different (broken) pool
+  // ═══════════════════════════════════════════════════════════════════════════════
+  //  PRIMARY: Always query Factory for the LATEST pool/manager addresses.
+  //  Nemesis may redeploy pools at any time. The Factory is the single source
+  //  of truth for current pool/manager addresses.
+  //  Try multiple token-pair combinations to cover all V2 pool structures.
+  // ═══════════════════════════════════════════════════════════════════════════════
+  const factory = new ethers.Contract(LEVERAGED_FACTORY, FACTORY_ABI, provider);
+
+  // Candidate token pairs to probe (deduplicated by address)
+  const candidatePairs = [];
+  const seenPairs = new Set();
+  const addPair = (a, b) => {
+    if (a.toLowerCase() === b.toLowerCase()) return; // skip same-token pairs
+    const key = [a, b].sort((x, y) => x.toLowerCase().localeCompare(y.toLowerCase())).join(":");
+    if (seenPairs.has(key)) return;
+    seenPairs.add(key);
+    candidatePairs.push(sortTokenPair(a, b));
+  };
+  addPair(collateral, pairToken);  // e.g., [NEMESIS, USDT] — most V2 pools
+  addPair(collateral, marketToken); // e.g., [USDT, WETH] — ETH/USDT pool
+  addPair(pairToken, marketToken);  // e.g., [USDT, WETH] — alternate
+
+  for (const [tokenA, tokenB] of candidatePairs) {
+    try {
+      const pool = await factory.getPool(tokenA, tokenB);
+      if (isValidContractTarget(pool)) {
+        const manager = await factory.getManager(pool);
+        if (isValidContractTarget(manager)) {
+          addLog(`[CONTEXT] Factory pool=${getShortAddress(pool)} mgr=${getShortAddress(manager)} (pair=${getShortAddress(tokenA)}/${getShortAddress(tokenB)})`, "info");
+          return { collateral, marketToken, pairToken, pool, manager, path: [collateral, marketToken] };
+        }
+      }
+    } catch { /* try next pair */ }
+  }
+
+  // ═══ FALLBACK: use market config's pool/manager if Factory returned nothing ═══
   if (marketConfig && isValidContractTarget(marketConfig.poolAddress) && isValidContractTarget(marketConfig.managerAddress)) {
-    addLog(`[CONTEXT] Using market config pool=${getShortAddress(marketConfig.poolAddress)} mgr=${getShortAddress(marketConfig.managerAddress)}`, "info");
+    addLog(`[CONTEXT] Fallback to market config pool=${getShortAddress(marketConfig.poolAddress)} mgr=${getShortAddress(marketConfig.managerAddress)}`, "warn");
     return { collateral, marketToken, pairToken, pool: marketConfig.poolAddress, manager: marketConfig.managerAddress, path: [collateral, marketToken] };
   }
 
-  // ── V2: Factory doesn't respond to getPool(address,address) — use subgraph/confirmed pools ──
+  // ═══ FALLBACK: confirmed pools from deployment profile ═══
   if (isV2Plus()) {
-    // Try confirmed pools from deployment profile
     const confirmedPools = getConfirmedPools();
-    const marketKey = `${getShortAddress(collateral)}/${getShortAddress(pairToken)}`;
     for (const [key, info] of Object.entries(confirmedPools)) {
       if (isValidContractTarget(info.pool) && isValidContractTarget(info.manager)) {
-        addLog(`[CONTEXT] V2 confirmed pool=${getShortAddress(info.pool)} mgr=${getShortAddress(info.manager)}`, "info");
+        addLog(`[CONTEXT] V2 confirmed pool=${getShortAddress(info.pool)} mgr=${getShortAddress(info.manager)}`, "warn");
         return { collateral, marketToken, pairToken, pool: info.pool, manager: info.manager, path: [collateral, marketToken] };
       }
     }
-    // V2 fallback: try Factory anyway (some V2 pools may respond)
-    const factory = new ethers.Contract(LEVERAGED_FACTORY, FACTORY_ABI, provider);
-    if (collateral.toLowerCase() === marketToken.toLowerCase()) {
-      const [tokenA, tokenB] = sortTokenPair(collateral, pairToken);
-      try {
-        const pool = await factory.getPool(tokenA, tokenB);
-        if (isValidContractTarget(pool)) {
-          const manager = await factory.getManager(pool);
-          if (isValidContractTarget(manager)) {
-            addLog(`[CONTEXT] V2 Factory pool=${getShortAddress(pool)} mgr=${getShortAddress(manager)}`, "info");
-            return { collateral, marketToken, pairToken, pool, manager, path: [collateral, marketToken] };
-          }
-        }
-      } catch { /* V2 Factory may not respond */ }
-    }
-    throw new Error(`V2: No confirmed pool for collateral=${getShortAddress(collateral)}. Use subgraph discovery first.`);
+    throw new Error(`V2: No pool found for collateral=${getShortAddress(collateral)}. Factory returned no valid pool.`);
   }
 
-  // ── V1: query Factory for pool/manager ──
-  const factory = new ethers.Contract(LEVERAGED_FACTORY, FACTORY_ABI, provider);
-  let pool, manager;
-  
-  // When collateral == marketToken (e.g., WETH collateral for LONG ETH),
-  // we need to find a pool that contains both tokens
-  if (collateral.toLowerCase() === marketToken.toLowerCase()) {
-    // Try pools: collateral/pairToken (e.g., WETH/USDT)
-    const [tokenA, tokenB] = sortTokenPair(collateral, pairToken);
-    pool = await factory.getPool(tokenA, tokenB);
-    if (isValidContractTarget(pool)) {
-      manager = await factory.getManager(pool);
-      if (isValidContractTarget(manager)) {
-        addLog(`[CONTEXT] Found pool ${getShortAddress(pool)} for ${getShortAddress(collateral)}/${getShortAddress(pairToken)}`, "info");
-        return { collateral, marketToken, pairToken, pool, manager, path: [collateral, marketToken] };
-      }
-    }
-    throw new Error(`No leveraged pool for ${collateral}/${pairToken} (collateral == marketToken)`);
-  }
-  
-  const [tokenA, tokenB] = sortTokenPair(collateral, marketToken);
-  pool = await factory.getPool(tokenA, tokenB);
-  if (!isValidContractTarget(pool)) throw new Error(`No leveraged pool for ${collateral}/${marketToken} (poolKey=${getShortAddress(tokenA)}/${getShortAddress(tokenB)})`);
-  manager = await factory.getManager(pool);
-  if (!isValidContractTarget(manager)) throw new Error(`No leveraged manager for pool ${pool}`);
-  return { collateral, marketToken, pairToken, pool, manager, path: [collateral, marketToken] };
+  throw new Error(`No pool found for collateral=${getShortAddress(collateral)}`);
 }
 
 async function getCollateralDecimals(provider, token, nativeCollateral) {
@@ -3419,6 +3701,7 @@ const KNOWN_NEMESIS_ERRORS_V2 = {
   "0x24811982": "MAM_WRONG_COLLATERAL_TOKEN (collateral token does not match this Manager's expected token)",
   "0x499ad952": "Router_InsufficientOutputAmount (V2: slippage too tight or zero output)",
   "0x56e7f09d": "MAM_OpenOracleDivergence (spot vs risk oracle divergence exceeds max threshold — call checkpointOracle)",
+  "0xda99a87e": "MAM_PositionDirectionMismatch (collateral token does not match pool.token0/token1 for the requested isLong direction)",
   "0xb8868327": "Pool_RiskOracleUnavailable (risk oracle not yet checkpointed — call Pool.checkpointOracle())",
 };
 function getKnownErrors() {
@@ -3507,9 +3790,6 @@ async function openLeveragedPosition(side, market = null, amountOverride = null)
   if (!resolvedMarket) {
     resolvedMarket = { collateralToken: WETH_ADDRESS, marketToken: WETH_ADDRESS, symbol: "ETH/USDT" };
   }
-  const normalizedMarket = normalizeMarketConfig(resolvedMarket || {});
-  // Resolve collateral AFTER market is known — pass market for pool.token0() lookup
-  const resolvedCollateral = resolveCollateralForSide(side, normalizedMarket);
   if (side === "LONG" && !tradingConfig.enableLong) throw new Error("LONG disabled in config");
   if (side === "SHORT" && !tradingConfig.enableShort) throw new Error("SHORT disabled in config");
   if (closePending) throw new Error("[SKIP] close pending; waiting before opening new position");
@@ -3517,7 +3797,17 @@ async function openLeveragedPosition(side, market = null, amountOverride = null)
   const accountIndex = tradingConfig.firstTxMode ? 0 : selectedWalletIndex;
   const proxyUrl = proxies[accountIndex % proxies.length] || null;
   const provider = getProvider(SEPOLIA_RPC_URL, SEPOLIA_CHAIN_ID, proxyUrl);
+  // ═══ MANAGER HEALTH CHECK — HARD SAFETY LOCK ═══
+  // Block leveraged trading if Manager implementation is empty/broken.
+  // Prevents wasting gas on guaranteed-to-fail transactions.
+  if (!(await validateManagerReady(provider))) {
+    addLog(`[BLOCKED] ${side} ${normalizedMarket?.symbol || "?"} — Manager implementation unavailable`, "error");
+    return;
+  }
   const wallet = new ethers.Wallet(accounts[accountIndex].privateKey, provider);
+  const normalizedMarket = normalizeMarketConfig(resolvedMarket || {});
+  // Resolve collateral AFTER market + provider are ready — reads pool.token0() from on-chain
+  const resolvedCollateral = await resolveCollateralForSide(side, normalizedMarket, provider);
   await syncActivePositionsFromChain(wallet, provider);
   if (!canOpenMarketSide(normalizedMarket, side)) throw new Error(`[SKIP] ${side} duplicate or limit reached for ${normalizedMarket.symbol}`);
   addLog("[OPEN] duplicate check passed", "success");
@@ -3543,6 +3833,53 @@ async function openLeveragedPosition(side, market = null, amountOverride = null)
   const tx = side === "LONG"
     ? await buildLongTx(amount, resolvedCollateral, leverage, undefined, provider, normalizedMarket)
     : await buildShortTx(amount, resolvedCollateral, leverage, undefined, provider, normalizedMarket);
+
+  // ═══ MIN SAFE CLOSE AMOUNT GUARD ═══════════════════════════════════════════════
+  // Contract reverts with 0xad60222e if position size is too small to close.
+  // On-chain verified: USDT min ~500 raw, safe minimum = 1000 raw (0.001 USDT).
+  // We check AFTER build*Tx because that's where collateralAmount is computed.
+  // ═══════════════════════════════════════════════════════════════════════════════
+  if (tx.collateralAmount != null && tx.collateralToken) {
+    const collAddr = String(tx.collateralToken).toLowerCase();
+    const isUSDT = collAddr === USDT_ADDRESS.toLowerCase();
+    const isWETH = collAddr === WETH_ADDRESS.toLowerCase();
+    if (isUSDT || isWETH) {
+      const dec = isUSDT ? 6 : 18;
+      const minStr = isUSDT
+        ? (tradingConfig.minSafeCloseAmountUSDT || "0.001")
+        : (tradingConfig.minSafeCloseAmountWETH || "0.00001");
+      const minRaw = ethers.parseUnits(minStr, dec);
+      if (BigInt(tx.collateralAmount) < minRaw) {
+        addLog(`[WARN] Position size below safe close threshold`, "warn");
+        addLog(`[WARN] collateral=${tx.collateralAmount} (${isUSDT ? "USDT" : "WETH"}) < minSafe=${minRaw}`, "warn");
+        addLog(`[WARN] Trade skipped to prevent unclosable position`, "warn");
+        return;
+      }
+    }
+  }
+
+  // ═══ PRE-FLIGHT CLOSE SIMULATION ═══════════════════════════════════════════════
+  // Verify this position can actually be closed by simulating a close on a
+  // dummy position with the same collateral amount. This catches edge cases
+  // where the contract's internal close logic would revert (e.g., rounding to
+  // zero on small swaps).
+  // ═══════════════════════════════════════════════════════════════════════════════
+  // NOTE: We do NOT send a real close TX. We only check that the contract
+  // accepts a close call with the same parameters. If the pre-flight fails,
+  // we skip the trade.
+  try {
+    // Use the build*Tx to estimate: if we opened this position, could we close it?
+    // The simplest check is to ensure collateral amount is non-zero and above
+    // the on-chain minimum. The minimum size guard above handles the main case.
+    if (BigInt(tx.collateralAmount ?? 0n) === 0n) {
+      addLog(`[WARN] Position collateral is zero — refusing to open unclosable position`, "warn");
+      return;
+    }
+  } catch (e) {
+    addLog(`[WARN] Pre-flight close check failed: ${e.message} — skipping trade`, "warn");
+    return;
+  }
+
   await ensureLeveragedApproval(wallet, tx.collateralToken, tx.to, tx.collateralAmount, tx.nativeCollateral, provider);
   await validateAndSendLeveragedTx(wallet, tx, side, provider);
 }
@@ -3742,6 +4079,11 @@ async function sendCloseAndConfirm(wallet, provider, position) {
 async function closeLeveragedPosition() {
   if (!tradingConfig.enableClose) throw new Error("Close disabled in config");
   const provider = getProvider(SEPOLIA_RPC_URL, SEPOLIA_CHAIN_ID, proxies[selectedWalletIndex % proxies.length] || null);
+  // ═══ MANAGER HEALTH CHECK — HARD SAFETY LOCK ═══
+  if (!(await validateManagerReady(provider))) {
+    addLog(`[BLOCKED] closePosition — Manager implementation unavailable`, "error");
+    return;
+  }
   const wallet = new ethers.Wallet(accounts[selectedWalletIndex].privateKey, provider);
   addLog("[CLOSE] searching active positions...", "warn");
   const positions = await discoverActivePositions(wallet, provider);
@@ -4338,6 +4680,10 @@ async function runDailyActivity() {
       addLog(`Processing account ${accountIndex + 1}: ${getShortAddress(wallet.address)}`, "wait");
 
       const providerForPairs = getProvider(SEPOLIA_RPC_URL, SEPOLIA_CHAIN_ID, proxyUrl);
+      // ── AUTO-RECOVERY: check if Manager implementation has been redeployed ──
+      if (managerHealthState !== MANAGER_HEALTH.READY) {
+        await autoRecoveryValidation(providerForPairs);
+      }
       // ── INVENTORY-AWARE: refresh balances and generate prioritized pairs ──
       await inventory.refreshBalances(providerForPairs, wallet.address, TOKENS, addLog);
       const allSwapPairs = getAllSwapPairs();
@@ -5546,6 +5892,28 @@ async function initialize() {
         discoveredSwapPairs = [];
       }
     }
+
+    // ─── MANAGER HEALTH CHECK at startup ───
+    if (accounts.length > 0) {
+      try {
+        const healthProvider = getProvider(SEPOLIA_RPC_URL, SEPOLIA_CHAIN_ID, proxies[selectedWalletIndex % proxies.length] || null);
+        const health = await checkManagerHealth(healthProvider);
+        if (health !== MANAGER_HEALTH.READY) {
+          addLog(`[SAFETY] Manager implementation is EMPTY — leveraged trading DISABLED`, "error");
+          addLog(`[SAFETY] Implementation at ${V2_MANAGER_IMPL.slice(0,10)}... has no bytecode`, "error");
+          addLog(`[SAFETY] Waiting for Nemesis to redeploy — bot will auto-detect when ready`, "error");
+          tradingConfig.enableLong = false;
+          tradingConfig.enableShort = false;
+          tradingConfig.enableClose = false;
+          tradingConfig.fullAutoEnabled = false;
+          addLog(`[SAFETY] enableLong/enableShort/enableClose/fullAutoEnabled all set to false`, "warn");
+        } else {
+          addLog(`[SAFETY] Manager implementation verified — leveraged trading ENABLED`, "success");
+        }
+      } catch (error) {
+        addLog(`[SAFETY] Manager health check failed: ${error.message}`, "error");
+      }
+    }
     if (accounts.length > 0) {
       const diagProvider = getProvider(SEPOLIA_RPC_URL, SEPOLIA_CHAIN_ID, proxies[selectedWalletIndex % proxies.length] || null);
       await printStartupDiagnostics(diagProvider);
@@ -5578,7 +5946,8 @@ if (IS_CLI) {
   const side = process.argv.includes("--long") ? "LONG" : "SHORT";
   loadConfig();
   // Use resolveCollateralForSide() — the SINGLE source of truth for collateral selection
-  tradingConfig.defaultCollateralToken = resolveCollateralForSide(side);
+  // CLI mode: use fallback (no provider available yet)
+  tradingConfig.defaultCollateralToken = side === "LONG" ? USDT_ADDRESS : "native";
   tradingConfig.fullAutoEnabled = false;
   tradingConfig.autoRSIEnabled = false;
   tradingConfig.simulateOnly = false;

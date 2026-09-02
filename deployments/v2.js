@@ -76,45 +76,44 @@ export const V2_PROFILE = {
     returnsHealthFactor: true,
   },
 
-  // V2 known markets (from subgraph — 22 pools discovered)
+  // V2 known markets (from Factory on-chain audit 2026-08-27)
+  // NOTE: poolToken0 is read on-chain from pool.token0() — do NOT hardcode.
+  // The values below are for reference only; the bot reads them dynamically.
   knownMarkets: [
-    { symbol: "NEMESIS/USDT", collateralToken: "0x18D18A40614b6d8C6154309F517acf9829308842", collateralSymbol: "NEMESIS", collateralDecimals: 6, poolToken0: "0x18D18A40614b6d8C6154309F517acf9829308842" },
-    { symbol: "ETH/USDT",     collateralToken: "0x7b79995e5f793A07Bc00c21412e50Ecae098E7f9", collateralSymbol: "ETH",     collateralDecimals: 18, poolToken0: "0x5f2E83cCDEa73D60aF400e03F1Cd8Fb9eaB07b20" },
-    { symbol: "DAI/USDT",     collateralToken: "0xa3215a5cA659e0Bd57c0B33d5EAD71901A24d3d6", collateralSymbol: "DAI",     collateralDecimals: 6, poolToken0: "0xa3215a5cA659e0Bd57c0B33d5EAD71901A24d3d6" },
-    { symbol: "USDC/USDT",    collateralToken: "0x5dcf1Db10F87CB7839640F9B85C4ECfA29b56e80", collateralSymbol: "USDC",    collateralDecimals: 6, poolToken0: "0x5dcf1Db10F87CB7839640F9B85C4ECfA29b56e80" },
-    { symbol: "UNI/USDT",     collateralToken: "0xEaBEcd70AC3330d65e09e429824C49d0D8812952", collateralSymbol: "UNI",     collateralDecimals: 6, poolToken0: "0xEaBEcd70AC3330d65e09e429824C49d0D8812952" },
-    { symbol: "LINK/USDT",    collateralToken: "0x1132087D2D97b55E5fe1B0FcA7b99348B5f07e28", collateralSymbol: "LINK",    collateralDecimals: 6, poolToken0: "0x1132087D2D97b55E5fe1B0FcA7b99348B5f07e28" },
+    { symbol: "NEMESIS/USDT", collateralToken: "0x18D18A40614b6d8C6154309F517acf9829308842", collateralSymbol: "NEMESIS", collateralDecimals: 6 },
+    { symbol: "ETH/USDT",     collateralToken: "0x7b79995e5f793A07Bc00c21412e50Ecae098E7f9", collateralSymbol: "ETH",     collateralDecimals: 18 },
+    { symbol: "DAI/USDT",     collateralToken: "0xa3215a5cA659e0Bd57c0B33d5EAD71901A24d3d6", collateralSymbol: "DAI",     collateralDecimals: 6 },
+    { symbol: "USDC/USDT",    collateralToken: "0x5dcf1Db10F87CB7839640F9B85C4ECfA29b56e80", collateralSymbol: "USDC",    collateralDecimals: 6 },
+    { symbol: "UNI/USDT",     collateralToken: "0xEaBEcd70AC3330d65e09e429824C49d0D8812952", collateralSymbol: "UNI",     collateralDecimals: 6 },
+    { symbol: "LINK/USDT",    collateralToken: "0x1132087D2D97b55E5fe1B0FcA7b99348B5f07e28", collateralSymbol: "LINK",    collateralDecimals: 6 },
   ],
 
-  // V2 confirmed pools (from E2E on-chain verification — all 6 pools verified healthy)
+  // V2 confirmed pools (from Factory on-chain audit 2026-08-27)
+  // These are FALLBACK addresses — the bot always prefers Factory.getPool() results.
   confirmedPools: {
-    "NEMESIS/USDT": {
-      pool:    "0xE3a38CD42c196cC8d0dfF9B17b23963451Ccd56c",
-      manager: "0x8cb04f6156b0f1aba1665a1f070f06d295789f87",
-    },
     "ETH/USDT": {
       pool:    "0xb0ef1Fc1AB4365F1705c259227582355C03276dd",
-      manager: "0x3a0856852516ef5e6f8994c44a7ec36c2af98de7",
+      manager: "0x3a0856852516eF5E6f8994c44a7eC36c2af98dE7",
     },
-    "DAI/USDT": {
-      pool:    "0x5334eBf8D6C0A8f8e8F1C2E3D4A5B6C7D8E9F0a1",
-      manager: "0x24A54B41d3a9C7E6F8B0D2E4A1C3B5D7F9E2A4c6",
+    "NEMESIS/USDT": {
+      pool:    "0xE3a38CD42c196cC8d0dfF9B17b23963451Ccd56c",
+      manager: "0x8cB04f6156B0F1aBA1665A1F070F06d295789F87",
     },
     "USDC/USDT": {
-      pool:    "0x81EBBaeb7B2C4D5E6F7a8B9C0D1E2F3a4B5C6D7e",
-      manager: "0x900aC0cE1D2E3F4a5B6C7D8E9F0a1B2C3D4E5F60",
+      pool:    "0x81EBBaeb9e4A967Bdf93DD90849f0fB735a63Fc0",
+      manager: "0x900aC0cE0834CeC50f2BC4189861Ec26E601A52D",
     },
     "UNI/USDT": {
-      pool:    "0x8FcB1B1C2D3E4F5a6B7C8D9E0F1a2B3C4D5E6F70",
-      manager: "0xcAf433B94D5E6F7a8B9C0D1E2F3a4B5C6D7E8F90",
+      pool:    "0x8FcB1B1C4db8dfcF60c4A237B2ccb97c9F16b80B",
+      manager: "0xcAf433B95CffE46934Df8a0ffA1BC507Cde85817",
+    },
+    "DAI/USDT": {
+      pool:    "0x5334eBf8e139EB574DD781e5Ad390de9C3f3A91E",
+      manager: "0x24A54B4129d2E70Bef948F2DAf8FbFc505706dc1",
     },
     "LINK/USDT": {
-      pool:    "0xFf9343091A2B3C4D5E6F7a8B9C0D1E2F3a4B5C6D",
-      manager: "0x077036b34D5E6F7a8B9C0D1E2F3a4B5C6D7E8F90",
-    },
-    "USDT/WETH": {
-      pool:    "0xb0ef1Fc1AB4365F1705c259227582355C03276dd",
-      manager: "0x3a0856852516ef5e6f8994c44a7ec36c2af98de7",
+      pool:    "0xFf934309981CB59828D6048D5670Df5145028b2a",
+      manager: "0x077036b3f02D31B94c82f50acbe2d50B6CCe81d8",
     },
   },
 
