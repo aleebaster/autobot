@@ -4,7 +4,12 @@
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "auto": "node auto.js",
+    "auto:dry": "node auto.js --dry-run",
+    "auto:once": "node auto.js --once",
+    "auto:once:2x": "node auto.js --once --leverage=2",
+    "auto:once:3x": "node auto.js --once --leverage=3"
   },
   "keywords": [],
   "author": "VinzSenzoo",

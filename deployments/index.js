@@ -76,11 +76,16 @@ export async function autoDetectDeployment(provider) {
   try {
     const { ethers } = await import("ethers");
 
-    // Check V2 Factory first (0x28e90C39CF9f65fc24000B563EFDEBB81a730a11)
+    // Check NEW V2 Factory first (0xdED3D3CA2F7eFDE734790ce51bD03D5145E4830B)
+    // This is the active deployment confirmed by reference manual tx 0x47b31...
+    const newV2FactoryCode = await provider.getCode("0xdED3D3CA2F7eFDE734790ce51bD03D5145E4830B");
+    if (newV2FactoryCode && newV2FactoryCode !== "0x" && newV2FactoryCode.length > 10) {
+      return "v2";
+    }
+
+    // Check OLD V2 Factory (0x28e90C39CF9f65fc24000B563EFDEBB81a730a11)
     const v2FactoryCode = await provider.getCode("0x28e90C39CF9f65fc24000B563EFDEBB81a730a11");
     if (v2FactoryCode && v2FactoryCode !== "0x" && v2FactoryCode.length > 10) {
-      // V2 Factory exists — check if it has V2-style pools
-      // V2 pools have 23326 chars code (V1 had 23132)
       return "v2";
     }
 
