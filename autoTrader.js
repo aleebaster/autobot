@@ -729,74 +729,52 @@ export class AutoTrader {
 
       this.log("[STATE] ═══ CYCLE START ═══", "info");
 
-      // ── Step 1: On-chain position verification (always, even if local state says active) ──
+      // ═══ PHASE 1: If active position → CLOSE immediately ═══
       if (this.state.activePosition) {
-        this.setState(STATES.MONITOR);
-        this.log(`[STATE] MONITOR position #${this.state.activePosition.positionId} side=${this.state.activePosition.side}`, "info");
+        this.setState(STATES.CLOSE);
+        this.log(`[STATE] CLOSE position #${this.state.activePosition.positionId} (${this.state.activePosition.side})`, "warn");
 
-        // Check exit signal
-        const rsi = await fetchRSI(this.config.rsiPair);
+        const closeResult = await closePositionFn({
+          wallet, provider, managerAddr,
+          positionId: this.state.activePosition.positionId,
+          config: this.config, log: this.log.bind(this), dryRun,
+        });
 
-        if (rsi !== null && getExitSignal(rsi, this.state.activePosition.side, this.config)) {
-          this.setState(STATES.EXIT_SIGNAL);
-          this.log(`[STATE] EXIT_SIGNAL: RSI=${rsi} → closing`, "warn");
+        if (closeResult?.failed) {
+          this.log(`[WARN] Close failed — clearing state`, "warn");
+          this.state.activePosition = null;
+          this.state.sessionStats.closes++;
+          saveState(this.state);
+        } else if (closeResult) {
+          this.log(`[STATE] CLOSE SUCCESS TX: ${closeResult.txHash || "dry-run"}`, "success");
+          this.state.activePosition = null;
+          this.state.sessionStats.closes++;
+          saveState(this.state);
 
-          this.setState(STATES.CLOSE);
-          const closeResult = await closePositionFn({
-            wallet, provider, managerAddr,
-            positionId: this.state.activePosition.positionId,
-            config: this.config, log: this.log.bind(this), dryRun,
-          });
-
-          if (closeResult?.failed) {
-            // FIX #3: Close pre-flight failed — position may no longer exist
-            this.log(`[WARN] Position may be already closed — clearing state`, "warn");
-            this.state.activePosition = null;
-            this.state.sessionStats.closes++;
-            saveState(this.state);
-          } else if (closeResult) {
-            this.log(`[STATE] CLOSE SUCCESS TX: ${closeResult.txHash || "dry-run"}`, "success");
-            this.state.activePosition = null;
-            this.state.sessionStats.closes++;
-            saveState(this.state);
-
-            this.setState(STATES.COOLDOWN);
-            this.log(`[STATE] COOLDOWN ${this.config.cooldownAfterCloseMs / 1000}s...`, "info");
-            await this.sleep(this.config.cooldownAfterCloseMs);
-          } else {
-            // Close failed — position still active, try again next cycle
-            this.log(`[WARN] Close failed — will retry next cycle`, "warn");
-          }
+          this.setState(STATES.COOLDOWN);
+          this.log(`[STATE] COOLDOWN ${this.config.cooldownAfterCloseMs / 1000}s...`, "info");
+          await this.sleep(this.config.cooldownAfterCloseMs);
         } else {
-          this.log(`[STATE] Holding. RSI=${rsi ?? "N/A"}`, "info");
+          this.log(`[WARN] Close failed — will retry next cycle`, "warn");
         }
-
-        return;
+        // After close → fall through to SELECT_DIRECTION + OPEN
       }
 
-      // ── Step 2: No active position → get signal ──
+      // ═══ PHASE 2: SELECT DIRECTION (alternate LONG/SHORT) ═══
       this.setState(STATES.SIGNAL);
-      const rsi = await fetchRSI(this.config.rsiPair);
-      const signal = getSignal(rsi, this.config);
-      this.log(`[STATE] SIGNAL: ${signal} (RSI=${rsi ?? "N/A"})`, signal === "WAIT" ? "info" : "warn");
+      const lastSide = this.state.lastSide || null;
+      const side = lastSide === "LONG" ? "SHORT" : "LONG";
+      this.log(`[STATE] DIRECTION: ${side} (alternating)`, "warn");
 
-      if (signal === "WAIT") {
-        this.setState(STATES.WAIT);
-        this.log("[STATE] WAIT — no trade", "info");
-        return;
-      }
-
-      // ── Step 3: Determine collateral (FIXED TARGET, not % of balance) ──
       this.setState(STATES.PREPARE_COLLATERAL);
-      const side = signal;
       const collateralToken = side === "LONG" ? USDT : WETH;
       const collateralDecimals = side === "LONG" ? 6 : 18;
       const collateralSym = side === "LONG" ? "USDT" : "WETH";
 
-      // FIXED target — independent of current balance
+      // Fixed testnet collateral
       const targetStr = side === "LONG"
-        ? (this.config.targetCollateralUSDT || "10")
-        : (this.config.targetCollateralWETH || "0.002");
+        ? (this.config.targetCollateralUSDT || "1")
+        : (this.config.targetCollateralWETH || "0.0002");
       const collateralAmount = side === "LONG"
         ? ethers.parseUnits(targetStr, 6)
         : ethers.parseEther(targetStr);
@@ -848,7 +826,9 @@ export class AutoTrader {
       });
 
       if (openResult?.dryRun) {
-        this.log(`[DRY] Open would execute — no state change`, "info");
+        this.log(`[DRY] Open would execute`, "info");
+        this.state.lastSide = side;
+        saveState(this.state);
       } else if (openResult) {
         this.state.activePosition = {
           positionId: openResult.positionId,
@@ -859,15 +839,18 @@ export class AutoTrader {
           openedAt: Date.now(),
           txHash: openResult.txHash,
         };
+        this.state.lastSide = side;
         this.state.sessionStats.opens++;
         saveState(this.state);
 
         this.setState(STATES.MONITOR);
-        this.log(`[STATE] MONITOR position #${openResult.positionId}`, "success");
+        this.log(`[STATE] MONITOR position #${openResult.positionId} (${side})`, "success");
 
-        this.setState(STATES.COOLDOWN);
+        // Brief cooldown → next cycle will CLOSE it
         this.log(`[STATE] COOLDOWN ${this.config.cooldownAfterOpenMs / 1000}s...`, "info");
         await this.sleep(this.config.cooldownAfterOpenMs);
+      } else {
+        this.log(`[BLOCKED] Open failed — skipping cycle`, "error");
       }
 
       this.log("[STATE] ═══ CYCLE END ═══", "info");
