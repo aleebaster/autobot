@@ -647,7 +647,11 @@ async function stopAutoTrading() {
 //  MENU HANDLER
 // ═══════════════════════════════════════════════════════════════════════════
 
+let _menuSelectLock = false;
 menuBox.on("select", async (item, index) => {
+  if (_menuSelectLock) return;
+  _menuSelectLock = true;
+  setTimeout(() => { _menuSelectLock = false; }, 500);
   const label = item.getText();
   if (label.includes("Start Full Auto")) {
     await startAutoTrading();
@@ -673,7 +677,7 @@ menuBox.on("select", async (item, index) => {
 
 screen.key(["up"], () => { if (screen.focused === menuBox) menuBox.moveSelection(-1); safeRender(); });
 screen.key(["down"], () => { if (screen.focused === menuBox) menuBox.moveSelection(1); safeRender(); });
-screen.key(["enter"], () => { if (screen.focused === menuBox) { const idx = menuBox.selected; const item = menuBox.items[idx]; menuBox.emit("select", item, idx); } });
+// Enter is handled natively by blessed List.enterSelected() — no custom handler needed
 screen.key(["q", "C-c"], async () => {
   if (autoRunning && autoTrader) autoTrader.stop();
   process.exit(0);
