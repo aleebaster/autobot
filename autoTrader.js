@@ -131,6 +131,35 @@ async function getFeeParams(provider) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+//  INVENTORY LOGGING — full token balances at cycle start
+// ═══════════════════════════════════════════════════════════════════════════
+
+async function logInventory(provider, walletAddr, log = () => {}) {
+  const tokens = [
+    { sym: "ETH", addr: null, decimals: 18, type: "native" },
+    { sym: "USDT", addr: USDT, decimals: 6 },
+    { sym: "WETH", addr: WETH, decimals: 18 },
+    { sym: "USDC", addr: USDC, decimals: 6 },
+  ];
+  const lines = [];
+  for (const t of tokens) {
+    try {
+      let bal;
+      if (t.type === "native") {
+        bal = await provider.getBalance(walletAddr);
+      } else {
+        const c = new ethers.Contract(t.addr, ["function balanceOf(address) view returns (uint256)"], provider);
+        bal = await c.balanceOf(walletAddr);
+      }
+      lines.push(`${t.sym}=${ethers.formatUnits(bal, t.decimals)}`);
+    } catch {
+      lines.push(`${t.sym}=ERR`);
+    }
+  }
+  log(`[INVENTORY] ${lines.join(" | ")}`, "info");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 //  STATE MACHINE
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -447,10 +476,11 @@ async function ensureCollateral({ wallet, provider, side, collateralAmount, conf
   const sym = side === "LONG" ? "USDT" : "WETH";
   const tokenContract = new ethers.Contract(collateralToken, ERC20_ABI, provider);
   const balance = await tokenContract.balanceOf(walletAddr);
+  const routerAddr = "0x8f6eB7870334b1FD8006Fd52413f01689f4E57e9";
 
   log(`[SWAP-DEBUG] requiredCollateral=${ethers.formatUnits(collateralAmount, decimals)} ${sym}`, "info");
   log(`[SWAP-DEBUG] currentCollateral=${ethers.formatUnits(balance, decimals)} ${sym}`, "info");
-  log(`[SWAP-DEBUG] router=${routerAddr || "0x8f6eB7870334b1FD8006Fd52413f01689f4E57e9"}`, "info");
+  log(`[SWAP-DEBUG] router=${routerAddr}`, "info");
 
   if (balance >= collateralAmount) {
     log(`[COLLATERAL] SUFFICIENT — no swap needed`, "success");
@@ -468,7 +498,6 @@ async function ensureCollateral({ wallet, provider, side, collateralAmount, conf
   log(`[COLLATERAL] INSUFFICIENT — deficit=${ethers.formatUnits(deficit, decimals)} ${sym}`, "warn");
 
   const sources = side === "LONG" ? LONG_SOURCES : SHORT_SOURCES;
-  const routerAddr = "0x8f6eB7870334b1FD8006Fd52413f01689f4E57e9";
   const router = new ethers.Contract(routerAddr, ROUTER_ABI, provider);
 
   for (const sourceToken of sources) {
@@ -522,21 +551,26 @@ async function ensureCollateral({ wallet, provider, side, collateralAmount, conf
     }
   }
 
-  // Last resort: ETH → WETH
+  // Last resort: ETH → WETH (wrap only the deficit, not all ETH)
   if (side === "SHORT") {
-    const ethBalance = await provider.getBalance(walletAddr);
-    const gasReserve = ethers.parseEther(String(config.ethGuard?.MIN_ETH_GAS_RESERVE || 0.003));
-    const ethAvail = ethBalance - gasReserve - ethers.parseEther("0.005");
-    if (ethAvail > ethers.parseEther("0.001")) {
-      log(`[SWAP] Last resort: ETH → WETH (${ethers.formatEther(ethAvail)} available)`, "warn");
-      const wethContract = new ethers.Contract(WETH, ["function deposit() payable", "function balanceOf(address) view returns (uint256)"], wallet);
-      const wrapTx = await wethContract.deposit({ value: ethAvail, gasLimit: 100000n });
-      await wrapTx.wait();
-      log(`[SWAP] Wrapped ${ethers.formatEther(ethAvail)} ETH → WETH`, "success");
-      const wethBal = await new ethers.Contract(WETH, ERC20_ABI, provider).balanceOf(walletAddr);
-      if (wethBal >= collateralAmount) {
-        log(`[COLLATERAL] VERIFIED — WETH sufficient after wrap`, "success");
-        return true;
+    const currentWethBal = await new ethers.Contract(WETH, ERC20_ABI, provider).balanceOf(walletAddr);
+    const remainingDeficit = collateralAmount > currentWethBal ? collateralAmount - currentWethBal : 0n;
+    if (remainingDeficit > 0n) {
+      const ethBalance = await provider.getBalance(walletAddr);
+      const gasReserve = ethers.parseEther(String(config.ethGuard?.MIN_ETH_GAS_RESERVE || 0.003));
+      const ethAvail = ethBalance - gasReserve - ethers.parseEther("0.005");
+      const wrapAmount = remainingDeficit > ethAvail ? ethAvail : remainingDeficit;
+      if (wrapAmount > ethers.parseEther("0.0001")) {
+        log(`[SWAP] Last resort: ETH → WETH: wrapping ${ethers.formatEther(wrapAmount)} (deficit=${ethers.formatEther(remainingDeficit)}, available=${ethers.formatEther(ethAvail)})`, "warn");
+        const wethContract = new ethers.Contract(WETH, ["function deposit() payable", "function balanceOf(address) view returns (uint256)"], wallet);
+        const wrapTx = await wethContract.deposit({ value: wrapAmount, gasLimit: 100000n });
+        await wrapTx.wait();
+        log(`[SWAP] Wrapped ${ethers.formatEther(wrapAmount)} ETH → WETH`, "success");
+        const wethBal = await new ethers.Contract(WETH, ERC20_ABI, provider).balanceOf(walletAddr);
+        if (wethBal >= collateralAmount) {
+          log(`[COLLATERAL] VERIFIED — WETH sufficient after wrap`, "success");
+          return true;
+        }
       }
     }
   }
@@ -877,6 +911,9 @@ export class AutoTrader {
 
       this.log("[CYCLE] ═══ CYCLE START ═══", "info");
 
+      // Log full token inventory
+      await logInventory(provider, walletAddr, this.log.bind(this));
+
       // PHASE 1: If active position → CLOSE
       if (this.state.activePosition) {
         this.setState(STATES.CLOSE);
@@ -943,33 +980,76 @@ export class AutoTrader {
 
       const tokenContract = new ethers.Contract(collateralToken, ERC20_ABI, provider);
       const balance = await tokenContract.balanceOf(walletAddr);
-      this.log(`[COLLATERAL] target=${collateralSym} required=${ethers.formatUnits(collateralAmount, collateralDecimals)} balance=${ethers.formatUnits(balance, collateralDecimals)}`, "info");
 
+      // Inventory-aware collateral check
       if (collateralAmount <= 0n) {
         this.log(`[BLOCKED] Invalid collateral target`, "error");
         return;
       }
 
-      // Swap if needed
       if (balance >= collateralAmount) {
-        this.log(`[COLLATERAL] SUFFICIENT — no swap needed`, "success");
+        // COLLATERAL REQUIREMENT satisfied — check INVENTORY REBALANCE
+        const ratio = balance * 100n / collateralAmount;
+        this.log(`[COLLATERAL] target=${collateralSym} required=${ethers.formatUnits(collateralAmount, collateralDecimals)} balance=${ethers.formatUnits(balance, collateralDecimals)} ratio=${Number(ratio)}%`, "info");
+
+        if (ratio < 200n) {
+          // Balance is between 1x-2x required — LOW reserve, check if inventory has excess to top up
+          this.log(`[COLLATERAL] LOW reserve (${Number(ratio)}% of 2x target) — checking inventory for top-up`, "warn");
+          const sources = side === "LONG" ? LONG_SOURCES : SHORT_SOURCES;
+          let toppedUp = false;
+          for (const sourceToken of sources) {
+            const sourceContract = new ethers.Contract(sourceToken, ERC20_ABI, provider);
+            const sourceBalance = await sourceContract.balanceOf(walletAddr);
+            const sourceDecimals = sourceToken === WETH ? 18 : 6;
+            const sourceSym = sourceToken === USDT ? "USDT" : sourceToken === USDC ? "USDC" : "WETH";
+            const targetDeficit = collateralAmount * 2n - balance; // gap to 2x target
+            if (sourceBalance > targetDeficit * 2n && targetDeficit > 0n) {
+              const swapAmount = targetDeficit; // top up to 2x target
+              this.log(`[INVENTORY-TOPUP] source=${sourceSym} balance=${ethers.formatUnits(sourceBalance, sourceDecimals)} swap=${ethers.formatUnits(swapAmount, sourceDecimals)} → ${collateralSym}`, "warn");
+              if (!dryRun) {
+                const topUpOk = await executeSwap({
+                  wallet, provider, fromToken: sourceToken, toToken: collateralToken,
+                  amount: swapAmount, amountOutMin: targetDeficit * 95n / 100n, config: this.config, log: this.log.bind(this),
+                });
+                if (topUpOk) {
+                  const newBal = await tokenContract.balanceOf(walletAddr);
+                  this.log(`[INVENTORY-TOPUP] balance_after=${ethers.formatUnits(newBal, collateralDecimals)} ${collateralSym}`, "success");
+                  toppedUp = true;
+                  break;
+                }
+              } else {
+                this.log(`[DRY] Would top-up ${collateralSym} from ${sourceSym}`, "info");
+                toppedUp = true;
+                break;
+              }
+            }
+          }
+          if (!toppedUp) {
+            this.log(`[COLLATERAL] No inventory excess available for top-up — proceeding with current balance`, "info");
+          }
+        } else {
+          this.log(`[COLLATERAL] ADEQUATE reserve (${Number(ratio)}%) — no top-up needed`, "success");
+        }
       } else {
+        // COLLATERAL DEFICIT — must swap from inventory
         this.setState(STATES.SWAP);
-        this.log(`[SWAP] needed for collateral`, "warn");
+        const deficit = collateralAmount - balance;
+        this.log(`[COLLATERAL] DEFICIT target=${collateralSym} required=${ethers.formatUnits(collateralAmount, collateralDecimals)} balance=${ethers.formatUnits(balance, collateralDecimals)} deficit=${ethers.formatUnits(deficit, collateralDecimals)}`, "warn");
+        this.log(`[SWAP] searching inventory for source tokens...`, "warn");
         const swapOk = await ensureCollateral({
           wallet, provider, side, collateralAmount, config: this.config,
           log: this.log.bind(this), dryRun,
         });
         if (!swapOk) {
-          this.log(`[BLOCKED] Cannot obtain collateral. Skipping.`, "error");
+          this.log(`[BLOCKED] Cannot obtain collateral from inventory. Skipping.`, "error");
           return;
         }
         const postSwapBalance = await tokenContract.balanceOf(walletAddr);
         if (postSwapBalance < collateralAmount) {
-          this.log(`[BLOCKED] Collateral still insufficient after swap`, "error");
+          this.log(`[BLOCKED] Collateral still insufficient after swap: have ${ethers.formatUnits(postSwapBalance, collateralDecimals)}, need ${ethers.formatUnits(collateralAmount, collateralDecimals)}`, "error");
           return;
         }
-        this.log(`[COLLATERAL] Post-swap balance: ${ethers.formatUnits(postSwapBalance, collateralDecimals)} ${collateralSym}`, "success");
+        this.log(`[COLLATERAL] AFTER SWAP target=${collateralSym} balance=${ethers.formatUnits(postSwapBalance, collateralDecimals)}`, "success");
       }
 
       // PHASE 4: OPEN

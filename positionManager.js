@@ -29,7 +29,7 @@ const CLOSE_POSITION_SELECTOR = "0xb35648d7";  // closePosition(uint256,uint256,
 const NONCES_SELECTOR = "0x7ecebe00";
 
 const MANAGER_ABI = [
-  "function openPosition(bool isLong, address collateralToken, uint256 collateralAmount, uint256 amountOutMin, uint256 leverage, uint256 size, uint256 deadline) returns (uint256)",
+  "function openPosition(bool isLong, address collateralToken, uint256 collateralAmount, uint256 borrowAmount, uint256 leverageX10, uint256 amountOutMin, uint256 deadline) returns (uint256)",
   "function closePosition(uint256 positionId, uint256 amountOutMin, uint256 deadline)",
   "function nonces(address user) view returns (uint256)",
   "function balanceOf(address account) view returns (uint256)",
@@ -203,15 +203,12 @@ export async function validatePositionParams({
 /**
  * Open a leveraged position via the Manager contract.
  *
- * Flow:
- * 1. Validate parameters
- * 2. Ensure ERC20 approval for collateral token → Manager
- * 3. Encode calldata (openPosition selector + params)
- * 4. Pre-flight call (eth_call)
- * 5. Estimate gas
- * 6. Send transaction
- * 7. Wait for confirmation
- * 8. Verify LP token receipt
+ * NOTE: The contract ABI is:
+ *   openPosition(bool isLong, address collateralToken, uint256 collateralAmount,
+ *                uint256 borrowAmount, uint256 leverageX10, uint256 amountOutMin, uint256 deadline)
+ *
+ * The `amountOutMin` parameter here is used as the amountOutMin in the contract.
+ * The `borrowAmount` is computed from the leverage (for 2x: borrowAmount = collateralAmount).
  *
  * @param {Object} params
  * @param {ethers.Wallet} params.wallet
@@ -220,7 +217,7 @@ export async function validatePositionParams({
  * @param {string} params.collateralToken
  * @param {ethers.BigNumberish} params.collateralAmount
  * @param {boolean} params.isLong — true=LONG, false=SHORT
- * @param {number} params.leverage — 1-5
+ * @param {number} params.leverage — 1-5 (will be multiplied by 10 for encoding)
  * @param {ethers.BigNumberish} params.amountOutMin — slippage protection (0 = any)
  * @param {string} params.poolAddress
  * @param {Function} params.getFeeParams
@@ -259,14 +256,18 @@ export async function openPosition({
     log(`[POS] Approve confirmed`, "success");
   }
 
-  // 3. Encode calldata
-  const deadline = Math.floor(Date.now() / 1000) + 1200; // 20 minutes
+  // 3. Compute borrowAmount from leverage
+  // For leverageX10: 20=2x, 30=3x, etc. borrowAmount = collateral * (leverageX10 - 10) / 10
+  const leverageX10 = BigInt(leverage) * 10n;
+  const borrowAmount = collateralAmount * (leverageX10 - 10n) / 10n;
 
-  // Build the 7-param calldata
+  // 4. Encode calldata — CORRECT parameter order
+  const deadline = Math.floor(Date.now() / 1000) + 1200;
+
   const coder = ethers.AbiCoder.defaultAbiCoder();
   const params = coder.encode(
     ["bool", "address", "uint256", "uint256", "uint256", "uint256", "uint256"],
-    [isLong, collateralToken, collateralAmount, amountOutMin, leverage, collateralAmount, deadline]
+    [isLong, collateralToken, collateralAmount, borrowAmount, leverageX10, amountOutMin, BigInt(deadline)]
   );
   const calldata = OPEN_POSITION_SELECTOR + params.slice(2);
 
