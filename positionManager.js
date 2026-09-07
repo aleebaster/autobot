@@ -261,13 +261,15 @@ export async function openPosition({
   const leverageX10 = BigInt(leverage) * 10n;
   const borrowAmount = collateralAmount * (leverageX10 - 10n) / 10n;
 
-  // 4. Encode calldata — CORRECT parameter order
+  // 4. Encode calldata — CORRECT parameter order per on-chain Manager ABI:
+  // openPosition(isLong, collateralToken, collateralAmount, amountOutMin, leverage, size, deadline)
+  // size=0: contract uses collateralAmount internally (required for USDT 6-decimal collateral)
   const deadline = Math.floor(Date.now() / 1000) + 1200;
 
   const coder = ethers.AbiCoder.defaultAbiCoder();
   const params = coder.encode(
     ["bool", "address", "uint256", "uint256", "uint256", "uint256", "uint256"],
-    [isLong, collateralToken, collateralAmount, borrowAmount, leverageX10, amountOutMin, BigInt(deadline)]
+    [isLong, collateralToken, collateralAmount, amountOutMin, leverageX10, 0n, BigInt(deadline)]
   );
   const calldata = OPEN_POSITION_SELECTOR + params.slice(2);
 

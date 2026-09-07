@@ -365,7 +365,7 @@ async function ensureOracleReady(wallet, poolAddress, side, provider, log = () =
     return;
   }
 
-  // Step 5: Send checkpointOracle
+  // Step 5: Send checkpointOracle — best-effort, never throw
   log(`[ORACLE] Sending Pool.checkpointOracle()...`, "warn");
   const poolWrite = new ethers.Contract(poolAddress, POOL_ABI, wallet);
   const feeParams = await getFeeParams(provider);
@@ -375,18 +375,18 @@ async function ensureOracleReady(wallet, poolAddress, side, provider, log = () =
     log(`[ORACLE] checkpointOracle tx hash=${checkpointTx.hash}`, "warn");
   } catch (cpErr) {
     const decodedErr = cpErr?.shortMessage || cpErr?.message || String(cpErr);
-    log(`[ORACLE] checkpointOracle FAILED: ${decodedErr}`, "error");
-    throw new Error(`checkpointOracle failed: ${decodedErr}`);
+    log(`[ORACLE] checkpointOracle FAILED (proceeding anyway): ${decodedErr}`, "error");
+    return;
   }
 
-  // Step 6: Wait for confirmations
+  // Step 6: Wait for confirmations — best-effort
   log(`[ORACLE] Waiting for ${ORACLE_CHECKPOINT_CONFIRMATIONS} confirmations...`, "info");
   try {
     await checkpointTx.wait(ORACLE_CHECKPOINT_CONFIRMATIONS);
     log(`[ORACLE] Checkpoint confirmed after ${ORACLE_CHECKPOINT_CONFIRMATIONS} blocks`, "success");
   } catch (confErr) {
-    log(`[ORACLE] Checkpoint confirmation failed: ${confErr.message}`, "error");
-    throw new Error(`checkpointOracle confirmation failed: ${confErr.message}`);
+    log(`[ORACLE] Checkpoint confirmation failed (proceeding anyway): ${confErr.message}`, "error");
+    return;
   }
 
   // Step 7: Re-verify
@@ -444,7 +444,7 @@ async function quoteLeveragedAmountOutMin(provider, { pool, manager, collateralT
     lpBorrowAmount, collateralToken, reserve0, reserve1, totalSupply, token0, swapFeeBps: BigInt(swapFeeBps),
   });
 
-  let amountOutMinFinal = applySlippage(amountOutMinRaw, BigInt(50));
+  let amountOutMinFinal = applySlippage(amountOutMinRaw, BigInt(200));
   if (amountOutMinRaw <= 0n || amountOutMinFinal <= 0n) throw new Error("Leveraged amountOutMin is zero");
 
   // SAFETY CAP: Emergency upper bound for amountOutMin.
@@ -557,7 +557,7 @@ async function ensureCollateral({ wallet, provider, side, collateralAmount, conf
     const remainingDeficit = collateralAmount > currentWethBal ? collateralAmount - currentWethBal : 0n;
     if (remainingDeficit > 0n) {
       const ethBalance = await provider.getBalance(walletAddr);
-      const gasReserve = ethers.parseEther(String(config.ethGuard?.MIN_ETH_GAS_RESERVE || 0.003));
+      const gasReserve = ethers.parseEther(String(config.ethGuard?.MIN_ETH_GAS_RESERVE ?? 0.003));
       const ethAvail = ethBalance - gasReserve - ethers.parseEther("0.005");
       const wrapAmount = remainingDeficit > ethAvail ? ethAvail : remainingDeficit;
       if (wrapAmount > ethers.parseEther("0.0001")) {
@@ -611,7 +611,7 @@ async function executeSwap({ wallet, provider, fromToken, toToken, amount, amoun
   const ethBalance = await provider.getBalance(walletAddr);
   const feeData = await provider.getFeeData();
   const gasCost = gasEstimate * (feeData.gasPrice || 0n);
-  const gasReserve = ethers.parseEther(String(config.ethGuard?.MIN_ETH_GAS_RESERVE || 0.003));
+  const gasReserve = ethers.parseEther(String(config.ethGuard?.MIN_ETH_GAS_RESERVE ?? 0.003));
   log(`[SWAP-DEBUG] ethBalance=${ethers.formatEther(ethBalance)} gasCost=${ethers.formatEther(gasCost)} gasReserve=${ethers.formatEther(gasReserve)}`, "info");
   if (ethBalance < gasCost + gasReserve) { log(`[SWAP] BLOCKED: ETH < gas reserve`, "error"); return false; }
 
@@ -690,7 +690,9 @@ async function openPosition({ wallet, provider, managerAddr, poolAddr, side, col
     log(`[OPEN] Approved`, "success");
   }
 
-  // Encode calldata — CORRECT parameter order
+  // Encode calldata — CORRECT parameter order per on-chain Manager ABI:
+  // openPosition(isLong, collateralToken, collateralAmount, amountOutMin, leverage, size, deadline)
+  // size=0: contract uses collateralAmount internally (required for USDT 6-decimal collateral)
   const deadline = Math.floor(Date.now() / 1000) + config.deadlineSeconds;
   const coder = ethers.AbiCoder.defaultAbiCoder();
 
@@ -698,7 +700,7 @@ async function openPosition({ wallet, provider, managerAddr, poolAddr, side, col
   const encodeCalldata = (aom) => {
     const p = coder.encode(
       ["bool", "address", "uint256", "uint256", "uint256", "uint256", "uint256"],
-      [isLong, collateralToken, collateralAmount, borrowAmount, leverageX10, aom, BigInt(deadline)]
+      [isLong, collateralToken, collateralAmount, aom, leverageX10, 0n, BigInt(deadline)]
     );
     return OPEN_POSITION_SELECTOR + p.slice(2);
   };
@@ -758,7 +760,7 @@ async function openPosition({ wallet, provider, managerAddr, poolAddr, side, col
   const feeData = await provider.getFeeData();
   const gasPrice = feeData.gasPrice || 0n;
   const gasCost = gasEstimate * gasPrice;
-  const gasReserve = ethers.parseEther(String(config.ethGuard?.MIN_ETH_GAS_RESERVE || 0.003));
+  const gasReserve = ethers.parseEther(String(config.ethGuard?.MIN_ETH_GAS_RESERVE ?? 0.003));
   if (ethBalance < gasCost + gasReserve) {
     log(`[BLOCKED] ETH ${ethers.formatEther(ethBalance)} below gas reserve`, "error");
     return null;
@@ -1101,40 +1103,50 @@ export class AutoTrader {
     if (this.running) { this.log("[AUTO] Already running.", "warn"); return; }
     this.running = true;
     this.stopRequested = false;
-    this.log("══════════════════════════════════════════════", "warn");
-    this.log("  AUTONOMOUS TRADING LOOP STARTED", "warn");
-    this.log(`  Interval: ${this.config.autoLoopIntervalMs / 1000}s`, "info");
-    this.log(`  Leverage: ${this.config.defaultLeverage}x`, "info");
-    this.log(`  Dry run: ${this.config.dryRun}`, "info");
-    this.log("══════════════════════════════════════════════", "warn");
 
-    // Restart recovery
-    this.log("[RECOVERY] scanning on-chain for active positions...", "info");
-    const { provider } = this.getRuntime();
-    const recovered = await recoverPosition(
-      provider, this.deps.accounts[this.deps.selectedWalletIndex].address,
-      this.getManagerAddr(), this.log.bind(this),
-    );
-    if (recovered) {
-      this.log(`[RECOVERED] position #${recovered.positionId} side=${recovered.side}`, "warn");
-      this.state.activePosition = recovered;
-      this.state.sessionStats.opens++;
-      saveState(this.state);
-    } else if (this.state.activePosition) {
-      this.log(`[WARN] Local state had position but on-chain says none — clearing`, "warn");
-      this.state.activePosition = null;
-      saveState(this.state);
-    }
+    try {
+      this.log("══════════════════════════════════════════════", "warn");
+      this.log("  AUTONOMOUS TRADING LOOP STARTED", "warn");
+      this.log(`  Interval: ${this.config.autoLoopIntervalMs / 1000}s`, "info");
+      this.log(`  Leverage: ${this.config.defaultLeverage}x`, "info");
+      this.log(`  Dry run: ${this.config.dryRun}`, "info");
+      this.log("══════════════════════════════════════════════", "warn");
 
-    while (!this.stopRequested) {
-      try { await this.runCycle(); }
-      catch (e) { this.log(`[ERROR] Unhandled: ${e.message?.slice(0, 80)}`, "error"); }
-      if (!this.stopRequested && this.config.autoLoopIntervalMs > 0) {
-        await this.sleep(this.config.autoLoopIntervalMs);
+      // Restart recovery — wrapped in try/catch so RPC failures don't kill the loop
+      try {
+        this.log("[RECOVERY] scanning on-chain for active positions...", "info");
+        const { provider } = this.getRuntime();
+        const recovered = await recoverPosition(
+          provider, this.deps.accounts[this.deps.selectedWalletIndex].address,
+          this.getManagerAddr(), this.log.bind(this),
+        );
+        if (recovered) {
+          this.log(`[RECOVERED] position #${recovered.positionId} side=${recovered.side}`, "warn");
+          this.state.activePosition = recovered;
+          this.state.sessionStats.opens++;
+          saveState(this.state);
+        } else if (this.state.activePosition) {
+          this.log(`[WARN] Local state had position but on-chain says none — clearing`, "warn");
+          this.state.activePosition = null;
+          saveState(this.state);
+        }
+      } catch (re) {
+        this.log(`[RECOVERY] scan failed (will retry next cycle): ${re.message?.slice(0, 80)}`, "error");
       }
+
+      while (!this.stopRequested) {
+        try { await this.runCycle(); }
+        catch (e) { this.log(`[ERROR] Unhandled: ${e.message?.slice(0, 80)}`, "error"); }
+        if (!this.stopRequested && this.config.autoLoopIntervalMs > 0) {
+          await this.sleep(this.config.autoLoopIntervalMs);
+        }
+      }
+    } catch (fatal) {
+      this.log(`[FATAL] start() crashed: ${fatal.message?.slice(0, 80)} — loop halted`, "error");
+    } finally {
+      this.running = false;
+      this.log("[AUTO] Trading loop stopped.", "warn");
     }
-    this.running = false;
-    this.log("[AUTO] Trading loop stopped.", "warn");
   }
 
   stop() {

@@ -45,7 +45,7 @@
   "swapTradeAmount": "0.01",
   "tinyTradeAmount": "0.05",
   "maxTradeAmount": "0.333216",
-  "leverage": 5,
+  "leverage": 2,
   "slippageBps": 50,
   "deadlineSeconds": 1200,
   "rsiLong": 30,

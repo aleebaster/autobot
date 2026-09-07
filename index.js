@@ -552,6 +552,9 @@ async function startAutoTrading() {
   autoTrader = new AutoTrader(deps);
   autoRunning = true;
 
+  // Set initial TUI leverage from config
+  autoStatus.leverage = (autoConfig.defaultLeverage || 2) + "x";
+
   // Wire log events to update TUI auto status
   autoTrader.onLog((msg, level) => {
     // Parse state updates from log messages
@@ -580,6 +583,9 @@ async function startAutoTrading() {
     } else if (msg.includes("OPEN") && msg.includes("Position ID:")) {
       const m = msg.match(/Position ID:\s*(\d+)/);
       if (m) { autoStatus.positionId = m[1]; autoStatus.position = "OPEN"; autoStatus.lastAction = `Position #${m[1]} opened`; }
+    } else if (msg.includes("[OPEN]") && msg.match(/\b\d+x\.\.\./)) {
+      const m = msg.match(/(\d+)x/);
+      if (m) { autoStatus.leverage = m[1] + "x"; autoStatus.lastAction = `Opening ${m[1]}x...`; }
     } else if (msg.includes("OPEN") && msg.includes("Sending")) {
       autoStatus.state = "OPEN";
       autoStatus.lastAction = "Sending open TX...";
