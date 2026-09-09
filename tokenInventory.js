@@ -472,7 +472,7 @@ function selectSwapSource(inventory, targetSymbol, targetAmount, allPairs, log =
   if (ethCheck.allowed) {
     // Check deficit: only use ETH if token is in deficit
     if (targetStatus === "deficit") {
-      log(`[INVENTORY] LAST RESORT: ETH → ${targetSymbol} (${targetTokenStatus} below minimum)`, "warn");
+      log(`[INVENTORY] LAST RESORT: ETH → ${targetSymbol} (${targetStatus} below minimum)`, "warn");
       return {
         source: "ETH",
         sourceAmount: ethEquiv,
@@ -645,6 +645,66 @@ function logSwapDetails({ source, dest, amountIn, amountOutExpected, priceImpact
 //  EXPORTS
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// ═══════════════════════════════════════════════════════════════════════════════
+//  BALANCE MAP — maps token symbols to their addresses and decimals
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const BALANCE_MAP = {
+  ETH:     { symbol: "ETH",  decimals: 18 },
+  WETH:    { symbol: "WETH", decimals: 18 },
+  USDC:    { symbol: "USDC", decimals: 6 },
+  USDT:    { symbol: "USDT", decimals: 6 },
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  INVENTORY-AWARE COLLATERAL CALCULATOR
+//  Used by Full Auto to determine if swap is needed
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Calculate how much of a collateral token needs to be swapped.
+ *
+ * @param {Object} opts
+ * @param {bigint} opts.balance       — current collateral balance
+ * @param {bigint} opts.required      — minimum required for position open
+ * @param {bigint} opts.targetReserve — desired inventory reserve level
+ * @param {number} opts.decimals      — token decimals (6 for USDT/USDC, 18 for WETH)
+ * @param {string} opts.sym           — token symbol for logging
+ * @param {Function} opts.log         — logging function
+ *
+ * @returns {{ action: string, swapAmount: bigint, reason: string }}
+ *   action = "none" | "critical" | "topup"
+ */
+function calculateInventoryDeficit({ balance, required, targetReserve, decimals, sym, log = () => {} }) {
+  if (balance >= targetReserve) {
+    return { action: "none", swapAmount: 0n, reason: `${sym} balance ${formatUnits(balance, decimals)} >= target ${formatUnits(targetReserve, decimals)} — no swap needed` };
+  }
+
+  if (balance < required) {
+    // Critical: not enough to open a position at all
+    const deficit = targetReserve - balance;
+    log(`[INVENTORY] ${sym} CRITICAL: balance ${formatUnits(balance, decimals)} < required ${formatUnits(required, decimals)}`, "warn");
+    log(`[INVENTORY] ${sym} swap target: ${formatUnits(targetReserve, decimals)} (deficit ${formatUnits(deficit, decimals)})`, "warn");
+    return { action: "critical", swapAmount: deficit, reason: `${sym} critical deficit: have ${formatUnits(balance, decimals)}, need ${formatUnits(targetReserve, decimals)}` };
+  }
+
+  // Between required and target — top-up to target
+  const deficit = targetReserve - balance;
+  log(`[INVENTORY] ${sym} TOP-UP: balance ${formatUnits(balance, decimals)} between required ${formatUnits(required, decimals)} and target ${formatUnits(targetReserve, decimals)}`, "info");
+  log(`[INVENTORY] ${sym} swap amount: ${formatUnits(deficit, decimals)} to reach ${formatUnits(targetReserve, decimals)}`, "info");
+  return { action: "topup", swapAmount: deficit, reason: `${sym} top-up: have ${formatUnits(balance, decimals)}, target ${formatUnits(targetReserve, decimals)}, swap ${formatUnits(deficit, decimals)}` };
+}
+
+function formatUnits(value, decimals) {
+  if (!value) return "0";
+  try {
+    if (typeof ethers !== "undefined" && ethers.formatUnits) {
+      return ethers.formatUnits(value, decimals);
+    }
+    return String(Number(value) / Math.pow(10, decimals));
+  } catch { return String(value); }
+}
+
 export {
   TokenInventory,
   EthSessionTracker,
@@ -653,4 +713,6 @@ export {
   logSwapDetails,
   DEFAULT_INVENTORY,
   DEFAULT_ETH_GUARD,
+  BALANCE_MAP,
+  calculateInventoryDeficit,
 };

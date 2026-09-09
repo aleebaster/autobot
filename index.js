@@ -532,8 +532,10 @@ async function startAutoTrading() {
     autoLoopIntervalMs: 30_000,
     ethGuard: { ...DEFAULT_ETH_GUARD },
     dryRun: false,
-    targetCollateralUSDT: "10",
-    targetCollateralWETH: "0.002",
+    targetCollateralUSDT: config.targetCollateralUSDT || "10",
+    targetCollateralWETH: config.targetCollateralWETH || "0.002",
+    targetReserveUSDT: config.targetReserveUSDT || "20",
+    targetReserveWETH: config.targetReserveWETH || "0.004",
     deadlineSeconds: config.deadlineSeconds || 1200,
   };
 

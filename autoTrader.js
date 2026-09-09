@@ -1,6 +1,6 @@
 import { ethers } from "ethers";
 import fs from "fs";
-import { TokenInventory, EthSessionTracker, DEFAULT_ETH_GUARD } from "./tokenInventory.js";
+import { TokenInventory, EthSessionTracker, DEFAULT_ETH_GUARD, calculateInventoryDeficit } from "./tokenInventory.js";
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  AUTONOMOUS TRADING LOOP — Nemesis Sepolia (V2 — CORRECTED)
@@ -10,6 +10,148 @@ import { TokenInventory, EthSessionTracker, DEFAULT_ETH_GUARD } from "./tokenInv
 const OPEN_POSITION_SELECTOR = "0xfa2b1dfd";
 const CLOSE_POSITION_SELECTOR = "0xb35648d7";
 const BPS = 10000n;
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  TX MANAGER — centralized nonce + serialization + retry
+//  All state-changing blockchain transactions MUST go through this manager
+// ═══════════════════════════════════════════════════════════════════════════
+
+class TxManager {
+  constructor() {
+    this._mutex = Promise.resolve();
+    this._nonce = null;
+    this._provider = null;
+    this._walletAddr = null;
+  }
+
+  /**
+   * Serialize all state-changing TXs through a single mutex.
+   * Returns a promise that resolves when it's this TX's turn.
+   */
+  async acquire() {
+    let release;
+    const waiter = new Promise(resolve => { release = resolve; });
+    const prev = this._mutex;
+    this._mutex = waiter;
+    await prev;
+    return release;
+  }
+
+  /**
+   * Get next nonce using 'pending' tag to include unconfirmed TXs.
+   * Also increment our internal counter to avoid RPC round-trips.
+   */
+  async getNextNonce(provider, walletAddr) {
+    // If we have a cached nonce, just increment it
+    if (this._nonce !== null && this._provider === provider && this._walletAddr === walletAddr) {
+      this._nonce++;
+      return this._nonce;
+    }
+    // First time or provider changed — fetch from chain with 'pending'
+    const nonce = await provider.getTransactionCount(walletAddr, "pending");
+    this._nonce = nonce;
+    this._provider = provider;
+    this._walletAddr = walletAddr;
+    return this._nonce;
+  }
+
+  /**
+   * Send a TX with managed nonce, wait for receipt, handle "replacement fee too low".
+   * @param {Object} opts - { wallet, provider, sendFn, txType, log }
+   *   sendFn(nonce) should return a TransactionResponse
+   */
+  async sendAndWait({ wallet, provider, sendFn, txType, log }) {
+    const walletAddr = wallet.address;
+    const release = await this.acquire();
+    try {
+      return await this._sendWithRetry({ wallet, provider, walletAddr, sendFn, txType, log, attempt: 0 });
+    } finally {
+      release();
+    }
+  }
+
+  async _sendWithRetry({ wallet, provider, walletAddr, sendFn, txType, log, attempt }) {
+    const MAX_RETRIES = 3;
+    const nonce = await this.getNextNonce(provider, walletAddr);
+
+    log(`[TX] ${txType} nonce=${nonce} pendingNonce=${await provider.getTransactionCount(walletAddr, "pending")} latestNonce=${await provider.getTransactionCount(walletAddr, "latest")}`, "info");
+
+    let tx;
+    try {
+      tx = await sendFn(nonce);
+    } catch (e) {
+      const msg = e?.message || String(e);
+      if (msg.includes("replacement fee too low") || msg.includes("nonce has already been used")) {
+        // Nonce collision — invalidate cache and retry
+        log(`[TX] ${txType} nonce=${nonce} COLLISION — invalidating nonce cache`, "warn");
+        this._nonce = null;
+        if (attempt < MAX_RETRIES) {
+          // Wait for any pending TX to confirm
+          log(`[TX] ${txType} waiting 5s for pending TX to resolve...`, "warn");
+          await new Promise(r => setTimeout(r, 5000));
+          return this._sendWithRetry({ wallet, provider, walletAddr, sendFn, txType, log, attempt: attempt + 1 });
+        }
+        throw e;
+      }
+      throw e;
+    }
+
+    log(`[TX] ${txType} SENT nonce=${nonce} hash=${tx.hash}`, "warn");
+
+    // Wait for receipt with timeout
+    let receipt;
+    try {
+      receipt = await tx.wait();
+    } catch (waitErr) {
+      const waitMsg = waitErr?.message || String(waitErr);
+      // TX might still be pending — check on-chain
+      log(`[TX] ${txType} wait() failed: ${waitMsg.slice(0, 60)} — checking chain status...`, "warn");
+      try {
+        receipt = await provider.getTransactionReceipt(tx.hash);
+        if (receipt) {
+          log(`[TX] ${txType} found on-chain: status=${receipt.status} block=${receipt.blockNumber}`, "info");
+        } else {
+          // TX might be pending — wait more
+          log(`[TX] ${txType} not yet mined — waiting up to 60s...`, "warn");
+          for (let i = 0; i < 12; i++) {
+            await new Promise(r => setTimeout(r, 5000));
+            receipt = await provider.getTransactionReceipt(tx.hash);
+            if (receipt) {
+              log(`[TX] ${txType} confirmed after ${(i+1)*5}s: status=${receipt.status}`, "info");
+              break;
+            }
+          }
+        }
+      } catch (checkErr) {
+        log(`[TX] ${txType} chain check failed: ${checkErr.message?.slice(0, 60)}`, "error");
+      }
+    }
+
+    if (!receipt) {
+      log(`[TX] ${txType} TIMEOUT — no receipt after extended wait. TX may still confirm later.`, "warn");
+      // Invalidate nonce cache since TX might be pending
+      this._nonce = null;
+      return { hash: tx.hash, status: null, pending: true };
+    }
+
+    if (receipt.status !== 1) {
+      log(`[TX] ${txType} REVERTED status=0 nonce=${receipt.nonce} gas=${receipt.gasUsed}`, "error");
+      // Nonce was consumed by failed TX — invalidate cache
+      this._nonce = null;
+      return { hash: tx.hash, status: 0, receipt };
+    }
+
+    log(`[TX] ${txType} CONFIRMED status=1 nonce=${receipt.nonce} block=${receipt.blockNumber} gas=${receipt.gasUsed}`, "success");
+    return { hash: tx.hash, status: 1, receipt };
+  }
+
+  /**
+   * Invalidate nonce cache (call after external TX or error recovery)
+   */
+  resetNonce() {
+    this._nonce = null;
+  }
+}
 
 const WETH = "0x7b79995e5f793A07Bc00c21412e50Ecae098E7f9";
 const USDT = "0x5f2E83cCDEa73D60aF400e03F1Cd8Fb9eaB07b20";
@@ -189,6 +331,10 @@ const DEFAULT_AUTO_CONFIG = {
   maxLeverage: 5,
   targetCollateralUSDT: "10",
   targetCollateralWETH: "0.002",
+  // Inventory targets — when collateral balance < targetReserve, SWAP from other tokens
+  // This triggers inventory-aware rebalancing, not just critical deficit swaps
+  targetReserveUSDT: "20",
+  targetReserveWETH: "0.004",
   minCollateralUSD: 1,
   slippageBps: 50,
   deadlineSeconds: 1200,
@@ -301,7 +447,7 @@ async function recoverPosition(provider, walletAddr, managerAddr, log = () => {}
 const ORACLE_MAX_DIVERGENCE_BPS = 500n;
 const ORACLE_CHECKPOINT_CONFIRMATIONS = 4;
 
-async function ensureOracleReady(wallet, poolAddress, side, provider, log = () => {}) {
+async function ensureOracleReady(wallet, poolAddress, side, provider, log = () => {}, txManager) {
   if (!ethers.isAddress(poolAddress) || poolAddress === ZERO_ADDRESS) {
     log(`[ORACLE] Pool address invalid — skipping`, "warn");
     return;
@@ -369,23 +515,22 @@ async function ensureOracleReady(wallet, poolAddress, side, provider, log = () =
   log(`[ORACLE] Sending Pool.checkpointOracle()...`, "warn");
   const poolWrite = new ethers.Contract(poolAddress, POOL_ABI, wallet);
   const feeParams = await getFeeParams(provider);
-  let checkpointTx;
   try {
-    checkpointTx = await poolWrite.checkpointOracle({ gasLimit: 500000n, ...feeParams });
-    log(`[ORACLE] checkpointOracle tx hash=${checkpointTx.hash}`, "warn");
+    if (txManager) {
+      await txManager.sendAndWait({
+        wallet, provider, txType: "ORACLE-CHECKPOINT",
+        sendFn: (nonce) => poolWrite.checkpointOracle({ gasLimit: 500000n, ...feeParams, nonce }),
+        log,
+      });
+    } else {
+      const checkpointTx = await poolWrite.checkpointOracle({ gasLimit: 500000n, ...feeParams });
+      log(`[ORACLE] checkpointOracle tx hash=${checkpointTx.hash}`, "warn");
+      await checkpointTx.wait(ORACLE_CHECKPOINT_CONFIRMATIONS);
+    }
+    log(`[ORACLE] Checkpoint confirmed`, "success");
   } catch (cpErr) {
     const decodedErr = cpErr?.shortMessage || cpErr?.message || String(cpErr);
     log(`[ORACLE] checkpointOracle FAILED (proceeding anyway): ${decodedErr}`, "error");
-    return;
-  }
-
-  // Step 6: Wait for confirmations — best-effort
-  log(`[ORACLE] Waiting for ${ORACLE_CHECKPOINT_CONFIRMATIONS} confirmations...`, "info");
-  try {
-    await checkpointTx.wait(ORACLE_CHECKPOINT_CONFIRMATIONS);
-    log(`[ORACLE] Checkpoint confirmed after ${ORACLE_CHECKPOINT_CONFIRMATIONS} blocks`, "success");
-  } catch (confErr) {
-    log(`[ORACLE] Checkpoint confirmation failed (proceeding anyway): ${confErr.message}`, "error");
     return;
   }
 
@@ -469,7 +614,7 @@ async function quoteLeveragedAmountOutMin(provider, { pool, manager, collateralT
 const LONG_SOURCES = [USDC, WETH];
 const SHORT_SOURCES = [USDT, USDC];
 
-async function ensureCollateral({ wallet, provider, side, collateralAmount, config, log, dryRun }) {
+async function ensureCollateral({ wallet, provider, side, collateralAmount, config, log, dryRun, txManager }) {
   const walletAddr = wallet.address;
   const collateralToken = side === "LONG" ? USDT : WETH;
   const decimals = side === "LONG" ? 6 : 18;
@@ -534,7 +679,7 @@ async function ensureCollateral({ wallet, provider, side, collateralAmount, conf
 
       const swapResult = await executeSwap({
         wallet, provider, fromToken: sourceToken, toToken: collateralToken,
-        amount: safeSwapAmount, amountOutMin, config, log,
+        amount: safeSwapAmount, amountOutMin, config, log, txManager,
       });
       if (!swapResult) { log(`[SWAP] FAILED — trying next source`, "error"); continue; }
 
@@ -563,8 +708,11 @@ async function ensureCollateral({ wallet, provider, side, collateralAmount, conf
       if (wrapAmount > ethers.parseEther("0.0001")) {
         log(`[SWAP] Last resort: ETH → WETH: wrapping ${ethers.formatEther(wrapAmount)} (deficit=${ethers.formatEther(remainingDeficit)}, available=${ethers.formatEther(ethAvail)})`, "warn");
         const wethContract = new ethers.Contract(WETH, ["function deposit() payable", "function balanceOf(address) view returns (uint256)"], wallet);
-        const wrapTx = await wethContract.deposit({ value: wrapAmount, gasLimit: 100000n });
-        await wrapTx.wait();
+        const wrapResult = await (txManager ? txManager.sendAndWait({
+          wallet, provider, txType: "WETH-WRAP",
+          sendFn: (nonce) => wethContract.deposit({ value: wrapAmount, gasLimit: 100000n, nonce }),
+          log,
+        }) : (async () => { const wrapTx = await wethContract.deposit({ value: wrapAmount, gasLimit: 100000n }); await wrapTx.wait(); return { hash: wrapTx.hash, status: 1 }; })());
         log(`[SWAP] Wrapped ${ethers.formatEther(wrapAmount)} ETH → WETH`, "success");
         const wethBal = await new ethers.Contract(WETH, ERC20_ABI, provider).balanceOf(walletAddr);
         if (wethBal >= collateralAmount) {
@@ -579,19 +727,29 @@ async function ensureCollateral({ wallet, provider, side, collateralAmount, conf
   return false;
 }
 
-async function executeSwap({ wallet, provider, fromToken, toToken, amount, amountOutMin, config, log }) {
+async function executeSwap({ wallet, provider, fromToken, toToken, amount, amountOutMin, config, log, txManager }) {
   const walletAddr = wallet.address;
   const routerAddr = "0x8f6eB7870334b1FD8006Fd52413f01689f4E57e9";
   const router = new ethers.Contract(routerAddr, ROUTER_ABI, wallet);
   const fromContract = new ethers.Contract(fromToken, ERC20_ABI, wallet);
   const fromSym = fromToken === USDT ? "USDT" : fromToken === USDC ? "USDC" : "WETH";
+  const srcDecimals = fromToken === WETH ? 18 : 6;
 
   const allowance = await fromContract.allowance(walletAddr, routerAddr);
-  log(`[SWAP-DEBUG] executeSwap: from=${fromSym} to=${toToken === USDT ? "USDT" : toToken === WETH ? "WETH" : "???"} amount=${ethers.formatUnits(amount, fromToken === WETH ? 18 : 6)} allowance=${ethers.formatUnits(allowance, fromToken === WETH ? 18 : 6)}`, "info");
+  log(`[SWAP-DEBUG] executeSwap: from=${fromSym} to=${toToken === USDT ? "USDT" : toToken === WETH ? "WETH" : "???"} amount=${ethers.formatUnits(amount, srcDecimals)} allowance=${ethers.formatUnits(allowance, srcDecimals)}`, "info");
   if (allowance < amount) {
     log(`[SWAP] Approve ${fromSym} → Router...`, "info");
-    const approveTx = await fromContract.approve(routerAddr, ethers.MaxUint256, { gasLimit: 100000n });
-    await approveTx.wait();
+    if (txManager) {
+      const r = await txManager.sendAndWait({
+        wallet, provider, txType: "SWAP-APPROVE",
+        sendFn: (nonce) => fromContract.approve(routerAddr, ethers.MaxUint256, { gasLimit: 100000n, nonce }),
+        log,
+      });
+      if (r.status === 0) { log(`[SWAP] Approve REVERTED`, "error"); return false; }
+    } else {
+      const approveTx = await fromContract.approve(routerAddr, ethers.MaxUint256, { gasLimit: 100000n });
+      await approveTx.wait();
+    }
     log(`[SWAP] Approved`, "success");
   }
 
@@ -616,20 +774,32 @@ async function executeSwap({ wallet, provider, fromToken, toToken, amount, amoun
   if (ethBalance < gasCost + gasReserve) { log(`[SWAP] BLOCKED: ETH < gas reserve`, "error"); return false; }
 
   const gasLimit = gasEstimate + gasEstimate / 5n;
-  log(`[SWAP] TX_SENT`, "warn");
-  const swapTx = await router.swapExactTokensForTokens(amount, amountOutMin, path, walletAddr, deadline, { gasLimit });
-  log(`[SWAP] TX hash=${swapTx.hash}`, "info");
-  const receipt = await swapTx.wait();
-  if (receipt.status !== 1) { log(`[SWAP] TX FAILED (status=0)`, "error"); return false; }
-  log(`[SWAP] SUCCESS gas=${receipt.gasUsed}`, "success");
-  return true;
+  if (txManager) {
+    const r = await txManager.sendAndWait({
+      wallet, provider, txType: "SWAP",
+      sendFn: (nonce) => router.swapExactTokensForTokens(amount, amountOutMin, path, walletAddr, deadline, { gasLimit, nonce }),
+      log,
+    });
+    if (!r || r.status === 0) { log(`[SWAP] TX FAILED`, "error"); return false; }
+    if (r.pending) { log(`[SWAP] TX pending — will confirm later`, "warn"); return true; }
+    log(`[SWAP] SUCCESS gas=${r.receipt.gasUsed}`, "success");
+    return true;
+  } else {
+    log(`[SWAP] TX_SENT`, "warn");
+    const swapTx = await router.swapExactTokensForTokens(amount, amountOutMin, path, walletAddr, deadline, { gasLimit });
+    log(`[SWAP] TX hash=${swapTx.hash}`, "info");
+    const receipt = await swapTx.wait();
+    if (receipt.status !== 1) { log(`[SWAP] TX FAILED (status=0)`, "error"); return false; }
+    log(`[SWAP] SUCCESS gas=${receipt.gasUsed}`, "success");
+    return true;
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  OPEN POSITION — CORRECTED (with oracle checkpoint + proper quote)
 // ═══════════════════════════════════════════════════════════════════════════
 
-async function openPosition({ wallet, provider, managerAddr, poolAddr, side, collateralToken, collateralAmount, leverage, config, log, dryRun }) {
+async function openPosition({ wallet, provider, managerAddr, poolAddr, side, collateralToken, collateralAmount, leverage, config, log, dryRun, txManager }) {
   const walletAddr = wallet.address;
   const isLong = side === "LONG";
   const decimals = isLong ? 6 : 18;
@@ -650,7 +820,7 @@ async function openPosition({ wallet, provider, managerAddr, poolAddr, side, col
 
   // STEP 1: Oracle checkpoint (fixes 0x56e7f09d)
   try {
-    await ensureOracleReady(wallet, poolAddr, side, provider, log);
+    await ensureOracleReady(wallet, poolAddr, side, provider, log, txManager);
   } catch (e) {
     log(`[BLOCKED] Oracle checkpoint failed: ${e.message?.slice(0, 80)}`, "error");
     return null;
@@ -685,8 +855,17 @@ async function openPosition({ wallet, provider, managerAddr, poolAddr, side, col
   const allowance = await token.allowance(walletAddr, managerAddr);
   if (allowance < collateralAmount) {
     log(`[OPEN] Approve collateral → Manager...`, "info");
-    const approveTx = await token.approve(managerAddr, ethers.MaxUint256, { gasLimit: 100000n });
-    await approveTx.wait();
+    if (txManager) {
+      const r = await txManager.sendAndWait({
+        wallet, provider, txType: "OPEN-APPROVE",
+        sendFn: (nonce) => token.approve(managerAddr, ethers.MaxUint256, { gasLimit: 100000n, nonce }),
+        log,
+      });
+      if (r.status === 0) { log(`[OPEN] Approve REVERTED`, "error"); return null; }
+    } else {
+      const approveTx = await token.approve(managerAddr, ethers.MaxUint256, { gasLimit: 100000n });
+      await approveTx.wait();
+    }
     log(`[OPEN] Approved`, "success");
   }
 
@@ -768,14 +947,27 @@ async function openPosition({ wallet, provider, managerAddr, poolAddr, side, col
 
   // Send TX
   const gasLimit = gasEstimate + gasEstimate / 5n;
-  log(`[OPEN] Sending openPosition TX...`, "warn");
-  const tx = await wallet.sendTransaction({ to: managerAddr, data: calldata, value: 0n, gasLimit });
-  log(`[OPEN] TX: ${tx.hash}`, "info");
-
-  const receipt = await tx.wait();
-  if (receipt.status !== 1) {
-    log(`[BLOCKED] TX FAILED (status=0)`, "error");
-    return null;
+  let txHash, receipt;
+  if (txManager) {
+    const r = await txManager.sendAndWait({
+      wallet, provider, txType: `OPEN-${side}`,
+      sendFn: (nonce) => wallet.sendTransaction({ to: managerAddr, data: calldata, value: 0n, gasLimit, nonce }),
+      log,
+    });
+    if (!r || r.status === 0) { log(`[BLOCKED] TX FAILED`, "error"); return null; }
+    if (r.pending) {
+      log(`[OPEN] TX pending — will confirm later`, "warn");
+      return { txHash: r.hash, positionId: null, gasUsed: 0n, blockNumber: null, pending: true };
+    }
+    txHash = r.hash;
+    receipt = r.receipt;
+  } else {
+    log(`[OPEN] Sending openPosition TX...`, "warn");
+    const tx = await wallet.sendTransaction({ to: managerAddr, data: calldata, value: 0n, gasLimit });
+    txHash = tx.hash;
+    log(`[OPEN] TX: ${tx.hash}`, "info");
+    receipt = await tx.wait();
+    if (receipt.status !== 1) { log(`[BLOCKED] TX FAILED (status=0)`, "error"); return null; }
   }
 
   log(`[OPEN] SUCCESS gas=${receipt.gasUsed}`, "success");
@@ -795,14 +987,14 @@ async function openPosition({ wallet, provider, managerAddr, poolAddr, side, col
   }
 
   log(`[OPEN] Position ID: ${positionId}`, "success");
-  return { txHash: tx.hash, positionId, gasUsed: receipt.gasUsed, blockNumber: receipt.blockNumber };
+  return { txHash, positionId, gasUsed: receipt.gasUsed, blockNumber: receipt.blockNumber };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  CLOSE POSITION
 // ═══════════════════════════════════════════════════════════════════════════
 
-async function closePositionFn({ wallet, provider, managerAddr, positionId, config, log, dryRun }) {
+async function closePositionFn({ wallet, provider, managerAddr, positionId, config, log, dryRun, txManager }) {
   const walletAddr = wallet.address;
 
   if (dryRun) {
@@ -834,18 +1026,31 @@ async function closePositionFn({ wallet, provider, managerAddr, positionId, conf
   }
 
   const gasLimit = gasEstimate + gasEstimate / 5n;
-  log(`[CLOSE] Sending closePosition TX...`, "warn");
-  const tx = await wallet.sendTransaction({ to: managerAddr, data: calldata, value: 0n, gasLimit });
-  log(`[CLOSE] TX: ${tx.hash}`, "info");
-
-  const receipt = await tx.wait();
-  if (receipt.status !== 1) {
-    log(`[BLOCKED] Close TX FAILED (status=0)`, "error");
-    return null;
+  let txHash, receipt;
+  if (txManager) {
+    const r = await txManager.sendAndWait({
+      wallet, provider, txType: "CLOSE",
+      sendFn: (nonce) => wallet.sendTransaction({ to: managerAddr, data: calldata, value: 0n, gasLimit, nonce }),
+      log,
+    });
+    if (!r || r.status === 0) { log(`[BLOCKED] Close TX FAILED`, "error"); return null; }
+    if (r.pending) {
+      log(`[CLOSE] TX pending — will confirm later`, "warn");
+      return { txHash: r.hash, gasUsed: 0n, blockNumber: null, pending: true };
+    }
+    txHash = r.hash;
+    receipt = r.receipt;
+  } else {
+    log(`[CLOSE] Sending closePosition TX...`, "warn");
+    const tx = await wallet.sendTransaction({ to: managerAddr, data: calldata, value: 0n, gasLimit });
+    txHash = tx.hash;
+    log(`[CLOSE] TX: ${tx.hash}`, "info");
+    receipt = await tx.wait();
+    if (receipt.status !== 1) { log(`[BLOCKED] Close TX FAILED (status=0)`, "error"); return null; }
   }
 
   log(`[CLOSE] SUCCESS gas=${receipt.gasUsed}`, "success");
-  return { txHash: tx.hash, gasUsed: receipt.gasUsed, blockNumber: receipt.blockNumber };
+  return { txHash, gasUsed: receipt.gasUsed, blockNumber: receipt.blockNumber };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -863,6 +1068,7 @@ export class AutoTrader {
     this.inventory = new TokenInventory();
     this.currentState = STATES.IDLE;
     this._logListeners = [];
+    this.txManager = new TxManager();
   }
 
   onLog(fn) { this._logListeners.push(fn); }
@@ -924,7 +1130,7 @@ export class AutoTrader {
         const closeResult = await closePositionFn({
           wallet, provider, managerAddr,
           positionId: this.state.activePosition.positionId,
-          config: this.config, log: this.log.bind(this), dryRun,
+          config: this.config, log: this.log.bind(this), dryRun, txManager: this.txManager,
         });
 
         if (closeResult?.failed) {
@@ -968,11 +1174,13 @@ export class AutoTrader {
       }
       this.log(`[DIRECTION] ${side}`, "warn");
 
-      // PHASE 3: PREPARE COLLATERAL
+      // PHASE 3: PREPARE COLLATERAL — INVENTORY-AWARE
       this.setState(STATES.PREPARE_COLLATERAL);
       const collateralToken = side === "LONG" ? USDT : WETH;
       const collateralDecimals = side === "LONG" ? 6 : 18;
       const collateralSym = side === "LONG" ? "USDT" : "WETH";
+
+      // Required collateral for position open
       const targetStr = side === "LONG"
         ? (this.config.targetCollateralUSDT || "10")
         : (this.config.targetCollateralWETH || "0.002");
@@ -980,78 +1188,129 @@ export class AutoTrader {
         ? ethers.parseUnits(targetStr, 6)
         : ethers.parseEther(targetStr);
 
+      // Inventory target — swap UP TO this level (not just critical deficit)
+      const reserveStr = side === "LONG"
+        ? (this.config.targetReserveUSDT || "20")
+        : (this.config.targetReserveWETH || "0.004");
+      const targetReserve = side === "LONG"
+        ? ethers.parseUnits(reserveStr, 6)
+        : ethers.parseEther(reserveStr);
+
       const tokenContract = new ethers.Contract(collateralToken, ERC20_ABI, provider);
       const balance = await tokenContract.balanceOf(walletAddr);
 
-      // Inventory-aware collateral check
+      this.log(`[INVENTORY] ═══ COLLATERAL CHECK ═══`, "info");
+      this.log(`[INVENTORY] ${collateralSym} balance=${ethers.formatUnits(balance, collateralDecimals)}`, "info");
+      this.log(`[INVENTORY] ${collateralSym} required=${ethers.formatUnits(collateralAmount, collateralDecimals)} (position open)`, "info");
+      this.log(`[INVENTORY] ${collateralSym} targetReserve=${ethers.formatUnits(targetReserve, collateralDecimals)} (inventory target)`, "info");
+
       if (collateralAmount <= 0n) {
         this.log(`[BLOCKED] Invalid collateral target`, "error");
         return;
       }
 
-      if (balance >= collateralAmount) {
-        // COLLATERAL REQUIREMENT satisfied — check INVENTORY REBALANCE
-        const ratio = balance * 100n / collateralAmount;
-        this.log(`[COLLATERAL] target=${collateralSym} required=${ethers.formatUnits(collateralAmount, collateralDecimals)} balance=${ethers.formatUnits(balance, collateralDecimals)} ratio=${Number(ratio)}%`, "info");
+      // Calculate inventory deficit using the new method
+      const deficit = calculateInventoryDeficit({
+        balance,
+        required: collateralAmount,
+        targetReserve,
+        decimals: collateralDecimals,
+        sym: collateralSym,
+        log: this.log.bind(this),
+      });
 
-        if (ratio < 200n) {
-          // Balance is between 1x-2x required — LOW reserve, check if inventory has excess to top up
-          this.log(`[COLLATERAL] LOW reserve (${Number(ratio)}% of 2x target) — checking inventory for top-up`, "warn");
-          const sources = side === "LONG" ? LONG_SOURCES : SHORT_SOURCES;
-          let toppedUp = false;
-          for (const sourceToken of sources) {
-            const sourceContract = new ethers.Contract(sourceToken, ERC20_ABI, provider);
-            const sourceBalance = await sourceContract.balanceOf(walletAddr);
-            const sourceDecimals = sourceToken === WETH ? 18 : 6;
-            const sourceSym = sourceToken === USDT ? "USDT" : sourceToken === USDC ? "USDC" : "WETH";
-            const targetDeficit = collateralAmount * 2n - balance; // gap to 2x target
-            if (sourceBalance > targetDeficit * 2n && targetDeficit > 0n) {
-              const swapAmount = targetDeficit; // top up to 2x target
-              this.log(`[INVENTORY-TOPUP] source=${sourceSym} balance=${ethers.formatUnits(sourceBalance, sourceDecimals)} swap=${ethers.formatUnits(swapAmount, sourceDecimals)} → ${collateralSym}`, "warn");
-              if (!dryRun) {
-                const topUpOk = await executeSwap({
-                  wallet, provider, fromToken: sourceToken, toToken: collateralToken,
-                  amount: swapAmount, amountOutMin: targetDeficit * 95n / 100n, config: this.config, log: this.log.bind(this),
-                });
-                if (topUpOk) {
-                  const newBal = await tokenContract.balanceOf(walletAddr);
-                  this.log(`[INVENTORY-TOPUP] balance_after=${ethers.formatUnits(newBal, collateralDecimals)} ${collateralSym}`, "success");
-                  toppedUp = true;
-                  break;
-                }
-              } else {
-                this.log(`[DRY] Would top-up ${collateralSym} from ${sourceSym}`, "info");
-                toppedUp = true;
-                break;
-              }
-            }
-          }
-          if (!toppedUp) {
-            this.log(`[COLLATERAL] No inventory excess available for top-up — proceeding with current balance`, "info");
-          }
-        } else {
-          this.log(`[COLLATERAL] ADEQUATE reserve (${Number(ratio)}%) — no top-up needed`, "success");
-        }
+      if (deficit.action === "none") {
+        // Sufficient — no swap needed, proceed to OPEN
+        this.log(`[INVENTORY] RESERVE OK — ${collateralSym} ${ethers.formatUnits(balance, collateralDecimals)} >= target ${ethers.formatUnits(targetReserve, collateralDecimals)}`, "success");
       } else {
-        // COLLATERAL DEFICIT — must swap from inventory
+        // SWAP needed — critical deficit OR top-up to target
         this.setState(STATES.SWAP);
-        const deficit = collateralAmount - balance;
-        this.log(`[COLLATERAL] DEFICIT target=${collateralSym} required=${ethers.formatUnits(collateralAmount, collateralDecimals)} balance=${ethers.formatUnits(balance, collateralDecimals)} deficit=${ethers.formatUnits(deficit, collateralDecimals)}`, "warn");
+        this.log(`[SWAP] ${deficit.reason}`, "warn");
         this.log(`[SWAP] searching inventory for source tokens...`, "warn");
-        const swapOk = await ensureCollateral({
-          wallet, provider, side, collateralAmount, config: this.config,
-          log: this.log.bind(this), dryRun,
-        });
-        if (!swapOk) {
-          this.log(`[BLOCKED] Cannot obtain collateral from inventory. Skipping.`, "error");
+
+        // Select swap source from inventory
+        const sources = side === "LONG" ? LONG_SOURCES : SHORT_SOURCES;
+        let swapSuccess = false;
+
+        for (const sourceToken of sources) {
+          const sourceContract = new ethers.Contract(sourceToken, ERC20_ABI, provider);
+          const sourceBalance = await sourceContract.balanceOf(walletAddr);
+          const sourceDecimals = sourceToken === WETH ? 18 : 6;
+          const sourceSym = sourceToken === USDT ? "USDT" : sourceToken === USDC ? "USDC" : "WETH";
+
+          if (sourceBalance <= 0n) {
+            this.log(`[SWAP] ${sourceSym} balance=0 — skip`, "info");
+            continue;
+          }
+
+          this.log(`[SWAP] ${sourceSym} balance=${ethers.formatUnits(sourceBalance, sourceDecimals)} — trying ${sourceSym} → ${collateralSym}`, "info");
+
+          try {
+            const router = new ethers.Contract("0x8f6eB7870334b1FD8006Fd52413f01689f4E57e9", ROUTER_ABI, provider);
+            const fullQuote = await router.getAmountsOut(sourceBalance, [sourceToken, collateralToken]);
+            const expectedOut = fullQuote[1];
+
+            if (expectedOut < deficit.swapAmount) {
+              this.log(`[SWAP] ${sourceSym} insufficient: max output ${ethers.formatUnits(expectedOut, collateralDecimals)} < needed ${ethers.formatUnits(deficit.swapAmount, collateralDecimals)}`, "warn");
+              continue;
+            }
+
+            // Calculate exact swap amount — don't swap more than needed
+            const neededWithBuffer = deficit.swapAmount * 101n / 100n; // 1% buffer for slippage
+            let swapAmount = neededWithBuffer * sourceBalance / expectedOut;
+            if (swapAmount > sourceBalance) swapAmount = sourceBalance;
+            const amountOutMin = deficit.swapAmount * 98n / 100n; // 2% slippage protection
+
+            this.log(`[SWAP] quote: ${ethers.formatUnits(swapAmount, sourceDecimals)} ${sourceSym} → ~${ethers.formatUnits(expectedOut * swapAmount / sourceBalance, collateralDecimals)} ${collateralSym}`, "info");
+            this.log(`[SWAP] amountOutMin=${ethers.formatUnits(amountOutMin, collateralDecimals)} ${collateralSym}`, "info");
+
+            if (dryRun) {
+              this.log(`[DRY] Would swap ${ethers.formatUnits(swapAmount, sourceDecimals)} ${sourceSym} → ${collateralSym}`, "info");
+              swapSuccess = true;
+              break;
+            }
+
+            // Execute swap — wait for receipt before proceeding
+            const swapResult = await executeSwap({
+              wallet, provider, fromToken: sourceToken, toToken: collateralToken,
+              amount: swapAmount, amountOutMin, config: this.config,
+              log: this.log.bind(this), txManager: this.txManager,
+            });
+
+            if (!swapResult) {
+              this.log(`[SWAP] ${sourceSym} → ${collateralSym} FAILED — trying next source`, "error");
+              continue;
+            }
+
+            // Verify balance after swap
+            const newBalance = await tokenContract.balanceOf(walletAddr);
+            this.log(`[SWAP] ${collateralSym} balance_after=${ethers.formatUnits(newBalance, collateralDecimals)} (target=${ethers.formatUnits(targetReserve, collateralDecimals)})`, "info");
+
+            if (newBalance >= collateralAmount) {
+              this.log(`[SWAP] CONFIRMED — ${collateralSym} sufficient after swap`, "success");
+              swapSuccess = true;
+              break;
+            } else {
+              this.log(`[SWAP] ${collateralSym} still below required after swap: ${ethers.formatUnits(newBalance, collateralDecimals)} < ${ethers.formatUnits(collateralAmount, collateralDecimals)}`, "warn");
+            }
+          } catch (e) {
+            this.log(`[SWAP] ${sourceSym} → ${collateralSym} failed: ${e.message?.slice(0, 80)}`, "error");
+            continue;
+          }
+        }
+
+        if (!swapSuccess && !dryRun) {
+          this.log(`[BLOCKED] No source token could cover ${collateralSym} deficit — skipping cycle`, "error");
           return;
         }
-        const postSwapBalance = await tokenContract.balanceOf(walletAddr);
-        if (postSwapBalance < collateralAmount) {
-          this.log(`[BLOCKED] Collateral still insufficient after swap: have ${ethers.formatUnits(postSwapBalance, collateralDecimals)}, need ${ethers.formatUnits(collateralAmount, collateralDecimals)}`, "error");
+
+        // Final verification before OPEN
+        const finalBalance = await tokenContract.balanceOf(walletAddr);
+        if (finalBalance < collateralAmount) {
+          this.log(`[BLOCKED] ${collateralSym} still insufficient after all swaps: ${ethers.formatUnits(finalBalance, collateralDecimals)} < ${ethers.formatUnits(collateralAmount, collateralDecimals)}`, "error");
           return;
         }
-        this.log(`[COLLATERAL] AFTER SWAP target=${collateralSym} balance=${ethers.formatUnits(postSwapBalance, collateralDecimals)}`, "success");
+        this.log(`[INVENTORY] POST-SWAP ${collateralSym}=${ethers.formatUnits(finalBalance, collateralDecimals)} — ready for OPEN`, "success");
       }
 
       // PHASE 4: OPEN
@@ -1061,7 +1320,7 @@ export class AutoTrader {
       const openResult = await openPosition({
         wallet, provider, managerAddr, poolAddr, side, collateralToken, collateralAmount,
         leverage: this.config.defaultLeverage,
-        config: this.config, log: this.log.bind(this), dryRun,
+        config: this.config, log: this.log.bind(this), dryRun, txManager: this.txManager,
       });
 
       if (openResult?.dryRun) {
@@ -1094,6 +1353,7 @@ export class AutoTrader {
       this.log("[CYCLE] ═══ CYCLE END ═══", "info");
     } catch (e) {
       this.log(`[ERROR] Cycle error: ${e.message?.slice(0, 80)}`, "error");
+      this.txManager.resetNonce();
     } finally {
       this.cycleRunning = false;
     }
