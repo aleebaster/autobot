@@ -705,9 +705,192 @@ function formatUnits(value, decimals) {
   } catch { return String(value); }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+//  SWAP JOURNAL — prevents circular swaps (USDC→USDT→USDC ping-pong)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+class SwapJournal {
+  constructor(maxHistory = 10) {
+    this.history = [];
+    this.maxHistory = maxHistory;
+  }
+
+  record(entry) {
+    this.history.push({
+      timestamp: Date.now(),
+      from: entry.from,
+      to: entry.to,
+      amount: entry.amount,
+    });
+    if (this.history.length > this.maxHistory) {
+      this.history = this.history.slice(-this.maxHistory);
+    }
+  }
+
+  wouldCreateCycle(fromSym, toSym) {
+    if (this.history.length === 0) return false;
+    const recent = this.history.slice(-3);
+    for (const prev of recent) {
+      if (prev.from === toSym && prev.to === fromSym) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  wasRecentlySwapped(fromSym, toSym, cooldownMs = 60000) {
+    const now = Date.now();
+    for (const entry of this.history) {
+      if (entry.from === fromSym && entry.to === toSym) {
+        if (now - entry.timestamp < cooldownMs) return true;
+      }
+    }
+    return false;
+  }
+
+  getStats() {
+    const counts = {};
+    for (const h of this.history) {
+      const key = `${h.from}→${h.to}`;
+      counts[key] = (counts[key] || 0) + 1;
+    }
+    return counts;
+  }
+
+  reset() {
+    this.history = [];
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  RANDOM SWAP AMOUNT CALCULATOR
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const DEFAULT_AUTO_SWAP_PAIRS = [
+  { from: "USDC", to: "USDT" },
+  { from: "USDT", to: "USDC" },
+  { from: "USDT", to: "WETH" },
+  { from: "WETH", to: "USDT" },
+  { from: "USDC", to: "WETH" },
+  { from: "WETH", to: "USDC" },
+];
+
+const TOKEN_DECIMALS = {
+  USDC: 6,
+  USDT: 6,
+  WETH: 18,
+  ETH: 18,
+};
+
+function pickRandom(arr) {
+  return arr[Math.floor(Math.random() * arr.length)];
+}
+
+function randomInRange(min, max) {
+  return min + Math.random() * (max - min);
+}
+
+/**
+ * Select a random swap pair from available pairs, avoiding:
+ * - circular swaps (recent reverse pair)
+ * - same-pair repeats
+ * - ETH→token (when preferTokenToToken is true)
+ *
+ * @param {SwapJournal} journal
+ * @param {Map<string, {raw: bigint, float: number}>} balances
+ * @param {object} autoSwapConfig
+ * @returns {{ from: string, to: string, fromAddr: string, toAddr: string } | null}
+ */
+function selectRandomSwapPair(journal, balances, autoSwapConfig, tokenAddrs, log = () => {}) {
+  const preferTokenToToken = autoSwapConfig.preferTokenToToken !== false;
+  const cooldownMs = autoSwapConfig.swapCooldownMs || 20000;
+
+  let candidates = DEFAULT_AUTO_SWAP_PAIRS.filter(pair => {
+    const fromBal = balances[pair.from];
+    const toBal = balances[pair.to];
+    if (!fromBal || fromBal.float <= 0) return false;
+    if (preferTokenToToken && pair.from === "ETH") return false;
+    if (journal.wasRecentlySwapped(pair.from, pair.to, cooldownMs)) return false;
+    if (journal.wouldCreateCycle(pair.from, pair.to)) return false;
+    return true;
+  });
+
+  if (candidates.length === 0) {
+    log(`[AUTO-SWAP] No valid swap pairs available`, "warn");
+    return null;
+  }
+
+  candidates.sort((a, b) => {
+    const aBal = balances[a.from]?.float || 0;
+    const bBal = balances[b.from]?.float || 0;
+    return bBal - aBal;
+  });
+
+  const topN = candidates.slice(0, Math.min(3, candidates.length));
+  const selected = pickRandom(topN);
+
+  const fromAddr = tokenAddrs[selected.from];
+  const toAddr = tokenAddrs[selected.to];
+
+  log(`[AUTO-SWAP] Selected pair: ${selected.from} → ${selected.to} (from ${candidates.length} candidates)`, "info");
+
+  return { from: selected.from, to: selected.to, fromAddr, toAddr };
+}
+
+/**
+ * Calculate a random swap amount for the selected pair.
+ * Uses percentage of available balance with min/max bounds.
+ *
+ * @param {string} fromSym
+ * @param {number} fromBalanceFloat
+ * @param {object} autoSwapConfig
+ * @returns {{ amountFloat: number, reason: string } | null}
+ */
+function calculateRandomSwapAmount(fromSym, fromBalanceFloat, autoSwapConfig) {
+  const minPercent = autoSwapConfig.swapMinPercent || 3;
+  const maxPercent = autoSwapConfig.swapMaxPercent || 15;
+  const decimals = TOKEN_DECIMALS[fromSym] || 6;
+
+  const minAmountStr = autoSwapConfig[`minSwapAmount${fromSym}`] || "1";
+  const maxAmountStr = autoSwapConfig[`maxSwapAmount${fromSym}`] || "100";
+  const minAmount = parseFloat(minAmountStr);
+  const maxAmount = parseFloat(maxAmountStr);
+
+  const percent = randomInRange(minPercent, maxPercent);
+  let amountFloat = fromBalanceFloat * (percent / 100);
+
+  amountFloat = Math.max(amountFloat, minAmount);
+  amountFloat = Math.min(amountFloat, maxAmount);
+
+  if (amountFloat > fromBalanceFloat * 0.9) {
+    amountFloat = fromBalanceFloat * randomInRange(0.05, 0.15);
+  }
+
+  if (amountFloat < minAmount * 0.5) {
+    return null;
+  }
+
+  return {
+    amountFloat,
+    reason: `random ${percent.toFixed(1)}% of ${fromBalanceFloat.toFixed(2)} balance`,
+  };
+}
+
+/**
+ * Get token address from symbol.
+ */
+function getTokenAddress(sym, tokenAddrs) {
+  return tokenAddrs[sym] || null;
+}
+
+function getSwapPairs() {
+  return [...DEFAULT_AUTO_SWAP_PAIRS];
+}
+
 export {
   TokenInventory,
   EthSessionTracker,
+  SwapJournal,
   selectSwapSource,
   generateInventoryAwarePairs,
   logSwapDetails,
@@ -715,4 +898,9 @@ export {
   DEFAULT_ETH_GUARD,
   BALANCE_MAP,
   calculateInventoryDeficit,
+  selectRandomSwapPair,
+  calculateRandomSwapAmount,
+  getTokenAddress,
+  getSwapPairs,
+  TOKEN_DECIMALS,
 };

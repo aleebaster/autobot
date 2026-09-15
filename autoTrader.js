@@ -1,6 +1,6 @@
 import { ethers } from "ethers";
 import fs from "fs";
-import { TokenInventory, EthSessionTracker, DEFAULT_ETH_GUARD, calculateInventoryDeficit } from "./tokenInventory.js";
+import { TokenInventory, EthSessionTracker, DEFAULT_ETH_GUARD, calculateInventoryDeficit, SwapJournal, selectRandomSwapPair, calculateRandomSwapAmount, getTokenAddress, getSwapPairs, TOKEN_DECIMALS } from "./tokenInventory.js";
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  AUTONOMOUS TRADING LOOP — Nemesis Sepolia (V2 — CORRECTED)
@@ -39,15 +39,10 @@ class TxManager {
 
   /**
    * Get next nonce using 'pending' tag to include unconfirmed TXs.
-   * Also increment our internal counter to avoid RPC round-trips.
+   * Always fetches from chain to prevent collisions from external TXs
+   * on the same wallet (e.g. other bot instances, manual transactions).
    */
   async getNextNonce(provider, walletAddr) {
-    // If we have a cached nonce, just increment it
-    if (this._nonce !== null && this._provider === provider && this._walletAddr === walletAddr) {
-      this._nonce++;
-      return this._nonce;
-    }
-    // First time or provider changed — fetch from chain with 'pending'
     const nonce = await provider.getTransactionCount(walletAddr, "pending");
     this._nonce = nonce;
     this._provider = provider;
@@ -307,6 +302,7 @@ async function logInventory(provider, walletAddr, log = () => {}) {
 
 const STATES = {
   IDLE:               "IDLE",
+  AUTO_SWAP:          "AUTO_SWAP",
   SIGNAL:             "SIGNAL",
   WAIT:               "WAIT",
   PREPARE_COLLATERAL: "PREPARE_COLLATERAL",
@@ -1147,6 +1143,7 @@ export class AutoTrader {
     this.cycleRunning = false;
     this.state = loadState();
     this.inventory = new TokenInventory();
+    this.swapJournal = new SwapJournal(10);
     this.currentState = STATES.IDLE;
     this._logListeners = [];
     this.txManager = new TxManager();
@@ -1202,6 +1199,156 @@ export class AutoTrader {
 
       // Log full token inventory
       await logInventory(provider, walletAddr, this.log.bind(this));
+
+      // PHASE 0: AUTO-SWAP — proactive token rebalancing (when no active position)
+      const autoSwapConfig = this.config.autoSwap || {};
+      if (autoSwapConfig.enabled && !this.state.activePosition) {
+        this.setState(STATES.AUTO_SWAP);
+        const maxSwaps = autoSwapConfig.maxSwapsPerCycle || 2;
+        const tokenAddrs = { USDC, USDT, WETH };
+        let swapsDone = 0;
+
+        this.log(`[AUTO-SWAP] Phase started (max ${maxSwaps} swaps per cycle)`, "info");
+
+        // Refresh inventory for auto-swap decisions
+        const inventoryTokenMap = {};
+        for (const [sym, addr] of Object.entries(tokenAddrs)) {
+          inventoryTokenMap[sym] = { address: addr, decimals: TOKEN_DECIMALS[sym] || 6 };
+        }
+        try {
+          await this.inventory.refreshBalances(provider, walletAddr, inventoryTokenMap, this.log.bind(this));
+          this.inventory.logStatus(this.log.bind(this));
+        } catch (e) {
+          this.log(`[AUTO-SWAP] Inventory refresh failed: ${e.message?.slice(0, 60)}`, "error");
+        }
+
+        for (let i = 0; i < maxSwaps; i++) {
+          try {
+            // Re-fetch fresh balances for each swap
+            const freshBalances = {};
+            for (const [sym, addr] of Object.entries(tokenAddrs)) {
+              try {
+                if (sym === "WETH") {
+                  const c = new ethers.Contract(addr, ERC20_ABI, provider);
+                  freshBalances[sym] = { raw: await c.balanceOf(walletAddr), float: parseFloat(ethers.formatUnits(await c.balanceOf(walletAddr), 18)) };
+                } else {
+                  const c = new ethers.Contract(addr, ERC20_ABI, provider);
+                  const bal = await c.balanceOf(walletAddr);
+                  freshBalances[sym] = { raw: bal, float: parseFloat(ethers.formatUnits(bal, TOKEN_DECIMALS[sym])) };
+                }
+              } catch { freshBalances[sym] = { raw: 0n, float: 0 }; }
+            }
+
+            // Select a random pair
+            const pair = selectRandomSwapPair(this.swapJournal, freshBalances, autoSwapConfig, tokenAddrs, this.log.bind(this));
+            if (!pair) {
+              this.log(`[AUTO-SWAP] No valid pair found — stopping auto-swap phase`, "info");
+              break;
+            }
+
+            // Calculate random amount
+            const fromBal = freshBalances[pair.from];
+            if (!fromBal || fromBal.float <= 0) {
+              this.log(`[AUTO-SWAP] ${pair.from} balance=0 — skip`, "info");
+              continue;
+            }
+
+            const amountResult = calculateRandomSwapAmount(pair.from, fromBal.float, autoSwapConfig);
+            if (!amountResult) {
+              this.log(`[AUTO-SWAP] Amount too small for ${pair.from} — skip`, "info");
+              continue;
+            }
+
+            // Convert float amount to raw BigInt
+            const decimals = TOKEN_DECIMALS[pair.from] || 6;
+            const amountRaw = ethers.parseUnits(amountResult.amountFloat.toFixed(decimals), decimals);
+
+            // Safety: don't use more than 90% of balance
+            if (amountRaw > fromBal.raw * 90n / 100n) {
+              this.log(`[AUTO-SWAP] Amount exceeds 90% of balance — capping`, "warn");
+              continue;
+            }
+
+            // Safety: don't use more than available balance
+            if (amountRaw > fromBal.raw) {
+              this.log(`[AUTO-SWAP] Insufficient ${pair.from} balance`, "warn");
+              continue;
+            }
+
+            // Get quote from Router
+            const router = new ethers.Contract("0x8f6eB7870334b1FD8006Fd52413f01689f4E57e9", ROUTER_ABI, provider);
+            let quote;
+            try {
+              quote = await router.getAmountsOut(amountRaw, [pair.fromAddr, pair.toAddr]);
+            } catch (e) {
+              this.log(`[AUTO-SWAP] Quote failed for ${pair.from}→${pair.to}: ${e.message?.slice(0, 60)}`, "error");
+              continue;
+            }
+
+            const expectedOut = quote[1];
+            const toDecimals = TOKEN_DECIMALS[pair.to] || 6;
+            const amountOutMin = applySlippage(expectedOut, BigInt(autoSwapConfig.slippageBps || 50));
+
+            // Log pre-swap details
+            this.log(`[SWAP] pair=${pair.from}→${pair.to}`, "warn");
+            this.log(`[SWAP] amountIn=${ethers.formatUnits(amountRaw, decimals)} ${pair.from}`, "warn");
+            this.log(`[SWAP] expectedOut=${ethers.formatUnits(expectedOut, toDecimals)} ${pair.to}`, "warn");
+            this.log(`[SWAP] amountOutMin=${ethers.formatUnits(amountOutMin, toDecimals)} ${pair.to}`, "warn");
+
+            if (dryRun) {
+              this.log(`[DRY] Would swap ${amountResult.amountFloat.toFixed(4)} ${pair.from} → ${pair.to}`, "info");
+              this.swapJournal.record({ from: pair.from, to: pair.to, amount: amountResult.amountFloat });
+              swapsDone++;
+              continue;
+            }
+
+            // Execute swap
+            const swapResult = await executeSwap({
+              wallet, provider,
+              fromToken: pair.fromAddr, toToken: pair.toAddr,
+              amount: amountRaw, amountOutMin,
+              config: this.config, log: this.log.bind(this), txManager: this.txManager,
+            });
+
+            if (!swapResult) {
+              this.log(`[SWAP] ${pair.from}→${pair.to} FAILED`, "error");
+              continue;
+            }
+
+            // Wait for balance update
+            await new Promise(r => setTimeout(r, 2000));
+
+            // Verify new balance
+            const newFromContract = new ethers.Contract(pair.fromAddr, ERC20_ABI, provider);
+            const newToContract = new ethers.Contract(pair.toAddr, ERC20_ABI, provider);
+            const newFromBal = await newFromContract.balanceOf(walletAddr);
+            const newToBal = await newToContract.balanceOf(walletAddr);
+
+            this.log(`[SWAP] SUCCESS ${pair.from}→${pair.to}`, "success");
+            this.log(`[SWAP] actualOut≈${ethers.formatUnits(expectedOut, toDecimals)} ${pair.to}`, "success");
+            this.log(`[SWAP] balanceAfter: ${pair.from}=${ethers.formatUnits(newFromBal, decimals)} ${pair.to}=${ethers.formatUnits(newToBal, toDecimals)}`, "success");
+
+            // Record in journal
+            this.swapJournal.record({ from: pair.from, to: pair.to, amount: amountResult.amountFloat });
+            swapsDone++;
+
+            // Cooldown between swaps
+            if (i < maxSwaps - 1) {
+              const cooldownMs = autoSwapConfig.swapCooldownMs || 20000;
+              this.log(`[AUTO-SWAP] Waiting ${cooldownMs / 1000}s before next swap...`, "info");
+              await this.sleep(cooldownMs);
+            }
+          } catch (e) {
+            this.log(`[AUTO-SWAP] Swap ${i + 1} error: ${e.message?.slice(0, 80)}`, "error");
+            this.txManager.resetNonce();
+          }
+        }
+
+        this.log(`[AUTO-SWAP] Phase complete — ${swapsDone} swaps executed`, "info");
+
+        // Log updated inventory
+        await logInventory(provider, walletAddr, this.log.bind(this));
+      }
 
       // PHASE 1: If active position → CLOSE
       if (this.state.activePosition) {
@@ -1451,6 +1598,14 @@ export class AutoTrader {
       this.log(`  Interval: ${this.config.autoLoopIntervalMs / 1000}s`, "info");
       this.log(`  Leverage: ${this.config.defaultLeverage}x`, "info");
       this.log(`  Dry run: ${this.config.dryRun}`, "info");
+
+      // Log autoSwap config
+      const asCfg = this.config.autoSwap || {};
+      this.log(`[AUTO-SWAP] enabled=${asCfg.enabled === true}`, "info");
+      this.log(`[AUTO-SWAP] cooldown=${asCfg.swapCooldownMs || 20000}ms`, "info");
+      this.log(`[AUTO-SWAP] maxSwapsPerCycle=${asCfg.maxSwapsPerCycle || 2}`, "info");
+      this.log(`[AUTO-SWAP] amountRange=${asCfg.swapMinPercent || 3}%-${asCfg.swapMaxPercent || 15}%`, "info");
+
       this.log("══════════════════════════════════════════════", "warn");
 
       // Restart recovery — wrapped in try/catch so RPC failures don't kill the loop

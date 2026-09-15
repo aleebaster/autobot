@@ -537,6 +537,7 @@ async function startAutoTrading() {
     targetReserveUSDT: config.targetReserveUSDT || "20",
     targetReserveWETH: config.targetReserveWETH || "0.004",
     deadlineSeconds: config.deadlineSeconds || 1200,
+    autoSwap: config.autoSwap,
   };
 
   const deps = {

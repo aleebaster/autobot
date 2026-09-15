@@ -206,5 +206,19 @@
   "lpMinLiquidity": "0",
   "lpRetryAttempts": 2,
   "lpRetryDelaySeconds": 5,
-  "lpCycles": 1
+  "lpCycles": 1,
+  "autoSwap": {
+    "enabled": true,
+    "swapCooldownMs": 20000,
+    "maxSwapsPerCycle": 2,
+    "swapMinPercent": 3,
+    "swapMaxPercent": 15,
+    "minSwapAmountUSDC": "1",
+    "minSwapAmountUSDT": "1",
+    "minSwapAmountWETH": "0.0001",
+    "maxSwapAmountUSDC": "100",
+    "maxSwapAmountUSDT": "100",
+    "maxSwapAmountWETH": "0.01",
+    "preferTokenToToken": true
+  }
 }

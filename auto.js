@@ -110,6 +110,7 @@ async function main() {
     autoLoopIntervalMs: once ? 0 : 30_000,
     ethGuard: { ...DEFAULT_ETH_GUARD },
     dryRun,
+    autoSwap: config.autoSwap,
   };
 
   const deps = {
