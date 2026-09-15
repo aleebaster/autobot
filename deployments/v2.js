@@ -83,17 +83,19 @@ export const V2_PROFILE = {
   // NOTE: poolToken0 is read on-chain from pool.token0() — do NOT hardcode.
   // The values below are for reference only; the bot reads them dynamically.
   knownMarkets: [
-    { symbol: "NEMESIS/USDT", collateralToken: "0x18D18A40614b6d8C6154309F517acf9829308842", collateralSymbol: "NEMESIS", collateralDecimals: 6 },
     { symbol: "ETH/USDT",     collateralToken: "0x7b79995e5f793A07Bc00c21412e50Ecae098E7f9", collateralSymbol: "ETH",     collateralDecimals: 18 },
-    { symbol: "DAI/USDT",     collateralToken: "0xa3215a5cA659e0Bd57c0B33d5EAD71901A24d3d6", collateralSymbol: "DAI",     collateralDecimals: 6 },
+    { symbol: "NEMESIS/USDT", collateralToken: "0x18D18A40614b6d8C6154309F517acf9829308842", collateralSymbol: "NEMESIS", collateralDecimals: 6 },
     { symbol: "USDC/USDT",    collateralToken: "0x5dcf1Db10F87CB7839640F9B85C4ECfA29b56e80", collateralSymbol: "USDC",    collateralDecimals: 6 },
-    { symbol: "UNI/USDT",     collateralToken: "0xEaBEcd70AC3330d65e09e429824C49d0D8812952", collateralSymbol: "UNI",     collateralDecimals: 6 },
-    { symbol: "LINK/USDT",    collateralToken: "0x1132087D2D97b55E5fe1B0FcA7b99348B5f07e28", collateralSymbol: "LINK",    collateralDecimals: 6 },
+    { symbol: "USDT/UNI",     collateralToken: "0xEaBEcd70AC3330d65e09e429824C49d0D8812952", collateralSymbol: "UNI",     collateralDecimals: 6 },
+    { symbol: "USDT/LINK",    collateralToken: "0x1132087D2D97b55E5fe1B0FcA7b99348B5f07e28", collateralSymbol: "LINK",    collateralDecimals: 6 },
+    // HISTORICAL: DAI/USDT NOT DEPLOYED on-chain (0 bytes)
+    // { symbol: "DAI/USDT",  collateralToken: "0xa3215a5cA659e0Bd57c0B33d5EAD71901A24d3d6", collateralSymbol: "DAI", collateralDecimals: 6 },
   ],
 
-  // V2 confirmed pools (verified on-chain 2026-09-04)
-  // ⚠️ UNI/USDT, DAI/USDT, LINK/USDT pools have 0 bytes on-chain — NOT DEPLOYED
-  // These are FALLBACK addresses — the bot always prefers Factory.getPool() results.
+  // V2 confirmed pools (verified on-chain 2026-09-15 E2E test)
+  // ⚠️ DAI/USDT has 0 bytes on-chain — NOT DEPLOYED
+  // Historical (pre-2026-09-15) pool addresses for UNI/USDT, DAI/USDT, LINK/USDT
+  // have been superseded by new deployments discovered via Factory.getPool().
   confirmedPools: {
     "ETH/USDT": {
       pool:    "0xf32E24b7F739c7C17544cb972833aB551121A72B",
@@ -110,21 +112,25 @@ export const V2_PROFILE = {
       manager: "0xAbC78D0650f47426DeF16286FF0cE9CFD501e80e",
       deployed: true,
     },
-    "UNI/USDT": {
-      pool:    "0x07a44c21688c0dB4486B6325EDf0a0C2C9c00571",
+    "USDT/UNI": {
+      pool:    "0x8435437288705A266170166abEbc37Ec9ADAbCDB",
       manager: "0x6238f87Dd84DA1DA2b0e93b22b380c710EE674a7",
-      deployed: false, // Pool has 0 bytes on-chain
+      deployed: true, // Verified E2E 2026-09-15: 11839 bytes, quote works
     },
-    "DAI/USDT": {
-      pool:    "0x5e7821F6B0Aa6716e9E2046B2aB91C0E94b74716",
+    "USDT/DAI": {
+      pool:    "0x17D3c1e35B66a4a0c5b8d8576e273465BB6c7Ec4",
       manager: "0x46c9835f3412f25Fd2706fDc8aDf04B14f943289",
-      deployed: false, // Pool has 0 bytes on-chain
+      deployed: false, // Verified E2E 2026-09-15: 0 bytes — NOT deployed
     },
-    "LINK/USDT": {
-      pool:    "0xd9Ab0698D658AFc6221DcA6BF7b70B4005aE44c5",
+    "USDT/LINK": {
+      pool:    "0xC055507D149A3e0302F0522a40CF1Fc9e49B3cAC",
       manager: "0xF603d60B713e557dc199DDceaCF370eA90ECC00E",
-      deployed: false, // Pool has 0 bytes on-chain
+      deployed: true, // Verified E2E 2026-09-15: 11839 bytes, quote works
     },
+    // HISTORICAL addresses (pre-2026-09-15) — kept for reference:
+    // "UNI/USDT (old)": pool=0x07a44c21688c0dB4486B6325EDf0a0C2C9c00571 (0 bytes)
+    // "DAI/USDT (old)":  pool=0x5e7821F6B0Aa6716e9E2046B2aB91C0E94b74716 (0 bytes)
+    // "LINK/USDT (old)": pool=0xd9Ab0698D658AFc6221DcA6BF7b70B4005aE44c5 (0 bytes)
   },
 
   // V2 router ABI — includes V2-specific function signatures

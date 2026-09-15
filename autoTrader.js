@@ -432,6 +432,21 @@ async function recoverPosition(provider, walletAddr, managerAddr, log = () => {}
       log(`[RECOVERY] position #${positionId} was already closed`, "info");
       return null;
     }
+    // Check for zombie position (zeroed collateral/debt on-chain)
+    try {
+      const mgr = new ethers.Contract(managerAddr, [
+        "function positions(uint256) view returns (bool isLong, address user, address collateralToken, uint256 collateralAmount, uint256 debtAmount, uint256 currentDebt)"
+      ], provider);
+      const pos = await mgr.positions(positionId);
+      if (pos && pos.collateralAmount === 0n && pos.currentDebt === 0n) {
+        log(`[RECOVERY] position #${positionId} is zombie (zero collateral+debt) — clearing`, "warn");
+        return null;
+      }
+      if (pos && pos.collateralAmount === 0n && pos.currentDebt > 0n) {
+        log(`[RECOVERY] position #${positionId} is zombie (zero collateral, debt=${pos.currentDebt}) — clearing`, "warn");
+        return null;
+      }
+    } catch {}
     log(`[RECOVERY] found active position #${positionId}`, "warn");
     return { positionId, side: "LONG", collateralToken: USDT, openedAt: lastOpen.blockNumber };
   } catch (e) {
@@ -506,10 +521,10 @@ async function ensureOracleReady(wallet, poolAddress, side, provider, log = () =
     } catch {}
   }
 
-  if (!needsCheckpoint) {
-    log(`[ORACLE] Oracle is ready — no checkpoint needed`, "success");
-    return;
-  }
+  // Always send checkpoint to ensure fresh oracle state.
+  // The contract threshold for MAM_OpenOracleDivergence may differ from
+  // our 500 bps check, so checkpoint unconditionally before every open.
+  log(`[ORACLE] Sending checkpoint to ensure fresh oracle state`, "info");
 
   // Step 5: Send checkpointOracle — best-effort, never throw
   log(`[ORACLE] Sending Pool.checkpointOracle()...`, "warn");
@@ -527,17 +542,37 @@ async function ensureOracleReady(wallet, poolAddress, side, provider, log = () =
       log(`[ORACLE] checkpointOracle tx hash=${checkpointTx.hash}`, "warn");
       await checkpointTx.wait(ORACLE_CHECKPOINT_CONFIRMATIONS);
     }
-    log(`[ORACLE] Checkpoint confirmed`, "success");
+    log(`[ORACLE] Checkpoint confirmed — waiting for oracle to update...`, "success");
   } catch (cpErr) {
     const decodedErr = cpErr?.shortMessage || cpErr?.message || String(cpErr);
     log(`[ORACLE] checkpointOracle FAILED (proceeding anyway): ${decodedErr}`, "error");
     return;
   }
 
-  // Step 7: Re-verify
+  // Wait for 2 blocks after checkpoint for oracle to propagate
+  try {
+    const curBlock = await provider.getBlockNumber();
+    log(`[ORACLE] Waiting for blocks after checkpoint (current=${curBlock})...`, "info");
+    for (let i = 0; i < 10; i++) {
+      await new Promise(r => setTimeout(r, 3000));
+      const newBlock = await provider.getBlockNumber();
+      if (newBlock >= curBlock + 2) {
+        log(`[ORACLE] Blocks confirmed (${newBlock})`, "info");
+        break;
+      }
+    }
+  } catch (e) {
+    log(`[ORACLE] Block wait failed: ${e.message?.slice(0, 40)}`, "warn");
+  }
+
+  // Re-verify oracle state
   try {
     const rpAfter = await pool.getRiskPrice();
-    log(`[ORACLE] Post-checkpoint getRiskPrice: price0Avg=${rpAfter[0]} price1Avg=${rpAfter[1]}`, "info");
+    const [spotAfter] = await pool.getOraclePrice();
+    const devBps = spotAfter > rpAfter[0]
+      ? (spotAfter - rpAfter[0]) * 10000n / rpAfter[0]
+      : rpAfter[0] > spotAfter ? (rpAfter[0] - spotAfter) * 10000n / spotAfter : 0n;
+    log(`[ORACLE] Post-checkpoint: risk=${rpAfter[0]} spot=${spotAfter} deviation=${devBps}bps`, "info");
   } catch {}
 
   log(`[ORACLE] Oracle checkpoint complete`, "success");
@@ -918,9 +953,47 @@ async function openPosition({ wallet, provider, managerAddr, poolAddr, side, col
       log(`[PREFLIGHT] Re-computed quote also failed: ${revertData2 || match2?.[0] || e2.message?.slice(0, 60)}`, "error");
       log(`[BLOCKED] Pre-flight REVERTED after retry: ${rawRevert}`, "error");
       if (rawRevert === "0x56e7f09d") {
-        log(`[BLOCKED] MAM_OpenOracleDivergence — oracle needs checkpoint`, "error");
+        log(`[PREFLIGHT] MAM_OpenOracleDivergence — sending checkpoint + retry`, "warn");
+        // Decode error params (uint256,uint256,uint256)
+        try {
+          const errParams = coder.decode(["uint256","uint256","uint256"], "0x" + rawRevert.slice(10));
+          log(`[PREFLIGHT] Error params: spot=${errParams[0]} risk=${errParams[1]} threshold=${errParams[2]}`, "info");
+        } catch {}
+        // Send oracle checkpoint and wait
+        try {
+          await ensureOracleReady(wallet, poolAddr, side, provider, log, txManager);
+        } catch (ckErr) {
+          log(`[PREFLIGHT] Retry checkpoint failed: ${ckErr.message?.slice(0, 60)}`, "error");
+        }
+        // Wait extra blocks for oracle to propagate
+        try {
+          const curBlk = await provider.getBlockNumber();
+          for (let i = 0; i < 8; i++) {
+            await new Promise(r => setTimeout(r, 3000));
+            if (await provider.getBlockNumber() >= curBlk + 3) break;
+          }
+        } catch {}
+        // Retry quote + preflight
+        try {
+          const retryQuote = await quoteLeveragedAmountOutMin(provider, {
+            pool: poolAddr, manager: managerAddr, collateralToken, collateralAmount, leverageX10, isLong, log,
+          });
+          const retryAom = retryQuote.amountOutMinFinal;
+          const retryCalldata = encodeCalldata(retryAom);
+          await provider.call({ from: walletAddr, to: managerAddr, data: retryCalldata, value: 0n });
+          amountOutMin = retryAom;
+          calldata = retryCalldata;
+          log(`[PREFLIGHT] PASS (after oracle checkpoint retry)`, "success");
+        } catch (retryErr) {
+          const retryData = retryErr?.data || retryErr?.info?.error?.data || retryErr?.cause?.data || retryErr?.cause?.info?.error?.data || null;
+          const retryMatch = (retryErr?.shortMessage || retryErr?.message || "").match(/0x[0-9a-fA-F]{8,}/);
+          log(`[PREFLIGHT] Retry also failed: ${retryData || retryMatch?.[0] || retryErr.message?.slice(0, 60)}`, "error");
+          log(`[BLOCKED] Pre-flight REVERTED after oracle checkpoint retry`, "error");
+          return null;
+        }
+      } else {
+        return null;
       }
-      return null;
     }
   }
 
@@ -1012,6 +1085,14 @@ async function closePositionFn({ wallet, provider, managerAddr, positionId, conf
     await provider.call({ from: walletAddr, to: managerAddr, data: calldata, value: 0n });
     log(`[CLOSE] Pre-flight OK`, "info");
   } catch (e) {
+    const closeErrData = e?.data || e?.info?.error?.data || e?.cause?.data || e?.cause?.info?.error?.data || null;
+    const closeErrMatch = (e?.shortMessage || e?.message || "").match(/0x[0-9a-fA-F]{8,}/);
+    const closeRawErr = closeErrData || closeErrMatch?.[0] || "";
+    // MAM_InvalidPosition (0xa5732d32) — zombie position (zeroed collateral/debt)
+    if (closeRawErr.startsWith("0xa5732d32")) {
+      log(`[CLOSE] MAM_InvalidPosition — zombie position detected, clearing state`, "warn");
+      return { failed: true, reason: "zombie" };
+    }
     log(`[BLOCKED] Close pre-flight REVERTED: ${e.message?.slice(0, 80)}`, "error");
     log(`[WARN] Position may no longer exist — clearing state`, "warn");
     return { failed: true, reason: e.message?.slice(0, 60) };
