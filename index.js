@@ -529,7 +529,7 @@ async function startAutoTrading() {
   const autoConfig = {
     defaultLeverage: config.leverage || 2,
     maxLeverage: 5,
-    autoLoopIntervalMs: 30_000,
+    autoLoopIntervalMs: 5_000,
     ethGuard: { ...DEFAULT_ETH_GUARD },
     dryRun: false,
     targetCollateralUSDT: config.targetCollateralUSDT || "10",
@@ -537,6 +537,8 @@ async function startAutoTrading() {
     targetReserveUSDT: config.targetReserveUSDT || "20",
     targetReserveWETH: config.targetReserveWETH || "0.004",
     deadlineSeconds: config.deadlineSeconds || 1200,
+    cooldownAfterOpenMs: 3_000,
+    cooldownAfterCloseMs: 3_000,
     autoSwap: config.autoSwap,
   };
 
@@ -608,6 +610,30 @@ async function startAutoTrading() {
     } else if (msg.includes("CYCLE END")) {
       autoStatus.state = "IDLE";
       autoStatus.lastAction = "Cycle complete, waiting...";
+    } else if (msg.includes("[AUTO] NEXT ACTION:")) {
+      const m = msg.match(/NEXT ACTION:\s*(.+)/);
+      if (m) { autoStatus.lastAction = m[1]; }
+    } else if (msg.includes("[AUTO] SWAPPING")) {
+      autoStatus.state = "SWAP";
+      autoStatus.swap = "IN PROGRESS";
+      const m = msg.match(/SWAPPING\s+(\S+\s*→\s*\S+)/);
+      if (m) { autoStatus.lastAction = `Swapping ${m[1]}`; }
+    } else if (msg.includes("[SWAP] SUCCESS")) {
+      autoStatus.swap = "DONE";
+      const m = msg.match(/SUCCESS\s+(\S+)/);
+      if (m) { autoStatus.lastAction = `Swap OK ${m[1]}`; }
+    } else if (msg.includes("[AUTO] OPENING")) {
+      autoStatus.state = "OPEN";
+      const m = msg.match(/OPENING\s+(\w+)/);
+      if (m) { autoStatus.direction = m[1]; autoStatus.lastAction = `Opening ${m[1]}...`; }
+    } else if (msg.includes("[AUTO] CLOSING")) {
+      autoStatus.state = "CLOSE";
+      autoStatus.lastAction = "Closing position...";
+    } else if (msg.includes("CYCLE START")) {
+      autoStatus.state = "CYCLING";
+    } else if (msg.includes("DIRECTION:")) {
+      const m = msg.match(/DIRECTION:\s*(\w+)/);
+      if (m) { autoStatus.direction = m[1]; }
     } else if (msg.includes("BLOCKED")) {
       autoStatus.lastAction = "Blocked — see log";
     } else if (msg.includes("ERROR")) {

@@ -107,9 +107,11 @@ async function main() {
   const autoConfig = {
     defaultLeverage: leverage,
     maxLeverage: 5,
-    autoLoopIntervalMs: once ? 0 : 30_000,
+    autoLoopIntervalMs: once ? 0 : 5_000,
     ethGuard: { ...DEFAULT_ETH_GUARD },
     dryRun,
+    cooldownAfterOpenMs: 3_000,
+    cooldownAfterCloseMs: 3_000,
     autoSwap: config.autoSwap,
   };
 

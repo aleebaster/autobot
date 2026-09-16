@@ -1147,6 +1147,7 @@ export class AutoTrader {
     this.currentState = STATES.IDLE;
     this._logListeners = [];
     this.txManager = new TxManager();
+    this.lastCycleAction = "idle";
   }
 
   onLog(fn) { this._logListeners.push(fn); }
@@ -1200,9 +1201,16 @@ export class AutoTrader {
       // Log full token inventory
       await logInventory(provider, walletAddr, this.log.bind(this));
 
-      // PHASE 0: AUTO-SWAP — proactive token rebalancing (when no active position)
+      // NEXT ACTION prediction for TUI
+      if (this.state.activePosition) {
+        this.log(`[AUTO] NEXT ACTION: CLOSE position #${this.state.activePosition.positionId}`, "info");
+      } else {
+        this.log(`[AUTO] NEXT ACTION: SWAP + OPEN ${this.config.defaultLeverage}x`, "info");
+      }
+
+      // PHASE 0: AUTO-SWAP — proactive token rebalancing (always)
       const autoSwapConfig = this.config.autoSwap || {};
-      if (autoSwapConfig.enabled && !this.state.activePosition) {
+      if (autoSwapConfig.enabled) {
         this.setState(STATES.AUTO_SWAP);
         const maxSwaps = autoSwapConfig.maxSwapsPerCycle || 2;
         const tokenAddrs = { USDC, USDT, WETH };
@@ -1377,6 +1385,10 @@ export class AutoTrader {
         } else {
           this.log(`[CLOSE] failed — will retry next cycle`, "warn");
         }
+
+        this.lastCycleAction = "close";
+        this.log("[CYCLE] ═══ CYCLE END ═══", "info");
+        return;
       }
 
       // PHASE 2: SELECT DIRECTION (alternating LONG/SHORT, or use RSI)
@@ -1578,6 +1590,7 @@ export class AutoTrader {
         this.log(`[BLOCKED] Open failed — skipping cycle`, "error");
       }
 
+      this.lastCycleAction = openResult ? "open" : "idle";
       this.log("[CYCLE] ═══ CYCLE END ═══", "info");
     } catch (e) {
       this.log(`[ERROR] Cycle error: ${e.message?.slice(0, 80)}`, "error");
@@ -1594,23 +1607,14 @@ export class AutoTrader {
 
     try {
       this.log("══════════════════════════════════════════════", "warn");
-      this.log("  AUTONOMOUS TRADING LOOP STARTED", "warn");
-      this.log(`  Interval: ${this.config.autoLoopIntervalMs / 1000}s`, "info");
+      this.log("  CONTINUOUS AUTO TRADING STARTED", "warn");
       this.log(`  Leverage: ${this.config.defaultLeverage}x`, "info");
       this.log(`  Dry run: ${this.config.dryRun}`, "info");
-
-      // Log autoSwap config
-      const asCfg = this.config.autoSwap || {};
-      this.log(`[AUTO-SWAP] enabled=${asCfg.enabled === true}`, "info");
-      this.log(`[AUTO-SWAP] cooldown=${asCfg.swapCooldownMs || 20000}ms`, "info");
-      this.log(`[AUTO-SWAP] maxSwapsPerCycle=${asCfg.maxSwapsPerCycle || 2}`, "info");
-      this.log(`[AUTO-SWAP] amountRange=${asCfg.swapMinPercent || 3}%-${asCfg.swapMaxPercent || 15}%`, "info");
-
       this.log("══════════════════════════════════════════════", "warn");
 
-      // Restart recovery — wrapped in try/catch so RPC failures don't kill the loop
+      // Recovery
       try {
-        this.log("[RECOVERY] scanning on-chain for active positions...", "info");
+        this.log("[RECOVERY] scanning on-chain...", "info");
         const { provider } = this.getRuntime();
         const recovered = await recoverPosition(
           provider, this.deps.accounts[this.deps.selectedWalletIndex].address,
@@ -1627,18 +1631,49 @@ export class AutoTrader {
           saveState(this.state);
         }
       } catch (re) {
-        this.log(`[RECOVERY] scan failed (will retry next cycle): ${re.message?.slice(0, 80)}`, "error");
+        this.log(`[RECOVERY] failed: ${re.message?.slice(0, 60)}`, "error");
       }
 
+      // CONTINUOUS RUNNER — never stops
       while (!this.stopRequested) {
-        try { await this.runCycle(); }
-        catch (e) { this.log(`[ERROR] Unhandled: ${e.message?.slice(0, 80)}`, "error"); }
-        if (!this.stopRequested && this.config.autoLoopIntervalMs > 0) {
-          await this.sleep(this.config.autoLoopIntervalMs);
+        try {
+          // STEP 1: Random token-to-token swaps
+          if (!this.stopRequested) {
+            await this.doRandomSwaps();
+          }
+
+          // STEP 2: Open position if none active
+          if (!this.state.activePosition && !this.stopRequested) {
+            const side = this.nextSide();
+            this.log(`[AUTO] NEXT ACTION: OPEN ${side}`, "info");
+            this.setState(STATES.OPEN);
+            await this.prepareAndOpen(side);
+          }
+
+          // STEP 3: Brief wait after open
+          if (!this.stopRequested) {
+            await this.sleep(this.randomDelay(3000, 5000));
+          }
+
+          // STEP 4: Close position if active
+          if (this.state.activePosition && !this.stopRequested) {
+            this.log(`[AUTO] NEXT ACTION: CLOSE position #${this.state.activePosition.positionId}`, "info");
+            await this.closeActivePosition();
+          }
+
+          // STEP 5: Brief wait after close
+          if (!this.stopRequested) {
+            await this.sleep(this.randomDelay(3000, 5000));
+          }
+
+        } catch (e) {
+          this.log(`[ERROR] Loop iteration: ${e.message?.slice(0, 80)}`, "error");
+          this.txManager.resetNonce();
+          await this.sleep(5000);
         }
       }
     } catch (fatal) {
-      this.log(`[FATAL] start() crashed: ${fatal.message?.slice(0, 80)} — loop halted`, "error");
+      this.log(`[FATAL] ${fatal.message?.slice(0, 80)}`, "error");
     } finally {
       this.running = false;
       this.log("[AUTO] Trading loop stopped.", "warn");
@@ -1648,6 +1683,302 @@ export class AutoTrader {
   stop() {
     this.stopRequested = true;
     this.log("[AUTO] Stop requested.", "warn");
+  }
+
+  randomDelay(minMs, maxMs) {
+    return minMs + Math.floor(Math.random() * (maxMs - minMs));
+  }
+
+  nextSide() {
+    return this.state.lastSide === "LONG" ? "SHORT" : "LONG";
+  }
+
+  async doRandomSwaps() {
+    const autoSwapConfig = this.config.autoSwap || {};
+    if (!autoSwapConfig.enabled) return;
+
+    const { provider, wallet } = this.getRuntime();
+    const walletAddr = wallet.address;
+    const dryRun = this.config.dryRun;
+    const tokenAddrs = { USDC, USDT, WETH };
+
+    const swapCount = 1 + Math.floor(Math.random() * 2);
+    this.log(`[AUTO] SWAPPING — ${swapCount} random swap(s)`, "info");
+
+    for (let i = 0; i < swapCount; i++) {
+      if (this.stopRequested) break;
+
+      try {
+        const freshBalances = {};
+        for (const [sym, addr] of Object.entries(tokenAddrs)) {
+          try {
+            const c = new ethers.Contract(addr, ERC20_ABI, provider);
+            const bal = await c.balanceOf(walletAddr);
+            freshBalances[sym] = { raw: bal, float: parseFloat(ethers.formatUnits(bal, TOKEN_DECIMALS[sym] || 6)) };
+          } catch { freshBalances[sym] = { raw: 0n, float: 0 }; }
+        }
+
+        const pair = selectRandomSwapPair(this.swapJournal, freshBalances, autoSwapConfig, tokenAddrs, this.log.bind(this));
+        if (!pair) {
+          this.log(`[AUTO-SWAP] No valid pair`, "info");
+          break;
+        }
+
+        const fromBal = freshBalances[pair.from];
+        if (!fromBal || fromBal.float <= 0) continue;
+
+        const amountResult = calculateRandomSwapAmount(pair.from, fromBal.float, autoSwapConfig);
+        if (!amountResult) continue;
+
+        const decimals = TOKEN_DECIMALS[pair.from] || 6;
+        const amountRaw = ethers.parseUnits(amountResult.amountFloat.toFixed(decimals), decimals);
+
+        if (amountRaw > fromBal.raw * 90n / 100n) continue;
+        if (amountRaw > fromBal.raw) continue;
+
+        const router = new ethers.Contract("0x8f6eB7870334b1FD8006Fd52413f01689f4E57e9", ROUTER_ABI, provider);
+        const quote = await router.getAmountsOut(amountRaw, [pair.fromAddr, pair.toAddr]);
+        const expectedOut = quote[1];
+        const toDecimals = TOKEN_DECIMALS[pair.to] || 6;
+        const amountOutMin = applySlippage(expectedOut, BigInt(autoSwapConfig.slippageBps || 50));
+
+        this.log(`[AUTO] SWAPPING ${pair.from} → ${pair.to} [${ethers.formatUnits(amountRaw, decimals)}]`, "warn");
+
+        if (dryRun) {
+          this.log(`[DRY] Would swap ${amountResult.amountFloat.toFixed(4)} ${pair.from} → ${pair.to}`, "info");
+          this.swapJournal.record({ from: pair.from, to: pair.to, amount: amountResult.amountFloat });
+          continue;
+        }
+
+        const swapResult = await executeSwap({
+          wallet, provider,
+          fromToken: pair.fromAddr, toToken: pair.toAddr,
+          amount: amountRaw, amountOutMin,
+          config: this.config, log: this.log.bind(this), txManager: this.txManager,
+        });
+
+        if (swapResult) {
+          this.swapJournal.record({ from: pair.from, to: pair.to, amount: amountResult.amountFloat });
+          this.log(`[SWAP] SUCCESS ${pair.from}→${pair.to}`, "success");
+        } else {
+          this.log(`[SWAP] FAILED ${pair.from}→${pair.to}`, "error");
+        }
+
+        if (i < swapCount - 1) {
+          await this.sleep(this.randomDelay(5000, 15000));
+        }
+      } catch (e) {
+        this.log(`[AUTO-SWAP] Error: ${e.message?.slice(0, 60)}`, "error");
+        this.txManager.resetNonce();
+      }
+    }
+  }
+
+  async closeActivePosition() {
+    if (!this.state.activePosition) return false;
+
+    const { provider, wallet } = this.getRuntime();
+    const managerAddr = this.getManagerAddr();
+    const dryRun = this.config.dryRun;
+
+    this.setState(STATES.CLOSE);
+    this.log(`[AUTO] CLOSING position #${this.state.activePosition.positionId} (${this.state.activePosition.side})`, "warn");
+
+    const closeResult = await closePositionFn({
+      wallet, provider, managerAddr,
+      positionId: this.state.activePosition.positionId,
+      config: this.config, log: this.log.bind(this), dryRun, txManager: this.txManager,
+    });
+
+    if (closeResult?.failed) {
+      this.log(`[CLOSE] Position gone — clearing state`, "warn");
+      this.state.activePosition = null;
+      this.state.sessionStats.closes++;
+      saveState(this.state);
+      return true;
+    } else if (closeResult) {
+      this.log(`[CLOSE] SUCCESS — TX: ${closeResult.txHash || "dry-run"}`, "success");
+      this.state.activePosition = null;
+      this.state.sessionStats.closes++;
+      saveState(this.state);
+      return true;
+    } else {
+      this.log(`[CLOSE] Failed — will retry`, "error");
+      return false;
+    }
+  }
+
+  async prepareAndOpen(side) {
+    const { provider, wallet } = this.getRuntime();
+    const walletAddr = wallet.address;
+    const managerAddr = this.getManagerAddr();
+    const poolAddr = this.getPoolAddr();
+    const dryRun = this.config.dryRun;
+
+    const collateralToken = side === "LONG" ? USDT : WETH;
+    const collateralDecimals = side === "LONG" ? 6 : 18;
+    const collateralSym = side === "LONG" ? "USDT" : "WETH";
+
+    const targetStr = side === "LONG"
+      ? (this.config.targetCollateralUSDT || "10")
+      : (this.config.targetCollateralWETH || "0.002");
+    const collateralAmount = side === "LONG"
+      ? ethers.parseUnits(targetStr, 6)
+      : ethers.parseEther(targetStr);
+
+    const reserveStr = side === "LONG"
+      ? (this.config.targetReserveUSDT || "20")
+      : (this.config.targetReserveWETH || "0.004");
+    const targetReserve = side === "LONG"
+      ? ethers.parseUnits(reserveStr, 6)
+      : ethers.parseEther(reserveStr);
+
+    this.log(`[AUTO] OPENING ${side} ${this.config.defaultLeverage}x — collateral: ${collateralSym}`, "warn");
+
+    // Check collateral
+    const tokenContract = new ethers.Contract(collateralToken, ERC20_ABI, provider);
+    const balance = await tokenContract.balanceOf(walletAddr);
+
+    if (collateralAmount <= 0n) {
+      this.log(`[BLOCKED] Invalid collateral`, "error");
+      return false;
+    }
+
+    const deficit = calculateInventoryDeficit({
+      balance, required: collateralAmount, targetReserve,
+      decimals: collateralDecimals, sym: collateralSym,
+      log: this.log.bind(this),
+    });
+
+    if (deficit.action !== "none") {
+      this.log(`[AUTO] SWAPPING for ${collateralSym} collateral`, "warn");
+      const sources = side === "LONG" ? LONG_SOURCES : SHORT_SOURCES;
+      let swapSuccess = false;
+
+      for (const sourceToken of sources) {
+        try {
+          const sourceContract = new ethers.Contract(sourceToken, ERC20_ABI, provider);
+          const sourceBalance = await sourceContract.balanceOf(walletAddr);
+          const sourceDecimals = sourceToken === WETH ? 18 : 6;
+          const sourceSym = sourceToken === USDT ? "USDT" : sourceToken === USDC ? "USDC" : "WETH";
+
+          if (sourceBalance <= 0n) {
+            this.log(`[SWAP] ${sourceSym} balance=0 — skip`, "info");
+            continue;
+          }
+
+          this.log(`[SWAP] ${sourceSym} → ${collateralSym}: balance=${ethers.formatUnits(sourceBalance, sourceDecimals)}`, "info");
+
+          const router = new ethers.Contract("0x8f6eB7870334b1FD8006Fd52413f01689f4E57e9", ROUTER_ABI, provider);
+          const fullQuote = await router.getAmountsOut(sourceBalance, [sourceToken, collateralToken]);
+          const expectedOut = fullQuote[1];
+
+          if (expectedOut < deficit.swapAmount) {
+            this.log(`[SWAP] ${sourceSym} insufficient: max output < needed`, "warn");
+            continue;
+          }
+
+          const neededWithBuffer = deficit.swapAmount * 101n / 100n;
+          let swapAmount = neededWithBuffer * sourceBalance / expectedOut;
+          if (swapAmount > sourceBalance) swapAmount = sourceBalance;
+          const amountOutMin = deficit.swapAmount * 98n / 100n;
+
+          this.log(`[AUTO] SWAPPING ${sourceSym} → ${collateralSym}`, "warn");
+
+          if (dryRun) {
+            this.log(`[DRY] Would swap ${sourceSym} → ${collateralSym}`, "info");
+            swapSuccess = true;
+            break;
+          }
+
+          const swapResult = await executeSwap({
+            wallet, provider, fromToken: sourceToken, toToken: collateralToken,
+            amount: swapAmount, amountOutMin, config: this.config,
+            log: this.log.bind(this), txManager: this.txManager,
+          });
+
+          if (swapResult) {
+            const newBalance = await tokenContract.balanceOf(walletAddr);
+            this.log(`[SWAP] ${collateralSym} balance_after=${ethers.formatUnits(newBalance, collateralDecimals)}`, "info");
+            if (newBalance >= collateralAmount) {
+              swapSuccess = true;
+              break;
+            }
+          }
+        } catch (e) {
+          this.log(`[SWAP] ${sourceSym} → ${collateralSym} failed: ${e.message?.slice(0, 60)}`, "error");
+          this.txManager.resetNonce();
+          continue;
+        }
+      }
+
+      // Last resort: ETH → WETH for SHORT
+      if (!swapSuccess && !dryRun && side === "SHORT") {
+        try {
+          const currentWethBal = await new ethers.Contract(WETH, ERC20_ABI, provider).balanceOf(walletAddr);
+          const remainingDeficit = collateralAmount > currentWethBal ? collateralAmount - currentWethBal : 0n;
+          if (remainingDeficit > 0n) {
+            const ethBalance = await provider.getBalance(walletAddr);
+            const gasReserve = ethers.parseEther(String(this.config.ethGuard?.MIN_ETH_GAS_RESERVE ?? 0.003));
+            const ethAvail = ethBalance - gasReserve - ethers.parseEther("0.005");
+            const wrapAmount = remainingDeficit > ethAvail ? ethAvail : remainingDeficit;
+            if (wrapAmount > ethers.parseEther("0.0001")) {
+              this.log(`[AUTO] SWAPPING ETH → WETH (wrap ${ethers.formatEther(wrapAmount)})`, "warn");
+              const wethContract = new ethers.Contract(WETH, ["function deposit() payable", "function balanceOf(address) view returns (uint256)"], wallet);
+              const feeParams = await getFeeParams(provider);
+              const r = await this.txManager.sendAndWait({
+                wallet, provider, txType: "WETH-WRAP",
+                sendFn: (nonce) => wethContract.deposit({ value: wrapAmount, gasLimit: 100000n, ...feeParams, nonce }),
+                log: this.log.bind(this),
+              });
+              if (r && r.status === 1) {
+                const wethBal = await new ethers.Contract(WETH, ERC20_ABI, provider).balanceOf(walletAddr);
+                if (wethBal >= collateralAmount) swapSuccess = true;
+              }
+            }
+          }
+        } catch (e) {
+          this.log(`[SWAP] ETH→WETH wrap failed: ${e.message?.slice(0, 60)}`, "error");
+        }
+      }
+
+      if (!swapSuccess && !dryRun) {
+        this.log(`[BLOCKED] No source for ${collateralSym}`, "error");
+        return false;
+      }
+    }
+
+    // Open position
+    this.setState(STATES.OPEN);
+    const openResult = await openPosition({
+      wallet, provider, managerAddr, poolAddr, side, collateralToken, collateralAmount,
+      leverage: this.config.defaultLeverage,
+      config: this.config, log: this.log.bind(this), dryRun, txManager: this.txManager,
+    });
+
+    if (openResult?.dryRun) {
+      this.log(`[DRY] Open ${side} would execute`, "info");
+      this.state.lastSide = side;
+      saveState(this.state);
+      return true;
+    } else if (openResult) {
+      this.state.activePosition = {
+        positionId: openResult.positionId,
+        side, collateralToken,
+        collateralAmount: collateralAmount.toString(),
+        leverage: this.config.defaultLeverage,
+        openedAt: Date.now(),
+        txHash: openResult.txHash,
+      };
+      this.state.lastSide = side;
+      this.state.sessionStats.opens++;
+      saveState(this.state);
+      this.log(`[OPEN] SUCCESS — position #${openResult.positionId} (${side})`, "success");
+      return true;
+    } else {
+      this.log(`[BLOCKED] Open failed`, "error");
+      return false;
+    }
   }
 
   sleep(ms) {
