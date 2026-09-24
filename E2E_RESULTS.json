@@ -1,0 +1,80 @@
+{
+  "date": "2026-09-24T06:38:27.796Z",
+  "wallet": "0x315E5193633A962B3F369F9C3833D973D0588cCD",
+  "results": [
+    {
+      "step": "BALANCES before",
+      "ok": true,
+      "balances": {
+        "ETH": "16.787743956252193147",
+        "USDT": "242886935.946965",
+        "USDC": "266310202.40143",
+        "WETH": "0.004787491564849553",
+        "NEMESIS": "189.705879"
+      }
+    },
+    {
+      "step": "SWAP 0x5dcf→0x5f2E",
+      "ok": true,
+      "hash": "0x7223a62f3969832835fad0e70773e0f6be0e92f177720f06154ed63f3fb6746a"
+    },
+    {
+      "step": "OPEN SHORT",
+      "ok": true,
+      "txHash": "0x83bb739659bdbe501a9a05c744cad4aa304a6f620ef5db34cbb5955ec01ef04b",
+      "positionId": 991,
+      "market": "NEMESIS/USDT",
+      "manager": "0xD45dde32C66769ED835A0F0f45EC0bF6973857FD",
+      "collateral": "USDT",
+      "amount": "10",
+      "leverage": 2
+    },
+    {
+      "step": "CLOSE #991",
+      "ok": true,
+      "txHash": "0xef2cdd1c7d3c9c81134ce890bbccc4efda67ffa67815b023b1ebfc5f11c3d4ed",
+      "positionId": 991
+    },
+    {
+      "step": "BALANCES after SHORT",
+      "ok": true,
+      "balances": {
+        "ETH": "16.784740970209796739",
+        "USDT": "362928354.975255",
+        "USDC": "0.0",
+        "WETH": "0.004559514674030236",
+        "NEMESIS": "189.705879"
+      }
+    },
+    {
+      "step": "OPEN LONG",
+      "ok": true,
+      "txHash": "0x0753557546bdb9aae7a29c85707939b9694348f74b7fbe06b1f9468eee081632",
+      "positionId": 992,
+      "market": "NEMESIS/USDT",
+      "manager": "0xD45dde32C66769ED835A0F0f45EC0bF6973857FD",
+      "collateral": "0x18D1...8842",
+      "amount": "10",
+      "leverage": 2
+    },
+    {
+      "step": "CLOSE #992",
+      "ok": true,
+      "txHash": "0x7bc647bac11db70e25c2e213141ce8b3ad3f9f00d103dd42786edfb5572a4d8e",
+      "positionId": 992
+    },
+    {
+      "step": "BALANCES after LONG",
+      "ok": true,
+      "balances": {
+        "ETH": "16.781852029152557811",
+        "USDT": "362928254.975255",
+        "USDC": "2598831.161916",
+        "WETH": "0.004559514674030236",
+        "NEMESIS": "189.583284"
+      }
+    }
+  ],
+  "pass": 8,
+  "fail": 0
+}

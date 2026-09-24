@@ -1,0 +1,70 @@
+{
+  "pass": 9,
+  "fail": 0,
+  "results": [
+    {
+      "step": "DISCOVER markets",
+      "ok": true,
+      "count": 21
+    },
+    {
+      "step": "DISCOVER routes",
+      "ok": true,
+      "count": 42
+    },
+    {
+      "step": "SWAP NEMESIS→? 5000000",
+      "ok": true,
+      "hash": "0x87ba14b485d4443d04f7753336998f4cb1e3a063bc5f0e08b976e50a7cc820ee",
+      "from": "NEMESIS",
+      "amountIn": "5.0",
+      "expectedOut": "4001.564063"
+    },
+    {
+      "step": "SWAP USDT→? 134341394965",
+      "ok": true,
+      "hash": "0x6940b1e10cba1a12bab3e179fdc4605b3245b01fd8fee7c29883dfbf7803bf36",
+      "from": "USDT",
+      "amountIn": "134341.394965",
+      "expectedOut": "164.464308"
+    },
+    {
+      "step": "PICK markets",
+      "ok": true,
+      "long": "USDC/USDT",
+      "short": "USDT/DAI"
+    },
+    {
+      "step": "OPEN LONG USDC/USDT",
+      "ok": true,
+      "positionId": 48,
+      "txHash": "0x783995f79b35bc77ca9e33a6e22cd2e5b298ee0a4c69a549b990e919b2c131c6",
+      "market": "USDC/USDT",
+      "manager": "0xAbC78D0650f47426DeF16286FF0cE9CFD501e80e",
+      "collateral": "USDC"
+    },
+    {
+      "step": "CLOSE LONG USDC/USDT #48",
+      "ok": true,
+      "txHash": "0xf11824da0c2602832dec03c5a1049df156efe89a79b674308758f78683b8dd3c",
+      "positionId": 48,
+      "manager": "0xAbC78D0650f47426DeF16286FF0cE9CFD501e80e"
+    },
+    {
+      "step": "OPEN SHORT USDT/DAI",
+      "ok": true,
+      "positionId": 68,
+      "txHash": "0xf803256994419d1292585ead9d4e2582125bf7776b6d95c004ed78e2b842e3f1",
+      "market": "USDT/DAI",
+      "manager": "0x46c9835f3412f25Fd2706fDc8aDf04B14f943289",
+      "collateral": "DAI"
+    },
+    {
+      "step": "CLOSE SHORT USDT/DAI #68",
+      "ok": true,
+      "txHash": "0xfed1017936d518aeb7eb180d0d7d9fbf22ca49cfe1e206ac1751ae20ae6ef18a",
+      "positionId": 68,
+      "manager": "0x46c9835f3412f25Fd2706fDc8aDf04B14f943289"
+    }
+  ]
+}

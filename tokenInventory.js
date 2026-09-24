@@ -766,6 +766,8 @@ class SwapJournal {
 //  RANDOM SWAP AMOUNT CALCULATOR
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// Default (fallback) swap pairs — used only when dynamic route discovery is unavailable.
+// The live bot builds its pair list from swapRoutes.discoverSwapRoutes() instead.
 const DEFAULT_AUTO_SWAP_PAIRS = [
   { from: "USDC", to: "USDT" },
   { from: "USDT", to: "USDC" },
@@ -773,13 +775,35 @@ const DEFAULT_AUTO_SWAP_PAIRS = [
   { from: "WETH", to: "USDT" },
   { from: "USDC", to: "WETH" },
   { from: "WETH", to: "USDC" },
+  { from: "USDT", to: "NEMESIS" },
+  { from: "NEMESIS", to: "USDT" },
+  { from: "USDT", to: "UNI" },
+  { from: "UNI", to: "USDT" },
+  { from: "USDT", to: "LINK" },
+  { from: "LINK", to: "USDT" },
+  { from: "USDT", to: "DAI" },
+  { from: "DAI", to: "USDT" },
+  { from: "USDC", to: "NEMESIS" },
+  { from: "NEMESIS", to: "USDC" },
+  { from: "USDC", to: "UNI" },
+  { from: "UNI", to: "USDC" },
+  { from: "USDC", to: "LINK" },
+  { from: "LINK", to: "USDC" },
+  { from: "USDC", to: "DAI" },
+  { from: "DAI", to: "USDC" },
 ];
 
+// Fallback decimals ONLY — the bot always prefers on-chain token.decimals()
+// (discovered via marketDiscovery/swapRoutes and passed in as `decimalsOverride`).
 const TOKEN_DECIMALS = {
   USDC: 6,
   USDT: 6,
   WETH: 18,
   ETH: 18,
+  DAI: 6,
+  UNI: 6,
+  LINK: 6,
+  NEMESIS: 6,
 };
 
 function pickRandom(arr) {
@@ -797,27 +821,63 @@ function randomInRange(min, max) {
  * - ETH→token (when preferTokenToToken is true)
  *
  * @param {SwapJournal} journal
- * @param {Map<string, {raw: bigint, float: number}>} balances
+ * @param {object} balances  { SYM: {raw, float} }
  * @param {object} autoSwapConfig
- * @returns {{ from: string, to: string, fromAddr: string, toAddr: string } | null}
+ * @param {object} tokenAddrs  { SYM: address } — fallback pairs only
+ * @param {Function} log
+ * @param {Array|null} routes  DYNAMIC routes from swapRoutes.discoverSwapRoutes()
+ *                             ([{from,to,fromAddr,toAddr,path,type,key}]) — preferred
+ * @param {RotationMemory|null} rotation  anti-repetition rotation memory
+ * @returns {{ from: string, to: string, fromAddr: string, toAddr: string, path?: string[], type?: string } | null}
  */
-function selectRandomSwapPair(journal, balances, autoSwapConfig, tokenAddrs, log = () => {}) {
+function selectRandomSwapPair(journal, balances, autoSwapConfig, tokenAddrs, log = () => {}, routes = null, rotation = null) {
   const preferTokenToToken = autoSwapConfig.preferTokenToToken !== false;
   const cooldownMs = autoSwapConfig.swapCooldownMs || 20000;
 
-  let candidates = DEFAULT_AUTO_SWAP_PAIRS.filter(pair => {
+  // Accept both discovery shape ({fromSym,toSym,...}) and routeCandidates shape ({from,to,...})
+  const toCandidate = (r) => {
+    const from = r.from ?? r.fromSym;
+    const to = r.to ?? r.toSym;
+    if (!from || !to) return null;
+    return {
+      from, to,
+      fromAddr: r.fromAddr, toAddr: r.toAddr,
+      path: r.path, type: r.type || "direct",
+      key: r.key || `${from}>${to}`,
+    };
+  };
+
+  const baseCandidates = (routes && routes.length)
+    ? routes.map(toCandidate).filter(Boolean)
+    : DEFAULT_AUTO_SWAP_PAIRS.map(p => ({
+        from: p.from, to: p.to,
+        fromAddr: tokenAddrs?.[p.from], toAddr: tokenAddrs?.[p.to],
+        path: [tokenAddrs?.[p.from], tokenAddrs?.[p.to]], type: "direct",
+        key: `${p.from}>${p.to}`,
+      }));
+
+  let candidates = baseCandidates.filter(pair => {
+    if (!pair.fromAddr || !pair.toAddr) return false;
     const fromBal = balances[pair.from];
-    const toBal = balances[pair.to];
     if (!fromBal || fromBal.float <= 0) return false;
     if (preferTokenToToken && pair.from === "ETH") return false;
-    if (journal.wasRecentlySwapped(pair.from, pair.to, cooldownMs)) return false;
-    if (journal.wouldCreateCycle(pair.from, pair.to)) return false;
+    if (journal && journal.wasRecentlySwapped(pair.from, pair.to, cooldownMs)) return false;
+    if (journal && journal.wouldCreateCycle(pair.from, pair.to)) return false;
     return true;
   });
 
   if (candidates.length === 0) {
     log(`[AUTO-SWAP] No valid swap pairs available`, "warn");
     return null;
+  }
+
+  // Rotation-aware selection: least-recently-used + no immediate repeats
+  if (rotation) {
+    const picked = rotation.pickSwapPair(candidates);
+    if (picked) {
+      log(`[AUTO-SWAP] Rotated pair: ${picked.from} → ${picked.to} (${picked.type || "direct"}, from ${candidates.length} candidates)`, "info");
+      return picked;
+    }
   }
 
   candidates.sort((a, b) => {
@@ -829,50 +889,68 @@ function selectRandomSwapPair(journal, balances, autoSwapConfig, tokenAddrs, log
   const topN = candidates.slice(0, Math.min(3, candidates.length));
   const selected = pickRandom(topN);
 
-  const fromAddr = tokenAddrs[selected.from];
-  const toAddr = tokenAddrs[selected.to];
-
   log(`[AUTO-SWAP] Selected pair: ${selected.from} → ${selected.to} (from ${candidates.length} candidates)`, "info");
 
-  return { from: selected.from, to: selected.to, fromAddr, toAddr };
+  return selected;
 }
+
+// Per-token absolute bounds used when config has no `minSwapAmount{SYM}`/`maxSwapAmount{SYM}`.
+// Values are human units; raw amounts always use on-chain decimals.
+const SWAP_AMOUNT_BOUNDS = {
+  WETH:   { min: "0.0001", max: "0.01" },
+  ETH:    { min: "0.0001", max: "0.01" },
+  USDT:   { min: "1",      max: "100" },
+  USDC:   { min: "1",      max: "100" },
+  DAI:    { min: "1",      max: "100" },
+  UNI:    { min: "0.01",   max: "10" },
+  LINK:   { min: "0.1",    max: "20" },
+  NEMESIS:{ min: "0.5",    max: "50" },
+};
 
 /**
  * Calculate a random swap amount for the selected pair.
- * Uses percentage of available balance with min/max bounds.
+ * Primary rule (unchanged): 3%–15% of the available balance,
+ * clamped by per-token min/max and by a 90%-of-balance safety cap.
+ * Returns null when the balance is too small for a safe operation.
  *
  * @param {string} fromSym
  * @param {number} fromBalanceFloat
  * @param {object} autoSwapConfig
+ * @param {number} [decimalsOverride] on-chain decimals (preferred over TOKEN_DECIMALS)
  * @returns {{ amountFloat: number, reason: string } | null}
  */
-function calculateRandomSwapAmount(fromSym, fromBalanceFloat, autoSwapConfig) {
+function calculateRandomSwapAmount(fromSym, fromBalanceFloat, autoSwapConfig, decimalsOverride) {
   const minPercent = autoSwapConfig.swapMinPercent || 3;
   const maxPercent = autoSwapConfig.swapMaxPercent || 15;
-  const decimals = TOKEN_DECIMALS[fromSym] || 6;
 
-  const minAmountStr = autoSwapConfig[`minSwapAmount${fromSym}`] || "1";
-  const maxAmountStr = autoSwapConfig[`maxSwapAmount${fromSym}`] || "100";
+  const bounds = SWAP_AMOUNT_BOUNDS[String(fromSym).toUpperCase()] || { min: "0.001", max: "100" };
+  const minAmountStr = autoSwapConfig[`minSwapAmount${fromSym}`] ?? bounds.min;
+  const maxAmountStr = autoSwapConfig[`maxSwapAmount${fromSym}`] ?? bounds.max;
   const minAmount = parseFloat(minAmountStr);
   const maxAmount = parseFloat(maxAmountStr);
+
+  if (!Number.isFinite(fromBalanceFloat) || fromBalanceFloat <= 0) return null;
 
   const percent = randomInRange(minPercent, maxPercent);
   let amountFloat = fromBalanceFloat * (percent / 100);
 
-  amountFloat = Math.max(amountFloat, minAmount);
-  amountFloat = Math.min(amountFloat, maxAmount);
+  if (amountFloat > maxAmount) amountFloat = maxAmount;
+  if (amountFloat > fromBalanceFloat * 0.9) amountFloat = fromBalanceFloat * 0.9;
 
-  if (amountFloat > fromBalanceFloat * 0.9) {
-    amountFloat = fromBalanceFloat * randomInRange(0.05, 0.15);
+  if (amountFloat < minAmount) {
+    // Balance too small for a safe operation → skip (never force a dust swap)
+    if (fromBalanceFloat < minAmount) {
+      return null;
+    }
+    amountFloat = Math.min(minAmount, fromBalanceFloat * 0.9);
   }
 
-  if (amountFloat < minAmount * 0.5) {
-    return null;
-  }
+  if (!(amountFloat > 0)) return null;
 
   return {
     amountFloat,
-    reason: `random ${percent.toFixed(1)}% of ${fromBalanceFloat.toFixed(2)} balance`,
+    decimals: decimalsOverride ?? TOKEN_DECIMALS[fromSym] ?? 6,
+    reason: `random ${percent.toFixed(1)}% of ${fromBalanceFloat} balance`,
   };
 }
 
@@ -903,4 +981,6 @@ export {
   getTokenAddress,
   getSwapPairs,
   TOKEN_DECIMALS,
+  DEFAULT_AUTO_SWAP_PAIRS,
+  SWAP_AMOUNT_BOUNDS,
 };

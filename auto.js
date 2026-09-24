@@ -75,8 +75,11 @@ async function main() {
   console.log("═══════════════════════════════════════════════════════");
   console.log(`  Factory:     ${deployment.factory}`);
   console.log(`  Router:      ${deployment.router}`);
-  console.log(`  Manager:     ${confirmedPools["NEMESIS/USDT"]?.manager || confirmedPools["ETH/USDT"]?.manager || "N/A"}`);
-  console.log(`  Market:      NEMESIS/USDT (preferred)`);
+  const marketCount = Object.keys(confirmedPools || {}).length;
+  const sampleMgr = Object.values(confirmedPools || {}).find(p => p?.manager)?.manager || "N/A";
+  console.log(`  Markets:     ${marketCount} confirmed pool(s) + dynamic factory discovery`);
+  console.log(`  Sample mgr:  ${sampleMgr}`);
+  console.log(`  Rotation:    all active MARKET × SIDE (no single preferred market)`);
   console.log(`  Leverage:    ${leverage}x`);
   console.log(`  Dry run:     ${dryRun}`);
   console.log(`  Once mode:   ${once}`);
@@ -123,7 +126,7 @@ async function main() {
     deadlineSeconds: config.deadlineSeconds || 1200,
     slippageBps: config.slippageBps || 50,
     availableMarkets: config.availableMarkets || [],
-    preferredMarket: config.preferredMarket || "NEMESIS/USDT",
+    preferredMarket: config.preferredMarket || null,
   };
 
   const deps = {

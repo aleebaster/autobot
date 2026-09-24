@@ -1,17 +1,9 @@
 {
-  "activePosition": {
-    "positionId": 3927,
-    "side": "LONG",
-    "collateralToken": "0x5f2E83cCDEa73D60aF400e03F1Cd8Fb9eaB07b20",
-    "collateralAmount": "10000000",
-    "leverage": 2,
-    "openedAt": 1789463294857,
-    "txHash": "0xf8bc57678deef06f9fa066f317d360954156406ac3dc62dc0d72fd065c599621"
-  },
+  "activePosition": null,
   "sessionStats": {
-    "opens": 2792,
-    "closes": 2776
+    "opens": 1475,
+    "closes": 1475
   },
   "lastCycleTime": 0,
-  "lastSide": "LONG"
+  "lastSide": "SHORT"
 }

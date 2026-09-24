@@ -1,11 +1,30 @@
 import { ethers } from "ethers";
 import fs from "fs";
 import { TokenInventory, EthSessionTracker, DEFAULT_ETH_GUARD, calculateInventoryDeficit, SwapJournal, selectRandomSwapPair, calculateRandomSwapAmount, getTokenAddress, getSwapPairs, TOKEN_DECIMALS } from "./tokenInventory.js";
-import { getRouterAddress } from "./deployments/index.js";
+import { getRouterAddress, getFactoryAddress, getActiveDeployment, getAllTokens, getConfirmedPools, getKnownMarkets } from "./deployments/index.js";
+import {
+  TokenMetaCache,
+  discoverMarkets,
+  mergeMarketSources,
+  collateralForSide,
+  collateralDecimalsForSide,
+  collateralSymbolForSide,
+  paymentTokenForMarket,
+  supportsSide,
+  marketKey,
+  normalizeSymbolKey,
+  enumerateMarketSides,
+  formatMarketsTable,
+  formatCoverageTable,
+} from "./marketDiscovery.js";
+import { discoverTokens, discoverSwapRoutes, findRoute, routeCandidates, sourcesForTarget, formatRoutesTable } from "./swapRoutes.js";
+import { RotationMemory } from "./rotation.js";
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  AUTONOMOUS TRADING LOOP — Nemesis Sepolia (V2 — CORRECTED)
+//  AUTONOMOUS TRADING LOOP — Nemesis Sepolia (V2 — MULTI-MARKET)
 //  FIX: openPosition ABI, borrowAmount, amountOutMin, oracle checkpoint
+//  NEW: dynamic market discovery, token0/token1 collateral rule, route-aware
+//       swaps and MARKET×SIDE rotation (no single-market hardcoding)
 // ═══════════════════════════════════════════════════════════════════════════
 
 const OPEN_POSITION_SELECTOR = "0xfa2b1dfd";
@@ -253,31 +272,124 @@ function lpBorrowToExpectedOut({ lpBorrowAmount, collateralToken, reserve0, rese
   return amountInWithFee * adjustedReserveOut / (adjustedReserveIn * BPS + amountInWithFee);
 }
 
-function tokenDecimalsOf(addr) {
-  return addr && addr.toLowerCase() === WETH.toLowerCase() ? 18 : 6;
+// ═══════════════════════════════════════════════════════════════════════════
+//  DISCOVERED MARKET REGISTRY — shared, on-chain verified
+//  Populated by ensureDiscoveredMarkets() / AutoTrader.ensureMarkets()
+// ═══════════════════════════════════════════════════════════════════════════
+
+let _discoveredMarkets = [];
+let _discoveredRoutes = [];
+let _discoveredTokens = [];
+let _discoveredMetaCache = null;
+const KNOWN_TOKEN_SYMBOLS = new Map(); // address(lower) → on-chain symbol (for logs only)
+
+export function setDiscoveredMarkets(markets = [], routes = [], tokens = [], metaCache = null) {
+  _discoveredMarkets = markets || [];
+  _discoveredRoutes = routes || [];
+  _discoveredTokens = tokens || [];
+  _discoveredMetaCache = metaCache || _discoveredMetaCache;
+  for (const t of _discoveredTokens) {
+    if (t?.address && t.symbol) KNOWN_TOKEN_SYMBOLS.set(String(t.address).toLowerCase(), t.symbol);
+  }
+  for (const m of _discoveredMarkets) {
+    if (m.token0 && m.token0Symbol) KNOWN_TOKEN_SYMBOLS.set(String(m.token0).toLowerCase(), m.token0Symbol);
+    if (m.token1 && m.token1Symbol) KNOWN_TOKEN_SYMBOLS.set(String(m.token1).toLowerCase(), m.token1Symbol);
+  }
 }
 
+export function getDiscoveredMarkets() { return _discoveredMarkets; }
+export function getDiscoveredRoutes() { return _discoveredRoutes; }
+export function getDiscoveredTokens() { return _discoveredTokens; }
+
+function readConfigJson() {
+  try { return JSON.parse(fs.readFileSync("config.json", "utf8")); } catch { return {}; }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  TOKEN META — ALWAYS `await token.decimals()` / `await token.symbol()`
+//  Hardcoded decimals are forbidden for any amount maths.
+// ═══════════════════════════════════════════════════════════════════════════
+
+const _metaCaches = new WeakMap();
+
+function metaCacheFor(provider) {
+  let c = _metaCaches.get(provider);
+  if (!c) { c = new TokenMetaCache(provider); _metaCaches.set(provider, c); }
+  if (_discoveredMetaCache) {
+    for (const meta of _discoveredMetaCache.cache.values()) c.seed(meta);
+  }
+  return c;
+}
+
+/** @returns {Promise<{address, symbol, decimals}>} — on-chain, cached */
+export async function tokenMetaOnChain(provider, addr, cache = null) {
+  if (!addr) throw new Error("tokenMetaOnChain: address required");
+  return cache ? cache.get(addr) : metaCacheFor(provider).get(addr);
+}
+
+export async function tokenDecimalsOnChain(provider, addr, cache = null) {
+  return (await tokenMetaOnChain(provider, addr, cache)).decimals;
+}
+
+export async function tokenSymbolOnChain(provider, addr, cache = null) {
+  return (await tokenMetaOnChain(provider, addr, cache)).symbol;
+}
+
+/** LOG-ONLY symbol label. Never used for amount maths. */
 function tokenSymbolOf(addr) {
   if (!addr) return "?";
-  const a = addr.toLowerCase();
+  const a = String(addr).toLowerCase();
+  const known = KNOWN_TOKEN_SYMBOLS.get(a);
+  if (known) return known;
   if (a === USDT.toLowerCase()) return "USDT";
   if (a === USDC.toLowerCase()) return "USDC";
   if (a === WETH.toLowerCase()) return "WETH";
   return short(addr);
 }
 
-function riskyTokenOfMarket(market) {
-  const t0 = market?.poolToken0;
-  const coll = market?.collateralToken;
-  if (t0 && t0.toLowerCase() !== USDT.toLowerCase()) return t0;
-  if (coll && coll.toLowerCase() !== USDT.toLowerCase()) return coll;
-  return WETH;
+// ═══════════════════════════════════════════════════════════════════════════
+//  MARKET PAIR / COLLATERAL HELPERS — per-market, token0/token1 driven
+// ═══════════════════════════════════════════════════════════════════════════
+
+function addrEqLocal(a, b) {
+  return !!a && !!b && String(a).toLowerCase() === String(b).toLowerCase();
 }
 
+/** Resolve both legs of a market from symbol + deployment token table (declared markets). */
+function derivePairTokens(token0Hint, symbol) {
+  const tokens = getAllTokens();
+  const parts = symbol ? String(symbol).split("/").map(s => s.trim().toUpperCase()) : [];
+  if (parts.length !== 2) return { token0: token0Hint || null, token1: null, s0: null, s1: null };
+  const addrOf = (p) => (p === "ETH" ? (tokens.WETH || tokens.ETH) : tokens[p]) || null;
+  const a = addrOf(parts[0]);
+  const b = addrOf(parts[1]);
+  if (!a || !b) return { token0: token0Hint || null, token1: null, s0: null, s1: null };
+  if (token0Hint) {
+    if (addrEqLocal(token0Hint, a)) return { token0: a, token1: b, s0: parts[0], s1: parts[1] };
+    if (addrEqLocal(token0Hint, b)) return { token0: b, token1: a, s0: parts[1], s1: parts[0] };
+  }
+  return { token0: a, token1: b, s0: parts[0], s1: parts[1] };
+}
+
+/**
+ * Both legs of a market + its "risky" (payment) token.
+ * token0 → LONG collateral, token1 → SHORT collateral (contract rule).
+ */
 function pairTokensOfMarket(market) {
-  const token0 = market.poolToken0;
-  const risky = riskyTokenOfMarket(market);
-  const token1 = token0 && token0.toLowerCase() === USDT.toLowerCase() ? risky : USDT;
+  if (!market) return { token0: null, token1: null, risky: null };
+  if (market.token0 && market.token1) {
+    const risky = market.paymentToken || paymentTokenForMarket(market) || market.token0;
+    return { token0: market.token0, token1: market.token1, risky };
+  }
+  const symbol = market.symbol || market.marketSymbol;
+  const derived = derivePairTokens(market.poolToken0 || market.token0, symbol);
+  const token0 = derived.token0;
+  const token1 = derived.token1;
+  const risky = paymentTokenForMarket({
+    token0, token1,
+    token0Symbol: market.token0Symbol || derived.s0,
+    token1Symbol: market.token1Symbol || derived.s1,
+  }) || token0;
   return { token0, token1, risky };
 }
 
@@ -295,49 +407,144 @@ function reserveTargetStr(config, collateralToken) {
   return config.targetReserveGeneric || "20";
 }
 
-function swapSourcesFor(collateralToken, side) {
-  const base = side === "LONG" ? LONG_SOURCES : SHORT_SOURCES;
-  const all = [USDT, USDC, WETH];
-  const ordered = [...base, ...all.filter(t => !base.some(b => b.toLowerCase() === t.toLowerCase()))];
-  const target = (collateralToken || "").toLowerCase();
-  return ordered.filter(t => t.toLowerCase() !== target);
+/**
+ * Every token that can fund `collateralToken` — dynamic, from the discovered
+ * token inventory (deployment tokens ∪ market tokens). Never a fixed 3-token list.
+ */
+function swapSourcesFor(collateralToken, side, allTokens = null) {
+  const target = String(collateralToken || "").toLowerCase();
+  const pool = (allTokens && allTokens.length ? allTokens : Object.values(getAllTokens()))
+    .map(t => (typeof t === "string" ? t : t?.address))
+    .filter(a => a && String(a).toLowerCase() !== target);
+  return [...new Set(pool)];
 }
 
 /**
- * Resolve active trading market for a side.
- * Prefers NEMESIS/USDT (reference market, supportsLong/Short), then config availableMarkets.
- * Collateral rule: token0 → LONG, token1 → SHORT.
+ * Build a market descriptor for `side` from a discovered/declared market record.
  */
-function resolveTradingMarket({ side, confirmedPools = {}, availableMarkets = [], preferSymbol = "NEMESIS/USDT" }) {
-  const eligible = (availableMarkets || []).filter(m => {
-    if (!m?.isActive) return false;
-    if (side === "LONG" && m.supportsLong === false) return false;
-    if (side === "SHORT" && m.supportsShort === false) return false;
-    const p = confirmedPools[m.symbol];
-    return !!(p && p.deployed !== false && p.manager && p.pool);
-  });
-  const ordered = [
-    ...eligible.filter(m => m.symbol === preferSymbol),
-    ...eligible.filter(m => m.symbol !== preferSymbol),
-  ];
-  const market = ordered[0];
-  if (!market) return null;
-  const poolInfo = confirmedPools[market.symbol];
+function describeResolvedMarket(market, side) {
   const { token0, token1, risky } = pairTokensOfMarket(market);
-  const collateralToken = side === "LONG" ? token0 : token1;
+  const collateralToken = collateralForSide({ ...market, token0, token1 }, side);
+  const decimals = side === "LONG" ? market.token0Decimals : market.token1Decimals;
+  const collateralSym = side === "LONG" ? market.token0Symbol : market.token1Symbol;
   return {
-    symbol: market.symbol,
-    managerAddr: poolInfo.manager,
-    poolAddr: poolInfo.pool,
+    symbol: market.marketSymbol || market.symbol,
+    managerAddr: market.managerAddr,
+    poolAddr: market.poolAddr,
     poolToken0: token0,
     poolToken1: token1,
+    token0,
+    token1,
+    token0Symbol: market.token0Symbol || null,
+    token1Symbol: market.token1Symbol || null,
+    token0Decimals: market.token0Decimals ?? null,
+    token1Decimals: market.token1Decimals ?? null,
     riskyToken: risky,
-    paymentToken: risky,
+    paymentToken: market.paymentToken || risky,
     collateralToken,
-    decimals: tokenDecimalsOf(collateralToken),
-    collateralSym: tokenSymbolOf(collateralToken),
+    decimals: decimals ?? null,
+    collateralSym: collateralSym || null,
+    supportsLong: market.supportsLong !== false,
+    supportsShort: market.supportsShort !== false,
+    isActive: market.isActive !== false,
     market,
   };
+}
+
+/** Declared-only market (config/confirmedPools) — used when on-chain discovery hasn't run yet. */
+function declaredMarketFromCandidate(cand) {
+  const derived = derivePairTokens(cand.poolToken0Hint, cand.symbol);
+  const token0 = derived.token0;
+  const token1 = derived.token1;
+  const token0Symbol = derived.s0;
+  const token1Symbol = derived.s1;
+  const market = {
+    marketSymbol: cand.symbol,
+    symbol: cand.symbol,
+    pairKey: normalizeSymbolKey(cand.symbol),
+    managerAddr: cand.managerAddr,
+    poolAddr: cand.poolAddr,
+    token0, token1,
+    poolToken0: token0, poolToken1: token1,
+    token0Symbol, token1Symbol,
+    token0Decimals: null, token1Decimals: null,
+    supportsLong: cand.supportsLong !== false,
+    supportsShort: cand.supportsShort !== false,
+    isActive: cand.isActive !== false && cand.deployedFlag !== false,
+    declared: true,
+    sources: cand.sources,
+  };
+  market.paymentToken = paymentTokenForMarket(market);
+  return market;
+}
+
+function buildDeclaredMarkets({ confirmedPools = {}, availableMarkets = [], knownMarkets = [] } = {}) {
+  const cands = mergeMarketSources({ availableMarkets, confirmedPools, knownMarkets });
+  return cands
+    .filter(c => c.poolAddr && c.isActive !== false && c.deployedFlag !== false)
+    .map(declaredMarketFromCandidate);
+}
+
+/**
+ * Resolve the trading market for a side.
+ *
+ * Collateral rule (per market, NEVER global):
+ *   LONG  → token0
+ *   SHORT → token1
+ *
+ * Ordering: `forceSymbol` (rotation pick) → explicit `preferSymbol` → least-recently-used.
+ * When the on-chain registry is populated it is always preferred over config-only data.
+ */
+function resolveTradingMarket({
+  side,
+  confirmedPools = {},
+  availableMarkets = [],
+  preferSymbol = null,
+  recentMarkets = [],
+  excludeSymbols = [],
+  discoveredMarkets = null,
+  forceSymbol = null,
+}) {
+  const registry = (discoveredMarkets && discoveredMarkets.length)
+    ? discoveredMarkets
+    : (getDiscoveredMarkets().length ? getDiscoveredMarkets() : null);
+
+  const pool = registry && registry.length
+    ? registry
+    : buildDeclaredMarkets({ confirmedPools, availableMarkets, knownMarkets: getKnownMarkets() });
+
+  const excluded = new Set(excludeSymbols || []);
+  let eligible = pool.filter(m => {
+    if (!m || m.isActive === false) return false;
+    if (excluded.has(marketKey(m))) return false;
+    if (side === "LONG" && m.supportsLong === false) return false;
+    if (side === "SHORT" && m.supportsShort === false) return false;
+    if (!m.managerAddr || !m.poolAddr) return false;
+    return true;
+  });
+
+  if (eligible.length === 0) return null;
+
+  if (forceSymbol) {
+    const forced = eligible.find(m => marketKey(m) === forceSymbol || m.marketSymbol === forceSymbol || m.symbol === forceSymbol);
+    if (forced) return describeResolvedMarket(forced, side);
+  }
+
+  // Least-recently-used first → prevents one market hogging the rotation
+  const recentIdx = new Map((recentMarkets || []).map((k, i) => [k, i]));
+  eligible = [...eligible].sort((a, b) => {
+    const ra = recentIdx.has(marketKey(a)) ? recentIdx.get(marketKey(a)) : -1;
+    const rb = recentIdx.has(marketKey(b)) ? recentIdx.get(marketKey(b)) : -1;
+    if (ra !== rb) return ra - rb;
+    return String(a.marketSymbol || a.symbol || "").localeCompare(String(b.marketSymbol || b.symbol || ""));
+  });
+
+  if (preferSymbol) {
+    const pref = eligible.find(m => (m.marketSymbol || m.symbol) === preferSymbol);
+    if (pref) return describeResolvedMarket(pref, side);
+  }
+
+  return describeResolvedMarket(eligible[0], side);
 }
 
 /**
@@ -385,23 +592,36 @@ async function getFeeParams(provider) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 async function logInventory(provider, walletAddr, log = () => {}) {
+  // Dynamic inventory: every discovered token + native ETH
+  const discovered = getDiscoveredTokens();
   const tokens = [
     { sym: "ETH", addr: null, decimals: 18, type: "native" },
-    { sym: "USDT", addr: USDT, decimals: 6 },
-    { sym: "WETH", addr: WETH, decimals: 18 },
-    { sym: "USDC", addr: USDC, decimals: 6 },
+    ...(discovered.length
+      ? discovered.map(t => ({ sym: t.symbol, addr: t.address, decimals: t.decimals, type: "erc20" }))
+      : Object.entries(getAllTokens()).map(([sym, addr]) => ({
+          sym, addr, decimals: TOKEN_DECIMALS[sym] ?? null, type: "erc20",
+        }))),
   ];
+  const seen = new Set();
   const lines = [];
   for (const t of tokens) {
+    const k = t.type === "native" ? "ETH" : String(t.addr).toLowerCase();
+    if (seen.has(k)) continue;
+    seen.add(k);
     try {
       let bal;
+      let decimals = t.decimals;
       if (t.type === "native") {
         bal = await provider.getBalance(walletAddr);
+        decimals = 18;
       } else {
+        if (decimals === null || decimals === undefined) {
+          decimals = await tokenDecimalsOnChain(provider, t.addr);
+        }
         const c = new ethers.Contract(t.addr, ["function balanceOf(address) view returns (uint256)"], provider);
         bal = await c.balanceOf(walletAddr);
       }
-      lines.push(`${t.sym}=${ethers.formatUnits(bal, t.decimals)}`);
+      lines.push(`${t.sym}=${ethers.formatUnits(bal, decimals)}`);
     } catch {
       lines.push(`${t.sym}=ERR`);
     }
@@ -456,7 +676,13 @@ const DEFAULT_AUTO_CONFIG = {
   dryRun: false,
   ethGuard: { ...DEFAULT_ETH_GUARD },
   availableMarkets: [],
-  preferredMarket: "NEMESIS/USDT",
+  // No preferred/single market: rotation covers every active MARKET × SIDE
+  preferredMarket: null,
+  // How many distinct markets to try per cycle when collateral can't be sourced
+  maxMarketAttemptsPerCycle: 3,
+  // Runtime direction kill-switch: disable a MARKET×SIDE after N consecutive open failures
+  maxDirectionFailures: 2,
+  marketRefreshMs: 120_000,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -759,14 +985,16 @@ async function quoteLeveragedAmountOutMin(provider, { pool, manager, collateralT
 //  SWAP LOGIC — ETH safety preserved
 // ═══════════════════════════════════════════════════════════════════════════
 
-const LONG_SOURCES = [USDC, WETH];
-const SHORT_SOURCES = [USDT, USDC];
-
-async function ensureCollateral({ wallet, provider, side, collateralToken: collateralTokenArg, collateralAmount, config, log, dryRun, txManager }) {
+async function ensureCollateral({ wallet, provider, side, collateralToken: collateralTokenArg, collateralAmount, config, log, dryRun, txManager, routes = null, allTokens = null }) {
   const walletAddr = wallet.address;
-  const collateralToken = collateralTokenArg || (side === "LONG" ? USDT : WETH);
-  const decimals = tokenDecimalsOf(collateralToken);
-  const sym = tokenSymbolOf(collateralToken);
+  const collateralToken = collateralTokenArg;
+  if (!collateralToken) {
+    log(`[BLOCKED] ensureCollateral: no collateral token for side=${side} (must come from market token0/token1)`, "error");
+    return false;
+  }
+  // decimals/symbol ALWAYS from the token contract
+  const decimals = await tokenDecimalsOnChain(provider, collateralToken);
+  const sym = await tokenSymbolOnChain(provider, collateralToken);
   const tokenContract = new ethers.Contract(collateralToken, ERC20_ABI, provider);
   const balance = await tokenContract.balanceOf(walletAddr);
   const routerAddr = getRouterAddress();
@@ -790,22 +1018,37 @@ async function ensureCollateral({ wallet, provider, side, collateralToken: colla
   log(`[SWAP-DEBUG] deficit=${ethers.formatUnits(deficit, decimals)} ${sym}`, "warn");
   log(`[COLLATERAL] INSUFFICIENT — deficit=${ethers.formatUnits(deficit, decimals)} ${sym}`, "warn");
 
-  const sources = swapSourcesFor(collateralToken, side);
+  const activeRoutes = routes || getDiscoveredRoutes();
+  const sources = swapSourcesFor(collateralToken, side, allTokens || getDiscoveredTokens());
   const router = new ethers.Contract(routerAddr, ROUTER_ABI, provider);
 
   for (const sourceToken of sources) {
     const sourceContract = new ethers.Contract(sourceToken, ERC20_ABI, provider);
-    const sourceBalance = await sourceContract.balanceOf(walletAddr);
-    const sourceDecimals = sourceToken === WETH ? 18 : 6;
-    const sourceSym = sourceToken === USDT ? "USDT" : sourceToken === USDC ? "USDC" : "WETH";
+    let sourceBalance, sourceDecimals, sourceSym;
+    try {
+      sourceBalance = await sourceContract.balanceOf(walletAddr);
+      const meta = await tokenMetaOnChain(provider, sourceToken);
+      sourceDecimals = meta.decimals;
+      sourceSym = meta.symbol;
+    } catch (e) {
+      log(`[SWAP] source ${short(sourceToken)} meta/balance failed — skip`, "warn");
+      continue;
+    }
 
     if (sourceBalance <= 0n) { log(`[SWAP] ${sourceSym} balance=0 — skip`, "info"); continue; }
     log(`[SWAP] Trying ${sourceSym} → ${sym}: balance=${ethers.formatUnits(sourceBalance, sourceDecimals)}`, "info");
 
-    const path = [sourceToken, collateralToken];
+    // Route discovery: direct A→B first, validated multi-hop A→HUB→B otherwise
+    const route = findRoute(activeRoutes, sourceToken, collateralToken);
+    const path = route ? route.path : [sourceToken, collateralToken];
+    if (activeRoutes.length && !route) {
+      log(`[SWAP] ${sourceSym} → ${sym}: no validated route — skip`, "warn");
+      continue;
+    }
+
     try {
       const fullQuote = await router.getAmountsOut(sourceBalance, path);
-      const expectedOut = fullQuote[1];
+      const expectedOut = fullQuote[fullQuote.length - 1];
       if (expectedOut < deficit) {
         log(`[SWAP] ${sourceSym} insufficient: max output < deficit`, "warn");
         continue;
@@ -815,19 +1058,19 @@ async function ensureCollateral({ wallet, provider, side, collateralToken: colla
       const safeSwapAmount = swapAmount > sourceBalance ? sourceBalance : swapAmount;
       const amountOutMin = deficit * 99n / 100n;
 
-      log(`[SWAP-DEBUG] tokenIn=${sourceSym} tokenOut=${sym}`, "info");
+      log(`[SWAP-DEBUG] tokenIn=${sourceSym} tokenOut=${sym} path=${path.length} hops=${route?.type || "direct"}`, "info");
       log(`[SWAP-DEBUG] sourceBalance=${ethers.formatUnits(sourceBalance, sourceDecimals)} ${sourceSym}`, "info");
       log(`[SWAP-DEBUG] fullQuoteOut=${ethers.formatUnits(expectedOut, decimals)} ${sym}`, "info");
       log(`[SWAP-DEBUG] neededWithBuffer=${ethers.formatUnits(neededWithBuffer, decimals)} ${sym}`, "info");
       log(`[SWAP-DEBUG] swapAmount=${ethers.formatUnits(safeSwapAmount, sourceDecimals)} ${sourceSym}`, "info");
       log(`[SWAP-DEBUG] amountOutMin=${ethers.formatUnits(amountOutMin, decimals)} ${sym}`, "info");
-      log(`[SWAP-DEBUG] allowance=${ethers.formatUnits(await new ethers.Contract(sourceToken, ERC20_ABI, provider).allowance(walletAddr, routerAddr), sourceDecimals)} ${sourceSym}`, "info");
+      log(`[SWAP-DEBUG] allowance=${ethers.formatUnits(await sourceContract.allowance(walletAddr, routerAddr), sourceDecimals)} ${sourceSym}`, "info");
 
       log(`[SWAP] quote: ${ethers.formatUnits(safeSwapAmount, sourceDecimals)} ${sourceSym} → ~${ethers.formatUnits(expectedOut * safeSwapAmount / sourceBalance, decimals)} ${sym}`, "info");
 
       const swapResult = await executeSwap({
         wallet, provider, fromToken: sourceToken, toToken: collateralToken,
-        amount: safeSwapAmount, amountOutMin, config, log, txManager,
+        amount: safeSwapAmount, amountOutMin, config, log, txManager, path,
       });
       if (!swapResult) { log(`[SWAP] FAILED — trying next source`, "error"); continue; }
 
@@ -845,7 +1088,7 @@ async function ensureCollateral({ wallet, provider, side, collateralToken: colla
   }
 
   // Last resort: ETH → WETH (wrap only the deficit, not all ETH) — only when target is WETH
-  if (side === "SHORT" && collateralToken.toLowerCase() === WETH.toLowerCase()) {
+  if (String(collateralToken).toLowerCase() === WETH.toLowerCase()) {
     const currentWethBal = await new ethers.Contract(WETH, ERC20_ABI, provider).balanceOf(walletAddr);
     const remainingDeficit = collateralAmount > currentWethBal ? collateralAmount - currentWethBal : 0n;
     if (remainingDeficit > 0n) {
@@ -875,16 +1118,22 @@ async function ensureCollateral({ wallet, provider, side, collateralToken: colla
   return false;
 }
 
-async function executeSwap({ wallet, provider, fromToken, toToken, amount, amountOutMin, config, log, txManager }) {
+/**
+ * Execute a Router swap.
+ * @param {string[]} [path] — validated route path (direct [A,B] or multi-hop [A,HUB,B])
+ */
+async function executeSwap({ wallet, provider, fromToken, toToken, amount, amountOutMin, config, log, txManager, path: pathArg = null }) {
   const walletAddr = wallet.address;
   const routerAddr = getRouterAddress();
   const router = new ethers.Contract(routerAddr, ROUTER_ABI, wallet);
   const fromContract = new ethers.Contract(fromToken, ERC20_ABI, wallet);
-  const fromSym = fromToken === USDT ? "USDT" : fromToken === USDC ? "USDC" : "WETH";
-  const srcDecimals = fromToken === WETH ? 18 : 6;
+  const fromMeta = await tokenMetaOnChain(provider, fromToken);
+  const toMeta = await tokenMetaOnChain(provider, toToken);
+  const fromSym = fromMeta.symbol;
+  const srcDecimals = fromMeta.decimals;
 
   const allowance = await fromContract.allowance(walletAddr, routerAddr);
-  log(`[SWAP-DEBUG] executeSwap: from=${fromSym} to=${toToken === USDT ? "USDT" : toToken === WETH ? "WETH" : "???"} amount=${ethers.formatUnits(amount, srcDecimals)} allowance=${ethers.formatUnits(allowance, srcDecimals)}`, "info");
+  log(`[SWAP-DEBUG] executeSwap: from=${fromSym} to=${toMeta.symbol} amount=${ethers.formatUnits(amount, srcDecimals)} allowance=${ethers.formatUnits(allowance, srcDecimals)}`, "info");
   if (allowance < amount) {
     log(`[SWAP] Approve ${fromSym} → Router...`, "info");
     if (txManager) {
@@ -901,7 +1150,7 @@ async function executeSwap({ wallet, provider, fromToken, toToken, amount, amoun
     log(`[SWAP] Approved`, "success");
   }
 
-  const path = [fromToken, toToken];
+  const path = (pathArg && pathArg.length >= 2) ? pathArg : [fromToken, toToken];
   const deadline = Math.floor(Date.now() / 1000) + config.deadlineSeconds;
   const calldata = router.interface.encodeFunctionData("swapExactTokensForTokens", [amount, amountOutMin, path, walletAddr, deadline]);
 
@@ -950,7 +1199,14 @@ async function executeSwap({ wallet, provider, fromToken, toToken, amount, amoun
 async function openPosition({ wallet, provider, managerAddr, poolAddr, side, collateralToken, collateralAmount, leverage, config, log, dryRun, txManager, paymentToken }) {
   const walletAddr = wallet.address;
   const isLong = side === "LONG";
-  const decimals = tokenDecimalsOf(collateralToken);
+  if (!collateralToken) {
+    log(`[BLOCKED] openPosition: collateralToken missing (side=${side})`, "error");
+    return null;
+  }
+  // decimals + symbol ALWAYS read from the collateral token contract
+  const collateralMeta = await tokenMetaOnChain(provider, collateralToken);
+  const decimals = collateralMeta.decimals;
+  const collSym = collateralMeta.symbol;
   const leverageX10 = BigInt(leverage * 10);
 
   // Validate leverage
@@ -1036,13 +1292,13 @@ async function openPosition({ wallet, provider, managerAddr, poolAddr, side, col
   // Attempt 1: pre-flight with computed amountOutMin
   try {
     await provider.call({ from: walletAddr, to: managerAddr, data: calldata, value: 0n });
-    log(`[PREFLIGHT] isLong=${isLong} collateralToken=${tokenSymbolOf(collateralToken)} collateralAmount=${collateralAmount} leverageX10=${leverageX10} borrowAmount=${borrowAmount} amountOutMin=${amountOutMin} deadline=${deadline}`, "info");
+    log(`[PREFLIGHT] isLong=${isLong} collateralToken=${collSym} collateralAmount=${collateralAmount} leverageX10=${leverageX10} borrowAmount=${borrowAmount} amountOutMin=${amountOutMin} deadline=${deadline}`, "info");
     log(`[PREFLIGHT] PASS`, "success");
   } catch (e) {
     const revertData = e?.data || e?.info?.error?.data || e?.cause?.data || e?.cause?.info?.error?.data || null;
     const match = (e?.shortMessage || e?.message || "").match(/0x[0-9a-fA-F]{8,}/);
     const rawRevert = revertData || match?.[0] || "unknown";
-    log(`[PREFLIGHT] isLong=${isLong} collateralToken=${tokenSymbolOf(collateralToken)} collateralAmount=${collateralAmount} leverageX10=${leverageX10} borrowAmount=${borrowAmount} amountOutMin=${amountOutMin} deadline=${deadline}`, "info");
+    log(`[PREFLIGHT] isLong=${isLong} collateralToken=${collSym} collateralAmount=${collateralAmount} leverageX10=${leverageX10} borrowAmount=${borrowAmount} amountOutMin=${amountOutMin} deadline=${deadline}`, "info");
     log(`[PREFLIGHT] rawRevertData=${rawRevert}`, "error");
 
     // Attempt 2: diagnostic — try amountOutMin=0 ONLY for eth_call (never for TX)
@@ -1264,6 +1520,113 @@ export class AutoTrader {
     this._logListeners = [];
     this.txManager = new TxManager();
     this.lastCycleAction = "idle";
+
+    // Dynamic market/route discovery (populated by ensureMarkets)
+    this.markets = [];
+    this.routes = [];
+    this.tokenList = [];
+    this.metaCache = new TokenMetaCache();
+    this.rotation = RotationMemory.fromJSON(this.state.rotation || null);
+    // MARKET×SIDE runtime kill-switch: { "SYMBOL:SIDE": failCount }
+    this.directionDisabled = this.state.directionDisabled || {};
+    this._marketsReady = false;
+    this._lastMarketRefresh = 0;
+    this._planned = null;
+  }
+
+  /**
+   * Discover ALL active markets + swap routes on-chain (cached, refreshed periodically).
+   */
+  async ensureMarkets({ force = false } = {}) {
+    const now = Date.now();
+    const refreshMs = Number(this.config.marketRefreshMs || 120_000);
+    if (!force && this._marketsReady && (now - this._lastMarketRefresh) < refreshMs) return this.markets;
+
+    try {
+      const { provider } = this.getRuntime();
+      const cfg = readConfigJson();
+      const discovered = await discoverMarkets({
+        provider,
+        factoryAddress: getFactoryAddress(),
+        tokens: getAllTokens(),
+        confirmedPools: this.deps.confirmedPools || getConfirmedPools(),
+        knownMarkets: getKnownMarkets?.() || [],
+        availableMarkets: this.config.availableMarkets || this.deps.availableMarkets || (cfg || this.config).availableMarkets || [],
+        runtime: { directionDisabled: this.directionDisabled },
+        log: this.log.bind(this),
+      });
+      this.markets = discovered.markets || [];
+      this.metaCache = discovered.tokenMetaCache || this.metaCache;
+      // Full token inventory: deployment tokens ∪ every market token (on-chain meta)
+      this.tokenList = await discoverTokens({
+        provider,
+        tokens: getAllTokens(),
+        markets: this.markets,
+        log: this.log.bind(this),
+      });
+
+      this.routes = await discoverSwapRoutes({
+        provider,
+        routerAddress: getRouterAddress(),
+        factoryAddress: getFactoryAddress(),
+        tokens: this.tokenList,
+        log: this.log.bind(this),
+      });
+      setDiscoveredMarkets(this.markets, this.routes, this.tokenList, this.metaCache);
+
+      this._marketsReady = true;
+      this._lastMarketRefresh = now;
+
+      this.log(formatMarketsTable(this.markets), "info");
+      this.log(formatCoverageTable(this.markets, { directionDisabled: this.directionDisabled }), "info");
+      this.log(formatRoutesTable(this.routes), "info");
+    } catch (e) {
+      this.log(`[DISCOVERY] failed: ${e.message?.slice(0, 80)}`, "error");
+    }
+    return this.markets;
+  }
+
+  _directionKey(marketSymbol, side) {
+    return `${marketSymbol}|${side}`;
+  }
+
+  _isDirectionDisabled(marketSymbol, side) {
+    if (this.directionDisabled[this._directionKey(marketSymbol, side)]) return true;
+    const m = this.markets.find(x => (x.marketSymbol || x.symbol) === marketSymbol);
+    return m ? !supportsSide(m, side) : false;
+  }
+
+  _disableDirection(marketSymbol, side, reason = "") {
+    const key = this._directionKey(marketSymbol, side);
+    if (this.directionDisabled[key]) return;
+    this.directionDisabled[key] = { since: Date.now(), reason };
+    this.state.directionDisabled = this.directionDisabled;
+    saveState(this.state);
+    this.log(`[DISCOVERY] DISABLED ${key} — ${reason}`, "warn");
+  }
+
+  _recordDirectionFailure(marketSymbol, side) {
+    const key = this._directionKey(marketSymbol, side);
+    const entry = this.directionDisabled[key] || { fails: 0 };
+    entry.fails = (entry.fails || 0) + 1;
+    const maxFails = Number(this.config.maxDirectionFailures || 2);
+    if (entry.fails >= maxFails) {
+      this._disableDirection(marketSymbol, side, `${entry.fails} consecutive preflight/open failures`);
+    } else {
+      this.directionDisabled[key] = entry;
+      this.state.directionDisabled = this.directionDisabled;
+      saveState(this.state);
+    }
+  }
+
+  _recordDirectionSuccess(marketSymbol, side) {
+    const key = this._directionKey(marketSymbol, side);
+    if (this.directionDisabled[key]) {
+      delete this.directionDisabled[key];
+      this.state.directionDisabled = this.directionDisabled;
+      saveState(this.state);
+      this.log(`[DISCOVERY] RE-ENABLED ${key}`, "success");
+    }
   }
 
   onLog(fn) { this._logListeners.push(fn); }
@@ -1285,45 +1648,125 @@ export class AutoTrader {
   }
 
   /**
-   * Resolve market for a side (pool-aware). Prefer NEMESIS/USDT per config/reference.
+   * Resolve market for a side (sync). Uses discovered markets when ensureMarkets()
+   * has run (callers should await it first); falls back to declared config otherwise.
+   * Honors declared supportsLong/supportsShort + runtime directionDisabled kill-switch,
+   * prefers least-recently-used via rotation memory. No hardcoded market preference.
    */
-  resolveMarket(side) {
-    const confirmedPools = this.deps.confirmedPools || {};
+  resolveMarket(side, opts = {}) {
+    const discovered = this.markets;
     const availableMarkets = this.config.availableMarkets || this.deps.availableMarkets || [];
-    return resolveTradingMarket({
-      side,
-      confirmedPools,
-      availableMarkets,
-      preferSymbol: this.config.preferredMarket || "NEMESIS/USDT",
+    const confirmedPools = this.deps.confirmedPools || {};
+    const rotation = this.rotation;
+    const excludeSymbols = opts.excludeSymbols || [];
+    const preferSymbol = opts.preferSymbol !== undefined ? opts.preferSymbol : (this.config.preferredMarket ?? null);
+
+    const candidates = discovered && discovered.length ? discovered : null;
+    if (!candidates) {
+      return resolveTradingMarket({
+        side, confirmedPools, availableMarkets, preferSymbol, excludeSymbols,
+        recentMarkets: rotation ? rotation.recentMarkets : [],
+      });
+    }
+
+    const enabled = candidates.filter(m =>
+      (m.marketSymbol || m.symbol) &&
+      supportsSide(m, side) &&
+      !this._isDirectionDisabled(m.marketSymbol || m.symbol, side) &&
+      !excludeSymbols.includes(m.marketSymbol || m.symbol) &&
+      m.isActive !== false
+    );
+    if (!enabled.length) return null;
+
+    // Least-recently-used first (rotation), then preferred, then declaration order
+    const recent = rotation ? rotation.recentMarkets : [];
+    // recentMarkets entries are "SYMBOL|SIDE" keys — extract per-market recency index
+    const marketRecency = new Map();
+    recent.forEach((key, idx) => {
+      const mkt = String(key).split("|")[0];
+      // later index = more recent; keep the highest (most recent) per market
+      if (!marketRecency.has(mkt) || marketRecency.get(mkt) < idx) marketRecency.set(mkt, idx);
     });
+    const score = m => {
+      const sym = m.marketSymbol || m.symbol;
+      const idx = marketRecency.has(sym) ? marketRecency.get(sym) : -1;
+      // Higher = chosen first: never-used >> least-recently-used >> most-recent
+      const recency = idx === -1 ? 1_000_000 : (recent.length - idx);
+      const pref = preferSymbol && sym === preferSymbol ? 10_000_000 : 0;
+      return pref + recency;
+    };
+    const sorted = [...enabled].sort((a, b) => score(b) - score(a));
+    const chosen = sorted[0];
+
+    const collateralToken = collateralForSide(chosen, side);
+    const decimals = collateralDecimalsForSide(chosen, side);
+    const collSym = collateralSymbolForSide(chosen, side);
+    return {
+      symbol: chosen.marketSymbol || chosen.symbol,
+      poolAddr: chosen.poolAddr,
+      managerAddr: chosen.managerAddr,
+      collateralToken,
+      collateralSym: collSym,
+      decimals,
+      paymentToken: chosen.paymentToken || paymentTokenForMarket(chosen),
+      token0: chosen.token0,
+      token1: chosen.token1,
+      market: chosen,
+    };
+  }
+
+  /**
+   * Plan one (or more) market candidates for a side — used by prepareAndOpen fallback.
+   */
+  async planMarketsForSide(side, { max = 3 } = {}) {
+    await this.ensureMarkets();
+    const out = [];
+    let exclude = [];
+    for (let i = 0; i < max; i++) {
+      const m = this.resolveMarket(side, { excludeSymbols: exclude });
+      if (!m) break;
+      out.push(m);
+      exclude.push(m.symbol);
+    }
+    return out;
+  }
+
+  /** Rotation-picked next (market, side) pair — for display/planning. */
+  async nextMarketSide() {
+    await this.ensureMarkets();
+    const sides = enumerateMarketSides(this.markets, { directionDisabled: this.directionDisabled })
+      .filter(x => x.market && x.market.isActive !== false);
+    if (!sides.length) return null;
+    return this.rotation.pickMarketSide(sides);
   }
 
   getManagerAddr(side) {
     if (side) {
       const m = this.resolveMarket(side);
-      if (m) return m.managerAddr;
+      if (m?.managerAddr) return m.managerAddr;
     }
     if (this.state?.activePosition?.managerAddr) return this.state.activePosition.managerAddr;
-    const confirmedPools = this.deps.confirmedPools || {};
-    const forSide = this.resolveMarket(this.state?.lastSide || "SHORT");
-    if (forSide) return forSide.managerAddr;
-    return confirmedPools["NEMESIS/USDT"]?.manager
-      || confirmedPools["ETH/USDT"]?.manager
-      || "0xD45dde32C66769ED835A0F0f45EC0bF6973857FD";
+    const forSide = this.resolveMarket(this.state?.lastSide || "SHORT") || this.resolveMarket("LONG");
+    if (forSide?.managerAddr) return forSide.managerAddr;
+    // Fallback: first discovered market's manager (never a hardcoded address)
+    const first = this.markets.find(m => m.managerAddr) || Object.values(this.deps.confirmedPools || {}).find(p => p?.manager);
+    if (first?.managerAddr) return first.managerAddr;
+    if (first?.manager) return first.manager;
+    return this.deps.confirmedPools?.["NEMESIS/USDT"]?.manager || null;
   }
 
   getPoolAddr(side) {
     if (side) {
       const m = this.resolveMarket(side);
-      if (m) return m.poolAddr;
+      if (m?.poolAddr) return m.poolAddr;
     }
     if (this.state?.activePosition?.poolAddr) return this.state.activePosition.poolAddr;
-    const confirmedPools = this.deps.confirmedPools || {};
-    const forSide = this.resolveMarket(this.state?.lastSide || "SHORT");
-    if (forSide) return forSide.poolAddr;
-    return confirmedPools["NEMESIS/USDT"]?.pool
-      || confirmedPools["ETH/USDT"]?.pool
-      || "0x792bCdbe39E6aF13EeEbab251Cb59D6824EBe28e";
+    const forSide = this.resolveMarket(this.state?.lastSide || "SHORT") || this.resolveMarket("LONG");
+    if (forSide?.poolAddr) return forSide.poolAddr;
+    const first = this.markets.find(m => m.poolAddr) || Object.values(this.deps.confirmedPools || {}).find(p => p?.pool);
+    if (first?.poolAddr) return first.poolAddr;
+    if (first?.pool) return first.pool;
+    return this.deps.confirmedPools?.["NEMESIS/USDT"]?.pool || null;
   }
 
   setState(newState) {
@@ -1341,6 +1784,8 @@ export class AutoTrader {
     try {
       const { provider, wallet } = this.getRuntime();
       const walletAddr = wallet.address;
+      // Discover all markets/routes before any planning
+      await this.ensureMarkets();
       // Default market for inventory logs / recovery — actual OPEN resolves per side
       const defaultMarket = this.resolveMarket(this.state.lastSide || "SHORT") || this.resolveMarket("LONG");
       const managerAddr = defaultMarket?.managerAddr || this.getManagerAddr();
@@ -1358,20 +1803,27 @@ export class AutoTrader {
         this.log(`[AUTO] NEXT ACTION: SWAP + OPEN ${this.config.defaultLeverage}x`, "info");
       }
 
-      // PHASE 0: AUTO-SWAP — proactive token rebalancing (always)
+      // PHASE 0: AUTO-SWAP — proactive token rebalancing across ALL discovered tokens
       const autoSwapConfig = this.config.autoSwap || {};
       if (autoSwapConfig.enabled) {
         this.setState(STATES.AUTO_SWAP);
         const maxSwaps = autoSwapConfig.maxSwapsPerCycle || 2;
-        const tokenAddrs = { USDC, USDT, WETH };
         let swapsDone = 0;
 
-        this.log(`[AUTO-SWAP] Phase started (max ${maxSwaps} swaps per cycle)`, "info");
+        // Dynamic token map: discovered tokens (on-chain decimals) ∪ deployment tokens
+        const tokenAddrs = {};
+        const tokenDecimalsMap = {};
+        for (const t of (this.tokenList.length ? this.tokenList : Object.entries(getAllTokens()).map(([symbol, address]) => ({ symbol, address, decimals: TOKEN_DECIMALS[symbol] ?? null })))) {
+          tokenAddrs[t.symbol] = t.address;
+          tokenDecimalsMap[t.symbol] = t.decimals;
+        }
+
+        this.log(`[AUTO-SWAP] Phase started (max ${maxSwaps} swaps per cycle, ${this.routes.length} routes)`, "info");
 
         // Refresh inventory for auto-swap decisions
         const inventoryTokenMap = {};
         for (const [sym, addr] of Object.entries(tokenAddrs)) {
-          inventoryTokenMap[sym] = { address: addr, decimals: TOKEN_DECIMALS[sym] || 6 };
+          inventoryTokenMap[sym] = { address: addr, decimals: tokenDecimalsMap[sym] ?? TOKEN_DECIMALS[sym] ?? 6 };
         }
         try {
           await this.inventory.refreshBalances(provider, walletAddr, inventoryTokenMap, this.log.bind(this));
@@ -1382,23 +1834,21 @@ export class AutoTrader {
 
         for (let i = 0; i < maxSwaps; i++) {
           try {
-            // Re-fetch fresh balances for each swap
+            // Re-fetch fresh balances for each swap (decimals from discovery / on-chain)
             const freshBalances = {};
             for (const [sym, addr] of Object.entries(tokenAddrs)) {
               try {
-                if (sym === "WETH") {
-                  const c = new ethers.Contract(addr, ERC20_ABI, provider);
-                  freshBalances[sym] = { raw: await c.balanceOf(walletAddr), float: parseFloat(ethers.formatUnits(await c.balanceOf(walletAddr), 18)) };
-                } else {
-                  const c = new ethers.Contract(addr, ERC20_ABI, provider);
-                  const bal = await c.balanceOf(walletAddr);
-                  freshBalances[sym] = { raw: bal, float: parseFloat(ethers.formatUnits(bal, TOKEN_DECIMALS[sym])) };
-                }
+                let dec = tokenDecimalsMap[sym];
+                if (dec === null || dec === undefined) dec = await tokenDecimalsOnChain(provider, addr);
+                tokenDecimalsMap[sym] = dec;
+                const c = new ethers.Contract(addr, ERC20_ABI, provider);
+                const bal = await c.balanceOf(walletAddr);
+                freshBalances[sym] = { raw: bal, float: parseFloat(ethers.formatUnits(bal, dec)) };
               } catch { freshBalances[sym] = { raw: 0n, float: 0 }; }
             }
 
-            // Select a random pair
-            const pair = selectRandomSwapPair(this.swapJournal, freshBalances, autoSwapConfig, tokenAddrs, this.log.bind(this));
+            // Select a pair from validated routes + rotation (avoid recent repeats)
+            const pair = selectRandomSwapPair(this.swapJournal, freshBalances, autoSwapConfig, tokenAddrs, this.log.bind(this), this.routes, this.rotation);
             if (!pair) {
               this.log(`[AUTO-SWAP] No valid pair found — stopping auto-swap phase`, "info");
               break;
@@ -1411,14 +1861,14 @@ export class AutoTrader {
               continue;
             }
 
-            const amountResult = calculateRandomSwapAmount(pair.from, fromBal.float, autoSwapConfig);
+            const amountResult = calculateRandomSwapAmount(pair.from, fromBal.float, autoSwapConfig, tokenDecimalsMap[pair.from]);
             if (!amountResult) {
               this.log(`[AUTO-SWAP] Amount too small for ${pair.from} — skip`, "info");
               continue;
             }
 
             // Convert float amount to raw BigInt
-            const decimals = TOKEN_DECIMALS[pair.from] || 6;
+            const decimals = tokenDecimalsMap[pair.from] ?? TOKEN_DECIMALS[pair.from] ?? 6;
             const amountRaw = ethers.parseUnits(amountResult.amountFloat.toFixed(decimals), decimals);
 
             // Safety: don't use more than 90% of balance
@@ -1433,22 +1883,26 @@ export class AutoTrader {
               continue;
             }
 
-            // Get quote from Router
+            // Validated route path (direct or multi-hop via hub)
+            const route = findRoute(this.routes, pair.fromAddr, pair.toAddr);
+            const path = route ? route.path : [pair.fromAddr, pair.toAddr];
+
+            // Get quote from Router along the route
             const router = new ethers.Contract(getRouterAddress(), ROUTER_ABI, provider);
             let quote;
             try {
-              quote = await router.getAmountsOut(amountRaw, [pair.fromAddr, pair.toAddr]);
+              quote = await router.getAmountsOut(amountRaw, path);
             } catch (e) {
               this.log(`[AUTO-SWAP] Quote failed for ${pair.from}→${pair.to}: ${e.message?.slice(0, 60)}`, "error");
               continue;
             }
 
-            const expectedOut = quote[1];
-            const toDecimals = TOKEN_DECIMALS[pair.to] || 6;
+            const expectedOut = quote[quote.length - 1];
+            const toDecimals = tokenDecimalsMap[pair.to] ?? TOKEN_DECIMALS[pair.to] ?? 6;
             const amountOutMin = applySlippage(expectedOut, BigInt(autoSwapConfig.slippageBps || 50));
 
             // Log pre-swap details
-            this.log(`[SWAP] pair=${pair.from}→${pair.to}`, "warn");
+            this.log(`[SWAP] pair=${pair.from}→${pair.to} hops=${route?.type || "direct"}`, "warn");
             this.log(`[SWAP] amountIn=${ethers.formatUnits(amountRaw, decimals)} ${pair.from}`, "warn");
             this.log(`[SWAP] expectedOut=${ethers.formatUnits(expectedOut, toDecimals)} ${pair.to}`, "warn");
             this.log(`[SWAP] amountOutMin=${ethers.formatUnits(amountOutMin, toDecimals)} ${pair.to}`, "warn");
@@ -1456,16 +1910,17 @@ export class AutoTrader {
             if (dryRun) {
               this.log(`[DRY] Would swap ${amountResult.amountFloat.toFixed(4)} ${pair.from} → ${pair.to}`, "info");
               this.swapJournal.record({ from: pair.from, to: pair.to, amount: amountResult.amountFloat });
+              this.rotation.recordSwapPair(pair.from, pair.to);
               swapsDone++;
               continue;
             }
 
-            // Execute swap
+            // Execute swap (route path: direct or multi-hop)
             const swapResult = await executeSwap({
               wallet, provider,
               fromToken: pair.fromAddr, toToken: pair.toAddr,
               amount: amountRaw, amountOutMin,
-              config: this.config, log: this.log.bind(this), txManager: this.txManager,
+              config: this.config, log: this.log.bind(this), txManager: this.txManager, path,
             });
 
             if (!swapResult) {
@@ -1486,8 +1941,11 @@ export class AutoTrader {
             this.log(`[SWAP] actualOut≈${ethers.formatUnits(expectedOut, toDecimals)} ${pair.to}`, "success");
             this.log(`[SWAP] balanceAfter: ${pair.from}=${ethers.formatUnits(newFromBal, decimals)} ${pair.to}=${ethers.formatUnits(newToBal, toDecimals)}`, "success");
 
-            // Record in journal
+            // Record in journal + rotation
             this.swapJournal.record({ from: pair.from, to: pair.to, amount: amountResult.amountFloat });
+            this.rotation.recordSwapPair(pair.from, pair.to);
+            this.state.rotation = this.rotation.toJSON();
+            saveState(this.state);
             swapsDone++;
 
             // Cooldown between swaps
@@ -1508,13 +1966,16 @@ export class AutoTrader {
         await logInventory(provider, walletAddr, this.log.bind(this));
       }
 
-      // PHASE 1: If active position → CLOSE
+      // PHASE 1: If active position → CLOSE (always via the position's own manager)
       if (this.state.activePosition) {
         this.setState(STATES.CLOSE);
-        this.log(`[CLOSE] position #${this.state.activePosition.positionId} (${this.state.activePosition.side})`, "warn");
+        const activeManager = this.state.activePosition.managerAddr
+          || this.getManagerAddr(this.state.activePosition.side)
+          || managerAddr;
+        this.log(`[CLOSE] position #${this.state.activePosition.positionId} (${this.state.activePosition.side}) market=${this.state.activePosition.marketSymbol || "?"} manager=${short(activeManager)}`, "warn");
 
         const closeResult = await closePositionFn({
-          wallet, provider, managerAddr,
+          wallet, provider, managerAddr: activeManager,
           positionId: this.state.activePosition.positionId,
           config: this.config, log: this.log.bind(this), dryRun, txManager: this.txManager,
         });
@@ -1541,10 +2002,11 @@ export class AutoTrader {
         return;
       }
 
-      // PHASE 2: SELECT DIRECTION (alternating LONG/SHORT, or use RSI)
+      // PHASE 2: SELECT DIRECTION + MARKET — RSI may bias side, rotation picks MARKET×SIDE
       this.setState(STATES.SIGNAL);
       const lastSide = this.state.lastSide || null;
-      let side;
+      let side = null;
+      let preferredSideFromSignal = null;
 
       // Try RSI first
       try {
@@ -1553,28 +2015,41 @@ export class AutoTrader {
           const signal = getSignal(rsi, { rsiLong: 30, rsiShort: 70 });
           this.log(`[RSI] value=${rsi} signal=${signal}`, "info");
           if (signal !== "WAIT") {
-            side = signal;
+            preferredSideFromSignal = signal;
           }
         }
       } catch {}
 
-      // Fallback: alternating
-      if (!side) {
+      // Rotation-backed side selection: RSI may bias; otherwise use rotated MARKET×SIDE
+      const planned = await this.nextMarketSide();
+      if (preferredSideFromSignal) {
+        side = preferredSideFromSignal;
+      } else if (planned) {
+        side = planned.side;
+      } else {
         side = lastSide === "LONG" ? "SHORT" : "LONG";
       }
-      this.log(`[DIRECTION] ${side}`, "warn");
+      this.log(`[DIRECTION] ${side}${planned ? ` (rotated candidate: ${planned.marketSymbol || planned.symbol}×${planned.side})` : ""}`, "warn");
 
-      // PHASE 3: PREPARE COLLATERAL — INVENTORY-AWARE, pool-aware market
+      // PHASE 3: PREPARE COLLATERAL — INVENTORY-AWARE, pool-aware market (with fallbacks)
       this.setState(STATES.PREPARE_COLLATERAL);
-      const market = this.resolveMarket(side);
-      if (!market) {
+      const marketCandidates = await this.planMarketsForSide(side, {
+        max: Number(this.config.maxMarketAttemptsPerCycle || 3),
+      });
+      if (!marketCandidates.length) {
         this.log(`[BLOCKED] No active market supports ${side}`, "error");
         return;
       }
-      this.log(`[MARKET] ${market.symbol} manager=${short(market.managerAddr)} coll=${market.collateralSym}`, "info");
+      const market = marketCandidates[0];
+      this.log(`[MARKET] ${market.symbol} manager=${short(market.managerAddr)} pool=${short(market.poolAddr)} coll=${market.collateralSym || "?"} (candidates: ${marketCandidates.map(m => m.symbol).join(", ")})`, "info");
       const collateralToken = market.collateralToken;
-      const collateralDecimals = market.decimals;
-      const collateralSym = market.collateralSym;
+      if (!collateralToken) {
+        this.log(`[BLOCKED] Market ${market.symbol} has no collateral token for ${side}`, "error");
+        return;
+      }
+      // decimals/symbol ALWAYS from token contract (never hardcoded)
+      const collateralDecimals = market.decimals ?? await tokenDecimalsOnChain(provider, collateralToken);
+      const collateralSym = market.collateralSym ?? await tokenSymbolOnChain(provider, collateralToken);
 
       // Required collateral for position open
       const targetStr = collateralTargetStr(this.config, collateralToken);
@@ -1616,15 +2091,22 @@ export class AutoTrader {
         this.log(`[SWAP] ${deficit.reason}`, "warn");
         this.log(`[SWAP] searching inventory for source tokens...`, "warn");
 
-        // Select swap source from inventory
-        const sources = swapSourcesFor(collateralToken, side);
+        // Select swap source from discovered routes (direct or multi-hop)
+        const sources = swapSourcesFor(collateralToken, side, this.tokenList);
         let swapSuccess = false;
 
         for (const sourceToken of sources) {
           const sourceContract = new ethers.Contract(sourceToken, ERC20_ABI, provider);
           const sourceBalance = await sourceContract.balanceOf(walletAddr);
-          const sourceDecimals = sourceToken === WETH ? 18 : 6;
-          const sourceSym = sourceToken === USDT ? "USDT" : sourceToken === USDC ? "USDC" : "WETH";
+          let sourceDecimals, sourceSym;
+          try {
+            const meta = await tokenMetaOnChain(provider, sourceToken);
+            sourceDecimals = meta.decimals;
+            sourceSym = meta.symbol;
+          } catch {
+            this.log(`[SWAP] source ${short(sourceToken)} meta failed — skip`, "warn");
+            continue;
+          }
 
           if (sourceBalance <= 0n) {
             this.log(`[SWAP] ${sourceSym} balance=0 — skip`, "info");
@@ -1634,9 +2116,15 @@ export class AutoTrader {
           this.log(`[SWAP] ${sourceSym} balance=${ethers.formatUnits(sourceBalance, sourceDecimals)} — trying ${sourceSym} → ${collateralSym}`, "info");
 
           try {
+            const route = findRoute(this.routes, sourceToken, collateralToken);
+            const path = route ? route.path : [sourceToken, collateralToken];
+            if (this.routes.length && !route) {
+              this.log(`[SWAP] ${sourceSym} → ${collateralSym}: no validated route — skip`, "warn");
+              continue;
+            }
             const router = new ethers.Contract(getRouterAddress(), ROUTER_ABI, provider);
-            const fullQuote = await router.getAmountsOut(sourceBalance, [sourceToken, collateralToken]);
-            const expectedOut = fullQuote[1];
+            const fullQuote = await router.getAmountsOut(sourceBalance, path);
+            const expectedOut = fullQuote[fullQuote.length - 1];
 
             if (expectedOut < deficit.swapAmount) {
               this.log(`[SWAP] ${sourceSym} insufficient: max output ${ethers.formatUnits(expectedOut, collateralDecimals)} < needed ${ethers.formatUnits(deficit.swapAmount, collateralDecimals)}`, "warn");
@@ -1662,7 +2150,7 @@ export class AutoTrader {
             const swapResult = await executeSwap({
               wallet, provider, fromToken: sourceToken, toToken: collateralToken,
               amount: swapAmount, amountOutMin, config: this.config,
-              log: this.log.bind(this), txManager: this.txManager,
+              log: this.log.bind(this), txManager: this.txManager, path,
             });
 
             if (!swapResult) {
@@ -1701,23 +2189,41 @@ export class AutoTrader {
         this.log(`[INVENTORY] POST-SWAP ${collateralSym}=${ethers.formatUnits(finalBalance, collateralDecimals)} — ready for OPEN`, "success");
       }
 
-      // PHASE 4: OPEN
+      // PHASE 4: OPEN — try market candidates in order, record rotation + direction health
       this.setState(STATES.OPEN);
       this.log(`[OPEN] ${side} ${this.config.defaultLeverage}x...`, "warn");
 
-      const openResult = await openPosition({
-        wallet, provider, managerAddr: market.managerAddr, poolAddr: market.poolAddr,
-        side, collateralToken, collateralAmount,
-        leverage: this.config.defaultLeverage,
-        config: this.config, log: this.log.bind(this), dryRun, txManager: this.txManager,
-        paymentToken: market.paymentToken,
-      });
+      let openResult = null;
+      let openedMarket = null;
+      for (const candidate of marketCandidates) {
+        this.log(`[OPEN] trying market ${candidate.symbol} manager=${short(candidate.managerAddr)}`, "info");
+        const attempt = await openPosition({
+          wallet, provider, managerAddr: candidate.managerAddr, poolAddr: candidate.poolAddr,
+          side, collateralToken, collateralAmount,
+          leverage: this.config.defaultLeverage,
+          config: this.config, log: this.log.bind(this), dryRun, txManager: this.txManager,
+          paymentToken: candidate.paymentToken,
+        });
+        openResult = attempt;
+        if (attempt) {
+          openedMarket = candidate;
+          break;
+        }
+        this._recordDirectionFailure(candidate.symbol, side);
+        this.log(`[OPEN] market ${candidate.symbol} failed — trying next candidate`, "warn");
+      }
+      const marketUsed = openedMarket || market;
 
       if (openResult?.dryRun) {
-        this.log(`[DRY] Open would execute`, "info");
+        this.log(`[DRY] Open would execute on ${marketUsed.symbol}`, "info");
         this.state.lastSide = side;
+        this.rotation.recordMarketSide(marketUsed.symbol, side);
+        this.state.rotation = this.rotation.toJSON();
         saveState(this.state);
       } else if (openResult) {
+        this._recordDirectionSuccess(marketUsed.symbol, side);
+        this.rotation.recordMarketSide(marketUsed.symbol, side);
+        this.state.rotation = this.rotation.toJSON();
         this.state.activePosition = {
           positionId: openResult.positionId,
           side,
@@ -1726,21 +2232,21 @@ export class AutoTrader {
           leverage: this.config.defaultLeverage,
           openedAt: Date.now(),
           txHash: openResult.txHash,
-          marketSymbol: market.symbol,
-          managerAddr: market.managerAddr,
-          poolAddr: market.poolAddr,
+          marketSymbol: marketUsed.symbol,
+          managerAddr: marketUsed.managerAddr,
+          poolAddr: marketUsed.poolAddr,
         };
         this.state.lastSide = side;
         this.state.sessionStats.opens++;
         saveState(this.state);
 
         this.setState(STATES.MONITOR);
-        this.log(`[MONITOR] position #${openResult.positionId} (${side})`, "success");
+        this.log(`[MONITOR] position #${openResult.positionId} (${side} ${marketUsed.symbol})`, "success");
 
         this.log(`[COOLDOWN] ${this.config.cooldownAfterOpenMs / 1000}s...`, "info");
         await this.sleep(this.config.cooldownAfterOpenMs);
       } else {
-        this.log(`[BLOCKED] Open failed — skipping cycle`, "error");
+        this.log(`[BLOCKED] Open failed on all candidate markets — skipping cycle`, "error");
       }
 
       this.lastCycleAction = openResult ? "open" : "idle";
@@ -1765,26 +2271,36 @@ export class AutoTrader {
       this.log(`  Dry run: ${this.config.dryRun}`, "info");
       this.log("══════════════════════════════════════════════", "warn");
 
-      // Recovery
+      // Recovery — scan EVERY discovered manager (all active markets)
       try {
         this.log("[RECOVERY] scanning on-chain...", "info");
         const { provider } = this.getRuntime();
         const walletAddr = this.deps.accounts[this.deps.selectedWalletIndex].address;
+        await this.ensureMarkets({ force: true });
+        const discoveredMgrs = this.markets.map(m => m.managerAddr).filter(Boolean);
         const managers = [...new Set([
-          this.getManagerAddr("SHORT"),
-          this.resolveMarket("LONG")?.managerAddr,
-          this.deps.confirmedPools?.["NEMESIS/USDT"]?.manager,
-          this.deps.confirmedPools?.["ETH/USDT"]?.manager,
+          ...discoveredMgrs,
+          this.state.activePosition?.managerAddr,
+          ...Object.values(this.deps.confirmedPools || {}).map(p => p?.manager),
         ].filter(Boolean))];
+        this.log(`[RECOVERY] ${managers.length} manager(s) to scan`, "info");
         let recovered = null;
         for (const mgr of managers) {
           recovered = await recoverPosition(provider, walletAddr, mgr, this.log.bind(this));
           if (recovered) {
             recovered.managerAddr = mgr;
-            const sym = Object.entries(this.deps.confirmedPools || {})
-              .find(([, p]) => p?.manager?.toLowerCase() === mgr.toLowerCase())?.[0];
-            if (sym) recovered.marketSymbol = sym;
-            recovered.poolAddr = this.deps.confirmedPools?.[sym]?.pool;
+            const mk = this.markets.find(m => m.managerAddr?.toLowerCase() === mgr.toLowerCase());
+            if (mk) {
+              recovered.marketSymbol = mk.marketSymbol || mk.symbol;
+              recovered.poolAddr = mk.poolAddr;
+            } else {
+              const sym = Object.entries(this.deps.confirmedPools || {})
+                .find(([, p]) => p?.manager?.toLowerCase() === mgr.toLowerCase())?.[0];
+              if (sym) {
+                recovered.marketSymbol = sym;
+                recovered.poolAddr = this.deps.confirmedPools?.[sym]?.pool;
+              }
+            }
             break;
           }
         }
@@ -1805,15 +2321,16 @@ export class AutoTrader {
       // CONTINUOUS RUNNER — never stops
       while (!this.stopRequested) {
         try {
-          // STEP 1: Random token-to-token swaps
+          // STEP 1: Random token-to-token swaps across ALL discovered routes
           if (!this.stopRequested) {
             await this.doRandomSwaps();
           }
 
-          // STEP 2: Open position if none active
+          // STEP 2: Open position if none active — rotation picks MARKET×SIDE
           if (!this.state.activePosition && !this.stopRequested) {
-            const side = this.nextSide();
-            this.log(`[AUTO] NEXT ACTION: OPEN ${side}`, "info");
+            const planned = await this.nextMarketSide();
+            const side = planned?.side || this.nextSide();
+            this.log(`[AUTO] NEXT ACTION: OPEN ${side}${planned ? ` on ${planned.marketSymbol || planned.symbol}` : ""}`, "info");
             this.setState(STATES.OPEN);
             await this.prepareAndOpen(side);
           }
@@ -1865,13 +2382,21 @@ export class AutoTrader {
     const autoSwapConfig = this.config.autoSwap || {};
     if (!autoSwapConfig.enabled) return;
 
+    await this.ensureMarkets();
     const { provider, wallet } = this.getRuntime();
     const walletAddr = wallet.address;
     const dryRun = this.config.dryRun;
-    const tokenAddrs = { USDC, USDT, WETH };
+
+    // Dynamic token map from discovery (on-chain decimals)
+    const tokenAddrs = {};
+    const decimalsMap = {};
+    for (const t of (this.tokenList.length ? this.tokenList : Object.entries(getAllTokens()).map(([symbol, address]) => ({ symbol, address, decimals: TOKEN_DECIMALS[symbol] ?? null })))) {
+      tokenAddrs[t.symbol] = t.address;
+      decimalsMap[t.symbol] = t.decimals;
+    }
 
     const swapCount = 1 + Math.floor(Math.random() * 2);
-    this.log(`[AUTO] SWAPPING — ${swapCount} random swap(s)`, "info");
+    this.log(`[AUTO] SWAPPING — ${swapCount} random swap(s) (${this.routes.length} routes)`, "info");
 
     for (let i = 0; i < swapCount; i++) {
       if (this.stopRequested) break;
@@ -1880,13 +2405,16 @@ export class AutoTrader {
         const freshBalances = {};
         for (const [sym, addr] of Object.entries(tokenAddrs)) {
           try {
+            let dec = decimalsMap[sym];
+            if (dec === null || dec === undefined) dec = await tokenDecimalsOnChain(provider, addr);
+            decimalsMap[sym] = dec;
             const c = new ethers.Contract(addr, ERC20_ABI, provider);
             const bal = await c.balanceOf(walletAddr);
-            freshBalances[sym] = { raw: bal, float: parseFloat(ethers.formatUnits(bal, TOKEN_DECIMALS[sym] || 6)) };
+            freshBalances[sym] = { raw: bal, float: parseFloat(ethers.formatUnits(bal, dec)) };
           } catch { freshBalances[sym] = { raw: 0n, float: 0 }; }
         }
 
-        const pair = selectRandomSwapPair(this.swapJournal, freshBalances, autoSwapConfig, tokenAddrs, this.log.bind(this));
+        const pair = selectRandomSwapPair(this.swapJournal, freshBalances, autoSwapConfig, tokenAddrs, this.log.bind(this), this.routes, this.rotation);
         if (!pair) {
           this.log(`[AUTO-SWAP] No valid pair`, "info");
           break;
@@ -1895,26 +2423,32 @@ export class AutoTrader {
         const fromBal = freshBalances[pair.from];
         if (!fromBal || fromBal.float <= 0) continue;
 
-        const amountResult = calculateRandomSwapAmount(pair.from, fromBal.float, autoSwapConfig);
+        const amountResult = calculateRandomSwapAmount(pair.from, fromBal.float, autoSwapConfig, decimalsMap[pair.from]);
         if (!amountResult) continue;
 
-        const decimals = TOKEN_DECIMALS[pair.from] || 6;
+        const decimals = decimalsMap[pair.from] ?? TOKEN_DECIMALS[pair.from] ?? 6;
         const amountRaw = ethers.parseUnits(amountResult.amountFloat.toFixed(decimals), decimals);
 
         if (amountRaw > fromBal.raw * 90n / 100n) continue;
         if (amountRaw > fromBal.raw) continue;
 
+        const route = findRoute(this.routes, pair.fromAddr, pair.toAddr);
+        const path = route ? route.path : [pair.fromAddr, pair.toAddr];
+
         const router = new ethers.Contract(getRouterAddress(), ROUTER_ABI, provider);
-        const quote = await router.getAmountsOut(amountRaw, [pair.fromAddr, pair.toAddr]);
-        const expectedOut = quote[1];
-        const toDecimals = TOKEN_DECIMALS[pair.to] || 6;
+        const quote = await router.getAmountsOut(amountRaw, path);
+        const expectedOut = quote[quote.length - 1];
+        const toDecimals = decimalsMap[pair.to] ?? TOKEN_DECIMALS[pair.to] ?? 6;
         const amountOutMin = applySlippage(expectedOut, BigInt(autoSwapConfig.slippageBps || 50));
 
-        this.log(`[AUTO] SWAPPING ${pair.from} → ${pair.to} [${ethers.formatUnits(amountRaw, decimals)}]`, "warn");
+        this.log(`[AUTO] SWAPPING ${pair.from} → ${pair.to} [${ethers.formatUnits(amountRaw, decimals)}] hops=${route?.type || "direct"}`, "warn");
 
         if (dryRun) {
           this.log(`[DRY] Would swap ${amountResult.amountFloat.toFixed(4)} ${pair.from} → ${pair.to}`, "info");
           this.swapJournal.record({ from: pair.from, to: pair.to, amount: amountResult.amountFloat });
+          this.rotation.recordSwapPair(pair.from, pair.to);
+          this.state.rotation = this.rotation.toJSON();
+          saveState(this.state);
           continue;
         }
 
@@ -1922,11 +2456,14 @@ export class AutoTrader {
           wallet, provider,
           fromToken: pair.fromAddr, toToken: pair.toAddr,
           amount: amountRaw, amountOutMin,
-          config: this.config, log: this.log.bind(this), txManager: this.txManager,
+          config: this.config, log: this.log.bind(this), txManager: this.txManager, path,
         });
 
         if (swapResult) {
           this.swapJournal.record({ from: pair.from, to: pair.to, amount: amountResult.amountFloat });
+          this.rotation.recordSwapPair(pair.from, pair.to);
+          this.state.rotation = this.rotation.toJSON();
+          saveState(this.state);
           this.log(`[SWAP] SUCCESS ${pair.from}→${pair.to}`, "success");
         } else {
           this.log(`[SWAP] FAILED ${pair.from}→${pair.to}`, "error");
@@ -1981,18 +2518,25 @@ export class AutoTrader {
     const walletAddr = wallet.address;
     const dryRun = this.config.dryRun;
 
-    const market = this.resolveMarket(side);
-    if (!market) {
+    await this.ensureMarkets();
+    const marketCandidates = await this.planMarketsForSide(side, {
+      max: Number(this.config.maxMarketAttemptsPerCycle || 3),
+    });
+    if (!marketCandidates.length) {
       this.log(`[BLOCKED] No active market supports ${side}`, "error");
       return false;
     }
-    const managerAddr = market.managerAddr;
-    const poolAddr = market.poolAddr;
-    this.log(`[MARKET] ${market.symbol} manager=${short(managerAddr)} coll=${market.collateralSym}`, "info");
+    const market = marketCandidates[0];
+    this.log(`[MARKET] ${market.symbol} manager=${short(market.managerAddr)} coll=${market.collateralSym || "?"} (candidates: ${marketCandidates.map(m => m.symbol).join(", ")})`, "info");
 
     const collateralToken = market.collateralToken;
-    const collateralDecimals = market.decimals;
-    const collateralSym = market.collateralSym;
+    if (!collateralToken) {
+      this.log(`[BLOCKED] Market ${market.symbol} has no collateral token for ${side}`, "error");
+      return false;
+    }
+    // decimals/symbol ALWAYS from token contract
+    const collateralDecimals = market.decimals ?? await tokenDecimalsOnChain(provider, collateralToken);
+    const collateralSym = market.collateralSym ?? await tokenSymbolOnChain(provider, collateralToken);
 
     const targetStr = collateralTargetStr(this.config, collateralToken);
     const collateralAmount = ethers.parseUnits(targetStr, collateralDecimals);
@@ -2019,15 +2563,16 @@ export class AutoTrader {
 
     if (deficit.action !== "none") {
       this.log(`[AUTO] SWAPPING for ${collateralSym} collateral`, "warn");
-      const sources = swapSourcesFor(collateralToken, side);
+      const sources = swapSourcesFor(collateralToken, side, this.tokenList);
       let swapSuccess = false;
 
       for (const sourceToken of sources) {
         try {
           const sourceContract = new ethers.Contract(sourceToken, ERC20_ABI, provider);
           const sourceBalance = await sourceContract.balanceOf(walletAddr);
-          const sourceDecimals = sourceToken === WETH ? 18 : 6;
-          const sourceSym = sourceToken === USDT ? "USDT" : sourceToken === USDC ? "USDC" : "WETH";
+          const srcMeta = await tokenMetaOnChain(provider, sourceToken);
+          const sourceDecimals = srcMeta.decimals;
+          const sourceSym = srcMeta.symbol;
 
           if (sourceBalance <= 0n) {
             this.log(`[SWAP] ${sourceSym} balance=0 — skip`, "info");
@@ -2036,9 +2581,15 @@ export class AutoTrader {
 
           this.log(`[SWAP] ${sourceSym} → ${collateralSym}: balance=${ethers.formatUnits(sourceBalance, sourceDecimals)}`, "info");
 
+          const route = findRoute(this.routes, sourceToken, collateralToken);
+          const path = route ? route.path : [sourceToken, collateralToken];
+          if (this.routes.length && !route) {
+            this.log(`[SWAP] ${sourceSym} → ${collateralSym}: no validated route — skip`, "warn");
+            continue;
+          }
           const router = new ethers.Contract(getRouterAddress(), ROUTER_ABI, provider);
-          const fullQuote = await router.getAmountsOut(sourceBalance, [sourceToken, collateralToken]);
-          const expectedOut = fullQuote[1];
+          const fullQuote = await router.getAmountsOut(sourceBalance, path);
+          const expectedOut = fullQuote[fullQuote.length - 1];
 
           if (expectedOut < deficit.swapAmount) {
             this.log(`[SWAP] ${sourceSym} insufficient: max output < needed`, "warn");
@@ -2061,7 +2612,7 @@ export class AutoTrader {
           const swapResult = await executeSwap({
             wallet, provider, fromToken: sourceToken, toToken: collateralToken,
             amount: swapAmount, amountOutMin, config: this.config,
-            log: this.log.bind(this), txManager: this.txManager,
+            log: this.log.bind(this), txManager: this.txManager, path,
           });
 
           if (swapResult) {
@@ -2073,14 +2624,14 @@ export class AutoTrader {
             }
           }
         } catch (e) {
-          this.log(`[SWAP] ${sourceSym} → ${collateralSym} failed: ${e.message?.slice(0, 60)}`, "error");
+          this.log(`[SWAP] source failed: ${e.message?.slice(0, 60)}`, "error");
           this.txManager.resetNonce();
           continue;
         }
       }
 
-      // Last resort: ETH → WETH for SHORT only when collateral is WETH
-      if (!swapSuccess && !dryRun && side === "SHORT" && collateralToken.toLowerCase() === WETH.toLowerCase()) {
+      // Last resort: ETH → WETH wrap when collateral is WETH
+      if (!swapSuccess && !dryRun && collateralToken.toLowerCase() === WETH.toLowerCase()) {
         try {
           const currentWethBal = await new ethers.Contract(WETH, ERC20_ABI, provider).balanceOf(walletAddr);
           const remainingDeficit = collateralAmount > currentWethBal ? collateralAmount - currentWethBal : 0n;
@@ -2115,21 +2666,40 @@ export class AutoTrader {
       }
     }
 
-    // Open position
+    // Open position — try market candidates in order
     this.setState(STATES.OPEN);
-    const openResult = await openPosition({
-      wallet, provider, managerAddr, poolAddr, side, collateralToken, collateralAmount,
-      leverage: this.config.defaultLeverage,
-      config: this.config, log: this.log.bind(this), dryRun, txManager: this.txManager,
-      paymentToken: market.paymentToken,
-    });
+    let openResult = null;
+    let openedMarket = null;
+    for (const candidate of marketCandidates) {
+      this.log(`[OPEN] trying market ${candidate.symbol} manager=${short(candidate.managerAddr)}`, "info");
+      const attempt = await openPosition({
+        wallet, provider, managerAddr: candidate.managerAddr, poolAddr: candidate.poolAddr,
+        side, collateralToken, collateralAmount,
+        leverage: this.config.defaultLeverage,
+        config: this.config, log: this.log.bind(this), dryRun, txManager: this.txManager,
+        paymentToken: candidate.paymentToken,
+      });
+      openResult = attempt;
+      if (attempt) {
+        openedMarket = candidate;
+        break;
+      }
+      this._recordDirectionFailure(candidate.symbol, side);
+      this.log(`[OPEN] market ${candidate.symbol} failed — trying next candidate`, "warn");
+    }
+    const marketUsed = openedMarket || market;
 
     if (openResult?.dryRun) {
-      this.log(`[DRY] Open ${side} would execute`, "info");
+      this.log(`[DRY] Open ${side} would execute on ${marketUsed.symbol}`, "info");
       this.state.lastSide = side;
+      this.rotation.recordMarketSide(marketUsed.symbol, side);
+      this.state.rotation = this.rotation.toJSON();
       saveState(this.state);
       return true;
     } else if (openResult) {
+      this._recordDirectionSuccess(marketUsed.symbol, side);
+      this.rotation.recordMarketSide(marketUsed.symbol, side);
+      this.state.rotation = this.rotation.toJSON();
       this.state.activePosition = {
         positionId: openResult.positionId,
         side, collateralToken,
@@ -2137,17 +2707,17 @@ export class AutoTrader {
         leverage: this.config.defaultLeverage,
         openedAt: Date.now(),
         txHash: openResult.txHash,
-        marketSymbol: market.symbol,
-        managerAddr: market.managerAddr,
-        poolAddr: market.poolAddr,
+        marketSymbol: marketUsed.symbol,
+        managerAddr: marketUsed.managerAddr,
+        poolAddr: marketUsed.poolAddr,
       };
       this.state.lastSide = side;
       this.state.sessionStats.opens++;
       saveState(this.state);
-      this.log(`[OPEN] SUCCESS — position #${openResult.positionId} (${side})`, "success");
+      this.log(`[OPEN] SUCCESS — position #${openResult.positionId} (${side} ${marketUsed.symbol})`, "success");
       return true;
     } else {
-      this.log(`[BLOCKED] Open failed`, "error");
+      this.log(`[BLOCKED] Open failed on all candidate markets`, "error");
       return false;
     }
   }

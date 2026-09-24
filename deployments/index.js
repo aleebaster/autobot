@@ -83,12 +83,6 @@ export async function autoDetectDeployment(provider) {
       return "v2";
     }
 
-    // Check OLD V2 Factory (0x28e90C39CF9f65fc24000B563EFDEBB81a730a11)
-    const v2FactoryCode = await provider.getCode("0x28e90C39CF9f65fc24000B563EFDEBB81a730a11");
-    if (v2FactoryCode && v2FactoryCode !== "0x" && v2FactoryCode.length > 10) {
-      return "v2";
-    }
-
     // Check V1 Factory (0x0e733d055dbE7020f42D4f692Bc4fff15E5f2E7d)
     const v1FactoryCode = await provider.getCode("0x0e733d055dbE7020f42D4f692Bc4fff15E5f2E7d");
     if (v1FactoryCode && v1FactoryCode !== "0x" && v1FactoryCode.length > 10) {

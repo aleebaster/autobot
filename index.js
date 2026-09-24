@@ -406,33 +406,58 @@ async function openManual(side) {
     const provider = new ethers.JsonRpcProvider(rpcUrl, chainId);
     const wallet = new ethers.Wallet(accounts[selectedWalletIndex].privateKey, provider);
 
-    const managerAddr = confirmedPools["NEMESIS/USDT"]?.manager || confirmedPools["ETH/USDT"]?.manager;
-    const poolAddr = confirmedPools["NEMESIS/USDT"]?.pool || confirmedPools["ETH/USDT"]?.pool;
+    // Import openPosition + market discovery from autoTrader
+    const { openPosition, resolveTradingMarket, getDiscoveredMarkets, setDiscoveredMarkets, tokenDecimalsOnChain, tokenSymbolOnChain } = await import("./autoTrader.js");
+    const md = await import("./marketDiscovery.js");
 
-    if (!managerAddr) {
-      addLog("No manager address found", "error");
-      return;
+    // Discover all markets on-chain (pool-address-first merge) — no single-market hardcode
+    let discovered = getDiscoveredMarkets();
+    if (!discovered.length) {
+      try {
+        const d = await md.discoverMarkets({
+          provider,
+          factoryAddress: getActiveDeployment().factory,
+          tokens: getActiveDeployment().tokens,
+          confirmedPools,
+          availableMarkets: config.availableMarkets || [],
+          knownMarkets: getActiveDeployment().knownMarkets || [],
+          runtime: {},
+          log: addLog,
+        });
+        discovered = d.markets || [];
+        setDiscoveredMarkets(discovered, [], [], d.tokenMetaCache || null);
+      } catch (e) {
+        addLog(`Market discovery failed: ${e.message?.slice(0, 60)}`, "warn");
+      }
     }
-
-    // Import openPosition from autoTrader
-    const { openPosition, resolveTradingMarket } = await import("./autoTrader.js");
 
     const market = resolveTradingMarket({
       side,
       confirmedPools,
       availableMarkets: config.availableMarkets || [],
-      preferSymbol: "NEMESIS/USDT",
+      discoveredMarkets: discovered,
+      preferSymbol: config.preferredMarket || null,
     });
-    const resolvedManager = market?.managerAddr || managerAddr;
-    const resolvedPool = market?.poolAddr || poolAddr;
-    const collateralToken = market?.collateralToken || (side === "LONG" ? USDT_ADDRESS : WETH_ADDRESS);
-    const decimals = collateralToken.toLowerCase() === WETH_ADDRESS.toLowerCase() ? 18 : 6;
-    const targetStr = collateralToken.toLowerCase() === WETH_ADDRESS.toLowerCase()
+    if (!market?.managerAddr) {
+      addLog("No active market supports this side", "error");
+      return;
+    }
+    const resolvedManager = market.managerAddr;
+    const resolvedPool = market.poolAddr;
+    const collateralToken = market.collateralToken;
+    if (!collateralToken) {
+      addLog("Market has no collateral token for this side", "error");
+      return;
+    }
+    // decimals/symbol ALWAYS from token contract — never hardcoded
+    const decimals = market.decimals ?? await tokenDecimalsOnChain(provider, collateralToken);
+    const collSym = market.collateralSym ?? await tokenSymbolOnChain(provider, collateralToken);
+    const targetStr = collSym === "WETH" || collateralToken.toLowerCase() === WETH_ADDRESS.toLowerCase()
       ? (config.targetCollateralWETH || "0.002")
       : (config.targetCollateralUSDT || "10");
     const collateralAmount = ethers.parseUnits(targetStr, decimals);
 
-    addLog(`Opening ${side} — market=${market?.symbol || "?"} collateral: ${targetStr} @ ${collateralToken.slice(0,8)}...`, "warn");
+    addLog(`Opening ${side} — market=${market.symbol || "?"} collateral: ${targetStr} ${collSym} @ ${collateralToken.slice(0,8)}...`, "warn");
 
     const result = await openPosition({
       wallet, provider, managerAddr: resolvedManager, poolAddr: resolvedPool, side, collateralToken, collateralAmount,
@@ -474,30 +499,19 @@ async function closeManual() {
     const chainId = config.chainId || SEPOLIA_CHAIN_ID;
     const provider = new ethers.JsonRpcProvider(rpcUrl, chainId);
     const wallet = new ethers.Wallet(accounts[selectedWalletIndex].privateKey, provider);
-    const managerAddr = confirmedPools["NEMESIS/USDT"]?.manager || confirmedPools["ETH/USDT"]?.manager;
-
-    if (!managerAddr) {
-      addLog("No manager address found", "error");
-      return;
-    }
-
-    // Check LP balance
-    const MANAGER_ABI = ["function balanceOf(address account) view returns (uint256)"];
-    const manager = new ethers.Contract(managerAddr, MANAGER_ABI, provider);
-    const lpBal = await manager.balanceOf(wallet.address);
-    addLog(`LP balance: ${lpBal.toString()}`, "info");
-
-    if (lpBal === 0n) {
-      addLog("No active position to close", "warn");
-      return;
-    }
-
-    // Find position ID from events or state
     const posState = autoTrader?.state?.activePosition;
     if (!posState) {
       addLog("No tracked position to close. Use Full Auto for automatic recovery.", "warn");
       return;
     }
+
+    // ALWAYS close via the position's own manager (per-market) — never a hardcoded default
+    const managerAddr = posState.managerAddr || autoTrader?.getManagerAddr?.(posState.side);
+    if (!managerAddr) {
+      addLog("No manager address for active position", "error");
+      return;
+    }
+    addLog(`Closing position #${posState.positionId} on manager ${managerAddr.slice(0,10)}... (market=${posState.marketSymbol || "?"})`, "info");
 
     const { closePositionFn } = await import("./autoTrader.js");
     const result = await closePositionFn({
@@ -553,7 +567,7 @@ async function startAutoTrading() {
     cooldownAfterCloseMs: 3_000,
     autoSwap: config.autoSwap,
     availableMarkets: config.availableMarkets || [],
-    preferredMarket: config.preferredMarket || "NEMESIS/USDT",
+    preferredMarket: config.preferredMarket || null,
   };
 
   const deps = {
