@@ -1,6 +1,7 @@
 import { ethers } from "ethers";
 import fs from "fs";
 import { TokenInventory, EthSessionTracker, DEFAULT_ETH_GUARD, calculateInventoryDeficit, SwapJournal, selectRandomSwapPair, calculateRandomSwapAmount, getTokenAddress, getSwapPairs, TOKEN_DECIMALS } from "./tokenInventory.js";
+import { getRouterAddress } from "./deployments/index.js";
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  AUTONOMOUS TRADING LOOP — Nemesis Sepolia (V2 — CORRECTED)
@@ -10,6 +11,9 @@ import { TokenInventory, EthSessionTracker, DEFAULT_ETH_GUARD, calculateInventor
 const OPEN_POSITION_SELECTOR = "0xfa2b1dfd";
 const CLOSE_POSITION_SELECTOR = "0xb35648d7";
 const BPS = 10000n;
+// Frontend extra words appended after the 7 ABI args (not in selector signature):
+// bytes32 r (constant across successful opens), uint256 v, address paymentToken
+const OPEN_EXTRAS_R = "0x1fef349898a4b7d9f2092024bb4addeca01b5c4f708aac30a980544b3a70bac5";
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  TX MANAGER — centralized nonce + serialization + retry
@@ -249,6 +253,115 @@ function lpBorrowToExpectedOut({ lpBorrowAmount, collateralToken, reserve0, rese
   return amountInWithFee * adjustedReserveOut / (adjustedReserveIn * BPS + amountInWithFee);
 }
 
+function tokenDecimalsOf(addr) {
+  return addr && addr.toLowerCase() === WETH.toLowerCase() ? 18 : 6;
+}
+
+function tokenSymbolOf(addr) {
+  if (!addr) return "?";
+  const a = addr.toLowerCase();
+  if (a === USDT.toLowerCase()) return "USDT";
+  if (a === USDC.toLowerCase()) return "USDC";
+  if (a === WETH.toLowerCase()) return "WETH";
+  return short(addr);
+}
+
+function riskyTokenOfMarket(market) {
+  const t0 = market?.poolToken0;
+  const coll = market?.collateralToken;
+  if (t0 && t0.toLowerCase() !== USDT.toLowerCase()) return t0;
+  if (coll && coll.toLowerCase() !== USDT.toLowerCase()) return coll;
+  return WETH;
+}
+
+function pairTokensOfMarket(market) {
+  const token0 = market.poolToken0;
+  const risky = riskyTokenOfMarket(market);
+  const token1 = token0 && token0.toLowerCase() === USDT.toLowerCase() ? risky : USDT;
+  return { token0, token1, risky };
+}
+
+function collateralTargetStr(config, collateralToken) {
+  const t = (collateralToken || "").toLowerCase();
+  if (t === WETH.toLowerCase()) return config.targetCollateralWETH || "0.002";
+  if (t === USDT.toLowerCase()) return config.targetCollateralUSDT || "10";
+  return config.targetCollateralGeneric || "10";
+}
+
+function reserveTargetStr(config, collateralToken) {
+  const t = (collateralToken || "").toLowerCase();
+  if (t === WETH.toLowerCase()) return config.targetReserveWETH || "0.004";
+  if (t === USDT.toLowerCase()) return config.targetReserveUSDT || "20";
+  return config.targetReserveGeneric || "20";
+}
+
+function swapSourcesFor(collateralToken, side) {
+  const base = side === "LONG" ? LONG_SOURCES : SHORT_SOURCES;
+  const all = [USDT, USDC, WETH];
+  const ordered = [...base, ...all.filter(t => !base.some(b => b.toLowerCase() === t.toLowerCase()))];
+  const target = (collateralToken || "").toLowerCase();
+  return ordered.filter(t => t.toLowerCase() !== target);
+}
+
+/**
+ * Resolve active trading market for a side.
+ * Prefers NEMESIS/USDT (reference market, supportsLong/Short), then config availableMarkets.
+ * Collateral rule: token0 → LONG, token1 → SHORT.
+ */
+function resolveTradingMarket({ side, confirmedPools = {}, availableMarkets = [], preferSymbol = "NEMESIS/USDT" }) {
+  const eligible = (availableMarkets || []).filter(m => {
+    if (!m?.isActive) return false;
+    if (side === "LONG" && m.supportsLong === false) return false;
+    if (side === "SHORT" && m.supportsShort === false) return false;
+    const p = confirmedPools[m.symbol];
+    return !!(p && p.deployed !== false && p.manager && p.pool);
+  });
+  const ordered = [
+    ...eligible.filter(m => m.symbol === preferSymbol),
+    ...eligible.filter(m => m.symbol !== preferSymbol),
+  ];
+  const market = ordered[0];
+  if (!market) return null;
+  const poolInfo = confirmedPools[market.symbol];
+  const { token0, token1, risky } = pairTokensOfMarket(market);
+  const collateralToken = side === "LONG" ? token0 : token1;
+  return {
+    symbol: market.symbol,
+    managerAddr: poolInfo.manager,
+    poolAddr: poolInfo.pool,
+    poolToken0: token0,
+    poolToken1: token1,
+    riskyToken: risky,
+    paymentToken: risky,
+    collateralToken,
+    decimals: tokenDecimalsOf(collateralToken),
+    collateralSym: tokenSymbolOf(collateralToken),
+    market,
+  };
+}
+
+/**
+ * openPosition ABI order (selector 0xfa2b1dfd):
+ *   isLong, collateralToken, collateralAmount, borrowAmount, leverageX10, amountOutMin, deadline
+ * Optional trailing extras (frontend): bytes32 r, uint256 v, address paymentToken
+ *   v = (paymentToken == collateralToken) ? 1 : 0
+ */
+function encodeOpenPositionCalldata({
+  isLong, collateralToken, collateralAmount, borrowAmount, leverageX10, amountOutMin, deadline,
+  paymentToken, withExtras = true,
+}) {
+  const coder = ethers.AbiCoder.defaultAbiCoder();
+  const core = coder.encode(
+    ["bool", "address", "uint256", "uint256", "uint256", "uint256", "uint256"],
+    [isLong, collateralToken, collateralAmount, borrowAmount, leverageX10, amountOutMin, BigInt(deadline)]
+  );
+  if (!withExtras) return OPEN_POSITION_SELECTOR + core.slice(2);
+  const pay = paymentToken || collateralToken;
+  const v = pay.toLowerCase() === collateralToken.toLowerCase() ? 1n : 0n;
+  const extras = coder.encode(["bytes32", "uint256", "address"], [OPEN_EXTRAS_R, v, pay]);
+  return OPEN_POSITION_SELECTOR + core.slice(2) + extras.slice(2);
+}
+
 function applySlippage(amount, slippageBps = 50n) {
   const bps = BigInt(Math.max(0, Number(slippageBps) || 0));
   if (amount <= 0n || bps >= BPS) return 0n;
@@ -327,10 +440,12 @@ const DEFAULT_AUTO_CONFIG = {
   maxLeverage: 5,
   targetCollateralUSDT: "10",
   targetCollateralWETH: "0.002",
+  targetCollateralGeneric: "10",
   // Inventory targets — when collateral balance < targetReserve, SWAP from other tokens
   // This triggers inventory-aware rebalancing, not just critical deficit swaps
   targetReserveUSDT: "20",
   targetReserveWETH: "0.004",
+  targetReserveGeneric: "20",
   minCollateralUSD: 1,
   slippageBps: 50,
   deadlineSeconds: 1200,
@@ -340,6 +455,8 @@ const DEFAULT_AUTO_CONFIG = {
   retryDelayMs: 5000,
   dryRun: false,
   ethGuard: { ...DEFAULT_ETH_GUARD },
+  availableMarkets: [],
+  preferredMarket: "NEMESIS/USDT",
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -444,7 +561,7 @@ async function recoverPosition(provider, walletAddr, managerAddr, log = () => {}
       }
     } catch {}
     log(`[RECOVERY] found active position #${positionId}`, "warn");
-    return { positionId, side: "LONG", collateralToken: USDT, openedAt: lastOpen.blockNumber };
+    return { positionId, side: "LONG", collateralToken: USDT, openedAt: lastOpen.blockNumber, managerAddr };
   } catch (e) {
     log(`[RECOVERY] error: ${e.message?.slice(0, 60)}`, "error");
     return null;
@@ -645,14 +762,14 @@ async function quoteLeveragedAmountOutMin(provider, { pool, manager, collateralT
 const LONG_SOURCES = [USDC, WETH];
 const SHORT_SOURCES = [USDT, USDC];
 
-async function ensureCollateral({ wallet, provider, side, collateralAmount, config, log, dryRun, txManager }) {
+async function ensureCollateral({ wallet, provider, side, collateralToken: collateralTokenArg, collateralAmount, config, log, dryRun, txManager }) {
   const walletAddr = wallet.address;
-  const collateralToken = side === "LONG" ? USDT : WETH;
-  const decimals = side === "LONG" ? 6 : 18;
-  const sym = side === "LONG" ? "USDT" : "WETH";
+  const collateralToken = collateralTokenArg || (side === "LONG" ? USDT : WETH);
+  const decimals = tokenDecimalsOf(collateralToken);
+  const sym = tokenSymbolOf(collateralToken);
   const tokenContract = new ethers.Contract(collateralToken, ERC20_ABI, provider);
   const balance = await tokenContract.balanceOf(walletAddr);
-  const routerAddr = "0x8f6eB7870334b1FD8006Fd52413f01689f4E57e9";
+  const routerAddr = getRouterAddress();
 
   log(`[SWAP-DEBUG] requiredCollateral=${ethers.formatUnits(collateralAmount, decimals)} ${sym}`, "info");
   log(`[SWAP-DEBUG] currentCollateral=${ethers.formatUnits(balance, decimals)} ${sym}`, "info");
@@ -673,7 +790,7 @@ async function ensureCollateral({ wallet, provider, side, collateralAmount, conf
   log(`[SWAP-DEBUG] deficit=${ethers.formatUnits(deficit, decimals)} ${sym}`, "warn");
   log(`[COLLATERAL] INSUFFICIENT — deficit=${ethers.formatUnits(deficit, decimals)} ${sym}`, "warn");
 
-  const sources = side === "LONG" ? LONG_SOURCES : SHORT_SOURCES;
+  const sources = swapSourcesFor(collateralToken, side);
   const router = new ethers.Contract(routerAddr, ROUTER_ABI, provider);
 
   for (const sourceToken of sources) {
@@ -727,8 +844,8 @@ async function ensureCollateral({ wallet, provider, side, collateralAmount, conf
     }
   }
 
-  // Last resort: ETH → WETH (wrap only the deficit, not all ETH)
-  if (side === "SHORT") {
+  // Last resort: ETH → WETH (wrap only the deficit, not all ETH) — only when target is WETH
+  if (side === "SHORT" && collateralToken.toLowerCase() === WETH.toLowerCase()) {
     const currentWethBal = await new ethers.Contract(WETH, ERC20_ABI, provider).balanceOf(walletAddr);
     const remainingDeficit = collateralAmount > currentWethBal ? collateralAmount - currentWethBal : 0n;
     if (remainingDeficit > 0n) {
@@ -760,7 +877,7 @@ async function ensureCollateral({ wallet, provider, side, collateralAmount, conf
 
 async function executeSwap({ wallet, provider, fromToken, toToken, amount, amountOutMin, config, log, txManager }) {
   const walletAddr = wallet.address;
-  const routerAddr = "0x8f6eB7870334b1FD8006Fd52413f01689f4E57e9";
+  const routerAddr = getRouterAddress();
   const router = new ethers.Contract(routerAddr, ROUTER_ABI, wallet);
   const fromContract = new ethers.Contract(fromToken, ERC20_ABI, wallet);
   const fromSym = fromToken === USDT ? "USDT" : fromToken === USDC ? "USDC" : "WETH";
@@ -830,10 +947,10 @@ async function executeSwap({ wallet, provider, fromToken, toToken, amount, amoun
 //  OPEN POSITION — CORRECTED (with oracle checkpoint + proper quote)
 // ═══════════════════════════════════════════════════════════════════════════
 
-async function openPosition({ wallet, provider, managerAddr, poolAddr, side, collateralToken, collateralAmount, leverage, config, log, dryRun, txManager }) {
+async function openPosition({ wallet, provider, managerAddr, poolAddr, side, collateralToken, collateralAmount, leverage, config, log, dryRun, txManager, paymentToken }) {
   const walletAddr = wallet.address;
   const isLong = side === "LONG";
-  const decimals = isLong ? 6 : 18;
+  const decimals = tokenDecimalsOf(collateralToken);
   const leverageX10 = BigInt(leverage * 10);
 
   // Validate leverage
@@ -900,33 +1017,32 @@ async function openPosition({ wallet, provider, managerAddr, poolAddr, side, col
     log(`[OPEN] Approved`, "success");
   }
 
-  // Encode calldata — CORRECT parameter order per on-chain Manager ABI:
-  // openPosition(isLong, collateralToken, collateralAmount, amountOutMin, leverage, size, deadline)
-  // size=0: contract uses collateralAmount internally (required for USDT 6-decimal collateral)
+  // Encode calldata — CORRECT parameter order per on-chain Manager ABI (0xfa2b1dfd):
+  // openPosition(isLong, collateralToken, collateralAmount, borrowAmount, leverageX10, amountOutMin, deadline)
+  // + optional frontend extras (r, v, paymentToken). a6 MUST be amountOutMin (slippage check).
   const deadline = Math.floor(Date.now() / 1000) + config.deadlineSeconds;
   const coder = ethers.AbiCoder.defaultAbiCoder();
+  const payToken = paymentToken || collateralToken;
 
   // Pre-flight simulation — encode calldata with the computed amountOutMin
-  const encodeCalldata = (aom) => {
-    const p = coder.encode(
-      ["bool", "address", "uint256", "uint256", "uint256", "uint256", "uint256"],
-      [isLong, collateralToken, collateralAmount, aom, leverageX10, 0n, BigInt(deadline)]
-    );
-    return OPEN_POSITION_SELECTOR + p.slice(2);
-  };
+  const encodeCalldata = (aom) => encodeOpenPositionCalldata({
+    isLong, collateralToken, collateralAmount,
+    borrowAmount, leverageX10, amountOutMin: aom, deadline,
+    paymentToken: payToken, withExtras: true,
+  });
 
   let calldata = encodeCalldata(amountOutMin);
 
   // Attempt 1: pre-flight with computed amountOutMin
   try {
     await provider.call({ from: walletAddr, to: managerAddr, data: calldata, value: 0n });
-    log(`[PREFLIGHT] isLong=${isLong} collateralToken=${collateralToken === USDT ? "USDT" : "WETH"} collateralAmount=${collateralAmount} leverageX10=${leverageX10} borrowAmount=${borrowAmount} amountOutMin=${amountOutMin} deadline=${deadline}`, "info");
+    log(`[PREFLIGHT] isLong=${isLong} collateralToken=${tokenSymbolOf(collateralToken)} collateralAmount=${collateralAmount} leverageX10=${leverageX10} borrowAmount=${borrowAmount} amountOutMin=${amountOutMin} deadline=${deadline}`, "info");
     log(`[PREFLIGHT] PASS`, "success");
   } catch (e) {
     const revertData = e?.data || e?.info?.error?.data || e?.cause?.data || e?.cause?.info?.error?.data || null;
     const match = (e?.shortMessage || e?.message || "").match(/0x[0-9a-fA-F]{8,}/);
     const rawRevert = revertData || match?.[0] || "unknown";
-    log(`[PREFLIGHT] isLong=${isLong} collateralToken=${collateralToken === USDT ? "USDT" : "WETH"} collateralAmount=${collateralAmount} leverageX10=${leverageX10} borrowAmount=${borrowAmount} amountOutMin=${amountOutMin} deadline=${deadline}`, "info");
+    log(`[PREFLIGHT] isLong=${isLong} collateralToken=${tokenSymbolOf(collateralToken)} collateralAmount=${collateralAmount} leverageX10=${leverageX10} borrowAmount=${borrowAmount} amountOutMin=${amountOutMin} deadline=${deadline}`, "info");
     log(`[PREFLIGHT] rawRevertData=${rawRevert}`, "error");
 
     // Attempt 2: diagnostic — try amountOutMin=0 ONLY for eth_call (never for TX)
@@ -1168,14 +1284,46 @@ export class AutoTrader {
     return { provider, wallet };
   }
 
-  getManagerAddr() {
+  /**
+   * Resolve market for a side (pool-aware). Prefer NEMESIS/USDT per config/reference.
+   */
+  resolveMarket(side) {
     const confirmedPools = this.deps.confirmedPools || {};
-    return confirmedPools["ETH/USDT"]?.manager || "0x2069b502DD917DC089171F96BeE390FcB5bad29d";
+    const availableMarkets = this.config.availableMarkets || this.deps.availableMarkets || [];
+    return resolveTradingMarket({
+      side,
+      confirmedPools,
+      availableMarkets,
+      preferSymbol: this.config.preferredMarket || "NEMESIS/USDT",
+    });
   }
 
-  getPoolAddr() {
+  getManagerAddr(side) {
+    if (side) {
+      const m = this.resolveMarket(side);
+      if (m) return m.managerAddr;
+    }
+    if (this.state?.activePosition?.managerAddr) return this.state.activePosition.managerAddr;
     const confirmedPools = this.deps.confirmedPools || {};
-    return confirmedPools["ETH/USDT"]?.pool || "0xf32E24b7F739c7C17544cb972833aB551121A72B";
+    const forSide = this.resolveMarket(this.state?.lastSide || "SHORT");
+    if (forSide) return forSide.managerAddr;
+    return confirmedPools["NEMESIS/USDT"]?.manager
+      || confirmedPools["ETH/USDT"]?.manager
+      || "0xD45dde32C66769ED835A0F0f45EC0bF6973857FD";
+  }
+
+  getPoolAddr(side) {
+    if (side) {
+      const m = this.resolveMarket(side);
+      if (m) return m.poolAddr;
+    }
+    if (this.state?.activePosition?.poolAddr) return this.state.activePosition.poolAddr;
+    const confirmedPools = this.deps.confirmedPools || {};
+    const forSide = this.resolveMarket(this.state?.lastSide || "SHORT");
+    if (forSide) return forSide.poolAddr;
+    return confirmedPools["NEMESIS/USDT"]?.pool
+      || confirmedPools["ETH/USDT"]?.pool
+      || "0x792bCdbe39E6aF13EeEbab251Cb59D6824EBe28e";
   }
 
   setState(newState) {
@@ -1193,8 +1341,10 @@ export class AutoTrader {
     try {
       const { provider, wallet } = this.getRuntime();
       const walletAddr = wallet.address;
-      const managerAddr = this.getManagerAddr();
-      const poolAddr = this.getPoolAddr();
+      // Default market for inventory logs / recovery — actual OPEN resolves per side
+      const defaultMarket = this.resolveMarket(this.state.lastSide || "SHORT") || this.resolveMarket("LONG");
+      const managerAddr = defaultMarket?.managerAddr || this.getManagerAddr();
+      const poolAddr = defaultMarket?.poolAddr || this.getPoolAddr();
 
       this.log("[CYCLE] ═══ CYCLE START ═══", "info");
 
@@ -1284,7 +1434,7 @@ export class AutoTrader {
             }
 
             // Get quote from Router
-            const router = new ethers.Contract("0x8f6eB7870334b1FD8006Fd52413f01689f4E57e9", ROUTER_ABI, provider);
+            const router = new ethers.Contract(getRouterAddress(), ROUTER_ABI, provider);
             let quote;
             try {
               quote = await router.getAmountsOut(amountRaw, [pair.fromAddr, pair.toAddr]);
@@ -1414,27 +1564,25 @@ export class AutoTrader {
       }
       this.log(`[DIRECTION] ${side}`, "warn");
 
-      // PHASE 3: PREPARE COLLATERAL — INVENTORY-AWARE
+      // PHASE 3: PREPARE COLLATERAL — INVENTORY-AWARE, pool-aware market
       this.setState(STATES.PREPARE_COLLATERAL);
-      const collateralToken = side === "LONG" ? USDT : WETH;
-      const collateralDecimals = side === "LONG" ? 6 : 18;
-      const collateralSym = side === "LONG" ? "USDT" : "WETH";
+      const market = this.resolveMarket(side);
+      if (!market) {
+        this.log(`[BLOCKED] No active market supports ${side}`, "error");
+        return;
+      }
+      this.log(`[MARKET] ${market.symbol} manager=${short(market.managerAddr)} coll=${market.collateralSym}`, "info");
+      const collateralToken = market.collateralToken;
+      const collateralDecimals = market.decimals;
+      const collateralSym = market.collateralSym;
 
       // Required collateral for position open
-      const targetStr = side === "LONG"
-        ? (this.config.targetCollateralUSDT || "10")
-        : (this.config.targetCollateralWETH || "0.002");
-      const collateralAmount = side === "LONG"
-        ? ethers.parseUnits(targetStr, 6)
-        : ethers.parseEther(targetStr);
+      const targetStr = collateralTargetStr(this.config, collateralToken);
+      const collateralAmount = ethers.parseUnits(targetStr, collateralDecimals);
 
       // Inventory target — swap UP TO this level (not just critical deficit)
-      const reserveStr = side === "LONG"
-        ? (this.config.targetReserveUSDT || "20")
-        : (this.config.targetReserveWETH || "0.004");
-      const targetReserve = side === "LONG"
-        ? ethers.parseUnits(reserveStr, 6)
-        : ethers.parseEther(reserveStr);
+      const reserveStr = reserveTargetStr(this.config, collateralToken);
+      const targetReserve = ethers.parseUnits(reserveStr, collateralDecimals);
 
       const tokenContract = new ethers.Contract(collateralToken, ERC20_ABI, provider);
       const balance = await tokenContract.balanceOf(walletAddr);
@@ -1469,7 +1617,7 @@ export class AutoTrader {
         this.log(`[SWAP] searching inventory for source tokens...`, "warn");
 
         // Select swap source from inventory
-        const sources = side === "LONG" ? LONG_SOURCES : SHORT_SOURCES;
+        const sources = swapSourcesFor(collateralToken, side);
         let swapSuccess = false;
 
         for (const sourceToken of sources) {
@@ -1486,7 +1634,7 @@ export class AutoTrader {
           this.log(`[SWAP] ${sourceSym} balance=${ethers.formatUnits(sourceBalance, sourceDecimals)} — trying ${sourceSym} → ${collateralSym}`, "info");
 
           try {
-            const router = new ethers.Contract("0x8f6eB7870334b1FD8006Fd52413f01689f4E57e9", ROUTER_ABI, provider);
+            const router = new ethers.Contract(getRouterAddress(), ROUTER_ABI, provider);
             const fullQuote = await router.getAmountsOut(sourceBalance, [sourceToken, collateralToken]);
             const expectedOut = fullQuote[1];
 
@@ -1558,9 +1706,11 @@ export class AutoTrader {
       this.log(`[OPEN] ${side} ${this.config.defaultLeverage}x...`, "warn");
 
       const openResult = await openPosition({
-        wallet, provider, managerAddr, poolAddr, side, collateralToken, collateralAmount,
+        wallet, provider, managerAddr: market.managerAddr, poolAddr: market.poolAddr,
+        side, collateralToken, collateralAmount,
         leverage: this.config.defaultLeverage,
         config: this.config, log: this.log.bind(this), dryRun, txManager: this.txManager,
+        paymentToken: market.paymentToken,
       });
 
       if (openResult?.dryRun) {
@@ -1576,6 +1726,9 @@ export class AutoTrader {
           leverage: this.config.defaultLeverage,
           openedAt: Date.now(),
           txHash: openResult.txHash,
+          marketSymbol: market.symbol,
+          managerAddr: market.managerAddr,
+          poolAddr: market.poolAddr,
         };
         this.state.lastSide = side;
         this.state.sessionStats.opens++;
@@ -1616,12 +1769,27 @@ export class AutoTrader {
       try {
         this.log("[RECOVERY] scanning on-chain...", "info");
         const { provider } = this.getRuntime();
-        const recovered = await recoverPosition(
-          provider, this.deps.accounts[this.deps.selectedWalletIndex].address,
-          this.getManagerAddr(), this.log.bind(this),
-        );
+        const walletAddr = this.deps.accounts[this.deps.selectedWalletIndex].address;
+        const managers = [...new Set([
+          this.getManagerAddr("SHORT"),
+          this.resolveMarket("LONG")?.managerAddr,
+          this.deps.confirmedPools?.["NEMESIS/USDT"]?.manager,
+          this.deps.confirmedPools?.["ETH/USDT"]?.manager,
+        ].filter(Boolean))];
+        let recovered = null;
+        for (const mgr of managers) {
+          recovered = await recoverPosition(provider, walletAddr, mgr, this.log.bind(this));
+          if (recovered) {
+            recovered.managerAddr = mgr;
+            const sym = Object.entries(this.deps.confirmedPools || {})
+              .find(([, p]) => p?.manager?.toLowerCase() === mgr.toLowerCase())?.[0];
+            if (sym) recovered.marketSymbol = sym;
+            recovered.poolAddr = this.deps.confirmedPools?.[sym]?.pool;
+            break;
+          }
+        }
         if (recovered) {
-          this.log(`[RECOVERED] position #${recovered.positionId} side=${recovered.side}`, "warn");
+          this.log(`[RECOVERED] position #${recovered.positionId} side=${recovered.side} market=${recovered.marketSymbol || "?"}`, "warn");
           this.state.activePosition = recovered;
           this.state.sessionStats.opens++;
           saveState(this.state);
@@ -1736,7 +1904,7 @@ export class AutoTrader {
         if (amountRaw > fromBal.raw * 90n / 100n) continue;
         if (amountRaw > fromBal.raw) continue;
 
-        const router = new ethers.Contract("0x8f6eB7870334b1FD8006Fd52413f01689f4E57e9", ROUTER_ABI, provider);
+        const router = new ethers.Contract(getRouterAddress(), ROUTER_ABI, provider);
         const quote = await router.getAmountsOut(amountRaw, [pair.fromAddr, pair.toAddr]);
         const expectedOut = quote[1];
         const toDecimals = TOKEN_DECIMALS[pair.to] || 6;
@@ -1778,11 +1946,11 @@ export class AutoTrader {
     if (!this.state.activePosition) return false;
 
     const { provider, wallet } = this.getRuntime();
-    const managerAddr = this.getManagerAddr();
+    const managerAddr = this.state.activePosition?.managerAddr || this.getManagerAddr();
     const dryRun = this.config.dryRun;
 
     this.setState(STATES.CLOSE);
-    this.log(`[AUTO] CLOSING position #${this.state.activePosition.positionId} (${this.state.activePosition.side})`, "warn");
+    this.log(`[AUTO] CLOSING position #${this.state.activePosition.positionId} (${this.state.activePosition.side}) manager=${short(managerAddr)}`, "warn");
 
     const closeResult = await closePositionFn({
       wallet, provider, managerAddr,
@@ -1811,27 +1979,26 @@ export class AutoTrader {
   async prepareAndOpen(side) {
     const { provider, wallet } = this.getRuntime();
     const walletAddr = wallet.address;
-    const managerAddr = this.getManagerAddr();
-    const poolAddr = this.getPoolAddr();
     const dryRun = this.config.dryRun;
 
-    const collateralToken = side === "LONG" ? USDT : WETH;
-    const collateralDecimals = side === "LONG" ? 6 : 18;
-    const collateralSym = side === "LONG" ? "USDT" : "WETH";
+    const market = this.resolveMarket(side);
+    if (!market) {
+      this.log(`[BLOCKED] No active market supports ${side}`, "error");
+      return false;
+    }
+    const managerAddr = market.managerAddr;
+    const poolAddr = market.poolAddr;
+    this.log(`[MARKET] ${market.symbol} manager=${short(managerAddr)} coll=${market.collateralSym}`, "info");
 
-    const targetStr = side === "LONG"
-      ? (this.config.targetCollateralUSDT || "10")
-      : (this.config.targetCollateralWETH || "0.002");
-    const collateralAmount = side === "LONG"
-      ? ethers.parseUnits(targetStr, 6)
-      : ethers.parseEther(targetStr);
+    const collateralToken = market.collateralToken;
+    const collateralDecimals = market.decimals;
+    const collateralSym = market.collateralSym;
 
-    const reserveStr = side === "LONG"
-      ? (this.config.targetReserveUSDT || "20")
-      : (this.config.targetReserveWETH || "0.004");
-    const targetReserve = side === "LONG"
-      ? ethers.parseUnits(reserveStr, 6)
-      : ethers.parseEther(reserveStr);
+    const targetStr = collateralTargetStr(this.config, collateralToken);
+    const collateralAmount = ethers.parseUnits(targetStr, collateralDecimals);
+
+    const reserveStr = reserveTargetStr(this.config, collateralToken);
+    const targetReserve = ethers.parseUnits(reserveStr, collateralDecimals);
 
     this.log(`[AUTO] OPENING ${side} ${this.config.defaultLeverage}x — collateral: ${collateralSym}`, "warn");
 
@@ -1852,7 +2019,7 @@ export class AutoTrader {
 
     if (deficit.action !== "none") {
       this.log(`[AUTO] SWAPPING for ${collateralSym} collateral`, "warn");
-      const sources = side === "LONG" ? LONG_SOURCES : SHORT_SOURCES;
+      const sources = swapSourcesFor(collateralToken, side);
       let swapSuccess = false;
 
       for (const sourceToken of sources) {
@@ -1869,7 +2036,7 @@ export class AutoTrader {
 
           this.log(`[SWAP] ${sourceSym} → ${collateralSym}: balance=${ethers.formatUnits(sourceBalance, sourceDecimals)}`, "info");
 
-          const router = new ethers.Contract("0x8f6eB7870334b1FD8006Fd52413f01689f4E57e9", ROUTER_ABI, provider);
+          const router = new ethers.Contract(getRouterAddress(), ROUTER_ABI, provider);
           const fullQuote = await router.getAmountsOut(sourceBalance, [sourceToken, collateralToken]);
           const expectedOut = fullQuote[1];
 
@@ -1912,8 +2079,8 @@ export class AutoTrader {
         }
       }
 
-      // Last resort: ETH → WETH for SHORT
-      if (!swapSuccess && !dryRun && side === "SHORT") {
+      // Last resort: ETH → WETH for SHORT only when collateral is WETH
+      if (!swapSuccess && !dryRun && side === "SHORT" && collateralToken.toLowerCase() === WETH.toLowerCase()) {
         try {
           const currentWethBal = await new ethers.Contract(WETH, ERC20_ABI, provider).balanceOf(walletAddr);
           const remainingDeficit = collateralAmount > currentWethBal ? collateralAmount - currentWethBal : 0n;
@@ -1954,6 +2121,7 @@ export class AutoTrader {
       wallet, provider, managerAddr, poolAddr, side, collateralToken, collateralAmount,
       leverage: this.config.defaultLeverage,
       config: this.config, log: this.log.bind(this), dryRun, txManager: this.txManager,
+      paymentToken: market.paymentToken,
     });
 
     if (openResult?.dryRun) {
@@ -1969,6 +2137,9 @@ export class AutoTrader {
         leverage: this.config.defaultLeverage,
         openedAt: Date.now(),
         txHash: openResult.txHash,
+        marketSymbol: market.symbol,
+        managerAddr: market.managerAddr,
+        poolAddr: market.poolAddr,
       };
       this.state.lastSide = side;
       this.state.sessionStats.opens++;
@@ -1986,5 +2157,5 @@ export class AutoTrader {
   }
 }
 
-export { STATES, DEFAULT_AUTO_CONFIG, openPosition, closePositionFn };
+export { STATES, DEFAULT_AUTO_CONFIG, openPosition, closePositionFn, resolveTradingMarket, encodeOpenPositionCalldata, TxManager };
 export default AutoTrader;

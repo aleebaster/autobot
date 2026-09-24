@@ -406,28 +406,38 @@ async function openManual(side) {
     const provider = new ethers.JsonRpcProvider(rpcUrl, chainId);
     const wallet = new ethers.Wallet(accounts[selectedWalletIndex].privateKey, provider);
 
-    const managerAddr = confirmedPools["ETH/USDT"]?.manager;
-    const poolAddr = confirmedPools["ETH/USDT"]?.pool;
+    const managerAddr = confirmedPools["NEMESIS/USDT"]?.manager || confirmedPools["ETH/USDT"]?.manager;
+    const poolAddr = confirmedPools["NEMESIS/USDT"]?.pool || confirmedPools["ETH/USDT"]?.pool;
 
     if (!managerAddr) {
-      addLog("No manager address found for ETH/USDT", "error");
+      addLog("No manager address found", "error");
       return;
     }
 
     // Import openPosition from autoTrader
-    const { openPosition } = await import("./autoTrader.js");
+    const { openPosition, resolveTradingMarket } = await import("./autoTrader.js");
 
-    const collateralToken = side === "LONG" ? USDT_ADDRESS : WETH_ADDRESS;
-    const targetStr = side === "LONG" ? "10" : "0.002";
-    const collateralAmount = side === "LONG"
-      ? ethers.parseUnits(targetStr, 6)
-      : ethers.parseEther(targetStr);
+    const market = resolveTradingMarket({
+      side,
+      confirmedPools,
+      availableMarkets: config.availableMarkets || [],
+      preferSymbol: "NEMESIS/USDT",
+    });
+    const resolvedManager = market?.managerAddr || managerAddr;
+    const resolvedPool = market?.poolAddr || poolAddr;
+    const collateralToken = market?.collateralToken || (side === "LONG" ? USDT_ADDRESS : WETH_ADDRESS);
+    const decimals = collateralToken.toLowerCase() === WETH_ADDRESS.toLowerCase() ? 18 : 6;
+    const targetStr = collateralToken.toLowerCase() === WETH_ADDRESS.toLowerCase()
+      ? (config.targetCollateralWETH || "0.002")
+      : (config.targetCollateralUSDT || "10");
+    const collateralAmount = ethers.parseUnits(targetStr, decimals);
 
-    addLog(`Opening ${side} — collateral: ${side === "LONG" ? "USDT" : "WETH"} ${targetStr}`, "warn");
+    addLog(`Opening ${side} — market=${market?.symbol || "?"} collateral: ${targetStr} @ ${collateralToken.slice(0,8)}...`, "warn");
 
     const result = await openPosition({
-      wallet, provider, managerAddr, poolAddr, side, collateralToken, collateralAmount,
+      wallet, provider, managerAddr: resolvedManager, poolAddr: resolvedPool, side, collateralToken, collateralAmount,
       leverage: 2,
+      paymentToken: market?.paymentToken,
       config: {
         maxLeverage: 5,
         deadlineSeconds: 1200,
@@ -464,7 +474,7 @@ async function closeManual() {
     const chainId = config.chainId || SEPOLIA_CHAIN_ID;
     const provider = new ethers.JsonRpcProvider(rpcUrl, chainId);
     const wallet = new ethers.Wallet(accounts[selectedWalletIndex].privateKey, provider);
-    const managerAddr = confirmedPools["ETH/USDT"]?.manager;
+    const managerAddr = confirmedPools["NEMESIS/USDT"]?.manager || confirmedPools["ETH/USDT"]?.manager;
 
     if (!managerAddr) {
       addLog("No manager address found", "error");
@@ -534,12 +544,16 @@ async function startAutoTrading() {
     dryRun: false,
     targetCollateralUSDT: config.targetCollateralUSDT || "10",
     targetCollateralWETH: config.targetCollateralWETH || "0.002",
+    targetCollateralGeneric: config.targetCollateralGeneric || "10",
     targetReserveUSDT: config.targetReserveUSDT || "20",
     targetReserveWETH: config.targetReserveWETH || "0.004",
+    targetReserveGeneric: config.targetReserveGeneric || "20",
     deadlineSeconds: config.deadlineSeconds || 1200,
     cooldownAfterOpenMs: 3_000,
     cooldownAfterCloseMs: 3_000,
     autoSwap: config.autoSwap,
+    availableMarkets: config.availableMarkets || [],
+    preferredMarket: config.preferredMarket || "NEMESIS/USDT",
   };
 
   const deps = {

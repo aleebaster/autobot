@@ -75,7 +75,8 @@ async function main() {
   console.log("═══════════════════════════════════════════════════════");
   console.log(`  Factory:     ${deployment.factory}`);
   console.log(`  Router:      ${deployment.router}`);
-  console.log(`  Manager:     ${confirmedPools["ETH/USDT"]?.manager || "N/A"}`);
+  console.log(`  Manager:     ${confirmedPools["NEMESIS/USDT"]?.manager || confirmedPools["ETH/USDT"]?.manager || "N/A"}`);
+  console.log(`  Market:      NEMESIS/USDT (preferred)`);
   console.log(`  Leverage:    ${leverage}x`);
   console.log(`  Dry run:     ${dryRun}`);
   console.log(`  Once mode:   ${once}`);
@@ -113,6 +114,16 @@ async function main() {
     cooldownAfterOpenMs: 3_000,
     cooldownAfterCloseMs: 3_000,
     autoSwap: config.autoSwap,
+    targetCollateralUSDT: config.targetCollateralUSDT || "10",
+    targetCollateralWETH: config.targetCollateralWETH || "0.002",
+    targetCollateralGeneric: config.targetCollateralGeneric || "10",
+    targetReserveUSDT: config.targetReserveUSDT || "20",
+    targetReserveWETH: config.targetReserveWETH || "0.004",
+    targetReserveGeneric: config.targetReserveGeneric || "20",
+    deadlineSeconds: config.deadlineSeconds || 1200,
+    slippageBps: config.slippageBps || 50,
+    availableMarkets: config.availableMarkets || [],
+    preferredMarket: config.preferredMarket || "NEMESIS/USDT",
   };
 
   const deps = {

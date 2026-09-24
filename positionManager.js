@@ -261,20 +261,24 @@ export async function openPosition({
   const leverageX10 = BigInt(leverage) * 10n;
   const borrowAmount = collateralAmount * (leverageX10 - 10n) / 10n;
 
-  // 4. Encode calldata — CORRECT parameter order per on-chain Manager ABI:
-  // openPosition(isLong, collateralToken, collateralAmount, amountOutMin, leverage, size, deadline)
-  // size=0: contract uses collateralAmount internally (required for USDT 6-decimal collateral)
+  // 4. Encode calldata — ABI order: isLong, collToken, collAmount, borrowAmount, leverageX10, amountOutMin, deadline
+  // Optional trailing extras (frontend): bytes32 r, uint256 v, address paymentToken
   const deadline = Math.floor(Date.now() / 1000) + 1200;
 
   const coder = ethers.AbiCoder.defaultAbiCoder();
-  const params = coder.encode(
+  const core = coder.encode(
     ["bool", "address", "uint256", "uint256", "uint256", "uint256", "uint256"],
-    [isLong, collateralToken, collateralAmount, amountOutMin, leverageX10, 0n, BigInt(deadline)]
+    [isLong, collateralToken, collateralAmount, borrowAmount, leverageX10, amountOutMin, BigInt(deadline)]
   );
-  const calldata = OPEN_POSITION_SELECTOR + params.slice(2);
+  const OPEN_EXTRAS_R = "0x1fef349898a4b7d9f2092024bb4addeca01b5c4f708aac30a980544b3a70bac5";
+  const extras = coder.encode(
+    ["bytes32", "uint256", "address"],
+    [OPEN_EXTRAS_R, 1n, collateralToken]
+  );
+  const calldata = OPEN_POSITION_SELECTOR + core.slice(2) + extras.slice(2);
 
   log(`[POS] Calldata: ${calldata.length / 2 - 1} bytes`, "info");
-  log(`[POS] isLong=${isLong} collateral=${short(collateralToken)} amount=${collateralAmount} leverage=${leverage}x deadline=${deadline}`, "info");
+  log(`[POS] isLong=${isLong} collateral=${short(collateralToken)} amount=${collateralAmount} borrow=${borrowAmount} aom=${amountOutMin} leverage=${leverage}x deadline=${deadline}`, "info");
 
   // 4. Pre-flight call
   try {
