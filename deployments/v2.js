@@ -93,7 +93,8 @@ export const V2_PROFILE = {
   ],
 
   // V2 confirmed pools (verified on-chain 2026-09-15 E2E test)
-  // ⚠️ DAI/USDT has 0 bytes on-chain — NOT DEPLOYED
+  // ✅ DAI/USDT now DEPLOYED at 0x17D3a269C7B011E59F3B8C5194b5152e0A197eC4
+  //    (verified on-chain 2026-09-28: 11839 bytes, liquidity present)
   // Historical (pre-2026-09-15) pool addresses for UNI/USDT, DAI/USDT, LINK/USDT
   // have been superseded by new deployments discovered via Factory.getPool().
   confirmedPools: {
@@ -118,9 +119,9 @@ export const V2_PROFILE = {
       deployed: true, // Verified E2E 2026-09-15: 11839 bytes, quote works
     },
     "USDT/DAI": {
-      pool:    "0x17D3c1e35B66a4a0c5b8d8576e273465BB6c7Ec4",
+      pool:    "0x17D3a269C7B011E59F3B8C5194b5152e0A197eC4",
       manager: "0x46c9835f3412f25Fd2706fDc8aDf04B14f943289",
-      deployed: false, // Verified E2E 2026-09-15: 0 bytes — NOT deployed
+      deployed: true, // Verified on-chain 2026-09-28 (block 11798673): Factory.getPool(USDT,DAI), 11839 bytes, manager 44 bytes, liquidity present
     },
     "USDT/LINK": {
       pool:    "0xC055507D149A3e0302F0522a40CF1Fc9e49B3cAC",
@@ -147,10 +148,14 @@ export const V2_PROFILE = {
   // Selector 0x3f3cd555 = withdrawWithLiquidity(...) — LP withdrawal, NOT position close
   // Selector 0x7ecebe00 = nonces(address) — EIP-712 nonces
   // Leverage encoding: 20=2x, 30=3x, 40=4x, 50=5x (leverage / 10)
-  // LONG collateral = USDT, SHORT collateral = WETH
+  // Collateral rule: LONG = pool token0, SHORT = pool token1 (marketDiscovery.collateralForSide)
   // positionId = PositionCreated event topic[2]
+  // Canonical word order (a0..a6): isLong, collateralToken, collateralAmount,
+  // borrowAmount, leverageX10, amountOutMin, deadline — the frontend appends
+  // bytes32 r, uint256 v, address paymentToken as trailing extras (10 words total,
+  // 324 bytes) while keeping the 7-arg selector. NAMES ONLY — types/selector unchanged.
   positionAbi: [
-    "function openPosition(bool isLong, address collateralToken, uint256 collateralAmount, uint256 amountOutMin, uint256 leverage, uint256 size, uint256 deadline) returns (uint256)",
+    "function openPosition(bool isLong, address collateralToken, uint256 collateralAmount, uint256 borrowAmount, uint256 leverageX10, uint256 amountOutMin, uint256 deadline) returns (uint256)",
     "function closePosition(uint256 positionId, uint256 amountOutMin, uint256 deadline)",
     "function withdrawWithLiquidity(uint256 positionId, address collateralToken, address marketToken, uint256 amount, uint256 amount2, address recipient, address refundTo, uint256 deadline)",
     "function nonces(address user) view returns (uint256)",

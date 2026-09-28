@@ -208,6 +208,75 @@ export function findRoute(routes, fromAddr, toAddr) {
   ) || null;
 }
 
+const _l = (a) => String(a || "").toLowerCase();
+
+/**
+ * Bounded candidate paths for an ordered pair, best first:
+ *   1. validated DIRECT route (or a read-only DIRECT probe when the pair has no
+ *      validated route record — the probe is only accepted if the Router itself
+ *      quotes amountOut > 0, so nothing invented is ever sent)
+ *   2. validated 2-hop A→H→B (both legs must already be validated routes)
+ * Never exceeds `maxPaths` (bounded search, no combinatorial explosion).
+ */
+export function candidatePaths(routes, fromAddr, toAddr, { maxPaths = 4, directProbe = true } = {}) {
+  if (!fromAddr || !toAddr) return [];
+  const f = _l(fromAddr), t = _l(toAddr);
+  const valid = (routes || []).filter(r => r.valid);
+  const leg = new Map();
+  for (const r of valid) leg.set(`${_l(r.fromAddr)}>${_l(r.toAddr)}`, r);
+
+  const out = [];
+  const push = (path, type) => {
+    if (!path || !path.length) return;
+    const key = path.map(_l).join(">");
+    if (out.some(o => o.key === key)) return;
+    out.push({ path, type, key });
+  };
+
+  const direct = leg.get(`${f}>${t}`);
+  if (direct) push(direct.path, "direct");
+  else if (directProbe) push([fromAddr, toAddr], "direct-probe");
+
+  for (const r1 of valid) {
+    if (out.length >= maxPaths) break;
+    if (_l(r1.fromAddr) !== f || !Array.isArray(r1.path) || r1.path.length !== 2) continue;
+    const hub = _l(r1.toAddr);
+    if (hub === t || hub === f) continue;
+    const r2 = leg.get(`${hub}>${t}`);
+    if (!r2 || !Array.isArray(r2.path) || r2.path.length !== 2) continue;
+    push([fromAddr, r1.toAddr, toAddr], "multi");
+  }
+  return out.slice(0, maxPaths);
+}
+
+/**
+ * Read-only quote across the bounded candidate paths (direct first, then validated
+ * 2-hop). Returns { path, amountOut, type } for the FIRST path with amountOut > 0,
+ * or null when every candidate path quotes zero/reverts — the caller must SKIP and
+ * must never send a swap with amountOut = 0.
+ */
+export async function quoteBestPath({ provider, routerAddress, routes, fromAddr, toAddr, amountIn, log = () => {}, maxPaths = 4 }) {
+  if (!amountIn || amountIn <= 0n) return null;
+  const cands = candidatePaths(routes, fromAddr, toAddr, { maxPaths });
+  if (!cands.length) {
+    log(`[ROUTE] no validated path ${_l(fromAddr).slice(0, 10)}…→${_l(toAddr).slice(0, 10)}… — SKIP`, "warn");
+    return null;
+  }
+  const router = new ethers.Contract(routerAddress, ROUTER_QUOTE_ABI, provider);
+  for (const c of cands) {
+    try {
+      const amounts = await router.getAmountsOut(amountIn, c.path);
+      const out = amounts[amounts.length - 1];
+      if (out > 0n) return { path: c.path, amountOut: out, type: c.type };
+      log(`[ROUTE] ${c.type} path quotes ZERO — trying next candidate path`, "warn");
+    } catch (e) {
+      log(`[ROUTE] ${c.type} path quote failed: ${e.message?.slice(0, 60)} — trying next candidate path`, "warn");
+    }
+  }
+  log(`[ROUTE] QUOTE_ZERO across all ${cands.length} candidate path(s) — SKIP pair (no swap with amountOut=0)`, "warn");
+  return null;
+}
+
 /**
  * Route candidates for a token inventory — used by the auto-swapper.
  * @returns {Array<{from, to, fromAddr, toAddr, path, type}>}
@@ -256,6 +325,8 @@ export default {
   discoverTokens,
   discoverSwapRoutes,
   findRoute,
+  candidatePaths,
+  quoteBestPath,
   routeCandidates,
   sourcesForTarget,
   probeAmountFor,

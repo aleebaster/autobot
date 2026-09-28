@@ -11,13 +11,14 @@ import {
   collateralSymbolForSide,
   paymentTokenForMarket,
   supportsSide,
+  isDirectionEntryDisabled,
   marketKey,
   normalizeSymbolKey,
   enumerateMarketSides,
   formatMarketsTable,
   formatCoverageTable,
 } from "./marketDiscovery.js";
-import { discoverTokens, discoverSwapRoutes, findRoute, routeCandidates, sourcesForTarget, formatRoutesTable } from "./swapRoutes.js";
+import { discoverTokens, discoverSwapRoutes, quoteBestPath, routeCandidates, sourcesForTarget, formatRoutesTable } from "./swapRoutes.js";
 import { RotationMemory } from "./rotation.js";
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -251,11 +252,17 @@ function feeAdjusted(amount, feeBps = 100n) {
 function collateralAsLp({ collateralToken, collateralAmount, reserve0, reserve1, totalSupply, token0, oraclePrice0 }) {
   const q112 = 1n << 112n;
   if (collateralAmount === 0n || reserve0 === 0n || reserve1 === 0n || totalSupply === 0n || oraclePrice0 === 0n) return 0n;
-  const collateralValue = collateralToken.toLowerCase() === token0.toLowerCase()
-    ? collateralAmount * oraclePrice0 / q112
-    : collateralAmount;
-  const poolValue = reserve0 * oraclePrice0 / q112 + reserve1;
-  return poolValue === 0n ? 0n : collateralValue * totalSupply / poolValue;
+  // Exact rational form (no intermediate truncation):
+  //   value(token1 units) = reserve0*oraclePrice0/q112 + reserve1
+  //   lp                  = collateralValue * totalSupply / poolValue
+  // Written as a single BigInt expression so a small collateral can never floor to 0
+  // in a partial product while the true LP value is still >= 1.
+  const denominator = reserve0 * oraclePrice0 + reserve1 * q112;
+  if (denominator === 0n) return 0n;
+  const collateralIsToken0 = collateralToken.toLowerCase() === token0.toLowerCase();
+  return collateralIsToken0
+    ? collateralAmount * oraclePrice0 * totalSupply / denominator
+    : collateralAmount * totalSupply * q112 / denominator;
 }
 
 function lpBorrowToExpectedOut({ lpBorrowAmount, collateralToken, reserve0, reserve1, totalSupply, token0, swapFeeBps }) {
@@ -727,11 +734,51 @@ function getSignal(rsi, config) {
 
 const STATE_FILE = "auto-trader-state.json";
 
+/**
+ * Normalise the persisted direction kill-switch map WITHOUT losing data.
+ *
+ * Backward compatibility: an older auto-trader-state.json stores soft counters as
+ * `{ fails: 1 }` (and hard disables as `{ since, reason }`). Those soft counters used
+ * to be read as "truthy ⇒ disabled", which locked every MARKET×SIDE after one failure.
+ * Here each entry keeps all of its fields and gains an explicit `disabled` boolean;
+ * only an explicit hard-disable hides a direction.
+ *
+ * @returns {Object} normalised map (also assigned onto state.directionDisabled)
+ */
+function normalizeDirectionDisabled(state) {
+  if (!state || typeof state !== "object") return {};
+  const src = state.directionDisabled;
+  if (!src || typeof src !== "object") {
+    state.directionDisabled = {};
+    return state.directionDisabled;
+  }
+  const out = {};
+  for (const [key, entry] of Object.entries(src)) {
+    if (entry === null || entry === undefined) continue;
+    if (entry === true) {
+      out[key] = { disabled: true, since: null, reason: "legacy boolean entry", fails: 0 };
+      continue;
+    }
+    if (typeof entry !== "object") continue;
+    const disabled = entry.disabled === true || (entry.since !== undefined && entry.since !== null);
+    const fails = Number.isFinite(Number(entry.fails)) ? Number(entry.fails) : 0;
+    out[key] = { ...entry, disabled, fails, since: entry.since ?? null };
+  }
+  state.directionDisabled = out;
+  return out;
+}
+
 function loadState() {
+  let state = null;
   try {
-    if (fs.existsSync(STATE_FILE)) return JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+    if (fs.existsSync(STATE_FILE)) state = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
   } catch {}
-  return { activePosition: null, sessionStats: { opens: 0, closes: 0 }, lastCycleTime: 0, lastSide: null };
+  if (!state || typeof state !== "object" || Array.isArray(state)) {
+    state = { activePosition: null, sessionStats: { opens: 0, closes: 0 }, lastCycleTime: 0, lastSide: null };
+  }
+  if (!state.sessionStats) state.sessionStats = { opens: 0, closes: 0 };
+  normalizeDirectionDisabled(state);
+  return state;
 }
 
 function saveState(state) {
@@ -771,23 +818,46 @@ async function recoverPosition(provider, walletAddr, managerAddr, log = () => {}
       log(`[RECOVERY] position #${positionId} was already closed`, "info");
       return null;
     }
-    // Check for zombie position (zeroed collateral/debt on-chain)
+    // On-chain truth for side/collateral: positions(positionId) — NEVER hardcoded
+    // (was: side:"LONG", collateralToken: USDT).
+    let pos = null;
     try {
       const mgr = new ethers.Contract(managerAddr, [
         "function positions(uint256) view returns (bool isLong, address user, address collateralToken, uint256 collateralAmount, uint256 debtAmount, uint256 currentDebt)"
       ], provider);
-      const pos = await mgr.positions(positionId);
-      if (pos && pos.collateralAmount === 0n && pos.currentDebt === 0n) {
-        log(`[RECOVERY] position #${positionId} is zombie (zero collateral+debt) — clearing`, "warn");
-        return null;
-      }
-      if (pos && pos.collateralAmount === 0n && pos.currentDebt > 0n) {
-        log(`[RECOVERY] position #${positionId} is zombie (zero collateral, debt=${pos.currentDebt}) — clearing`, "warn");
-        return null;
-      }
-    } catch {}
-    log(`[RECOVERY] found active position #${positionId}`, "warn");
-    return { positionId, side: "LONG", collateralToken: USDT, openedAt: lastOpen.blockNumber, managerAddr };
+      pos = await mgr.positions(positionId);
+    } catch (e) {
+      log(`[RECOVERY] AMBIGUITY: cannot read position #${positionId} on-chain (${e.message?.slice(0, 40)}) — refusing to guess side/collateral`, "warn");
+      return null;
+    }
+    if (!pos || pos.user === undefined) {
+      log(`[RECOVERY] AMBIGUITY: position #${positionId} returned no on-chain data — refusing to guess side/collateral`, "warn");
+      return null;
+    }
+    // Check for zombie position (zeroed collateral/debt on-chain)
+    if (pos.collateralAmount === 0n && pos.currentDebt === 0n) {
+      log(`[RECOVERY] position #${positionId} is zombie (zero collateral+debt) — clearing`, "warn");
+      return null;
+    }
+    if (pos.collateralAmount === 0n && pos.currentDebt > 0n) {
+      log(`[RECOVERY] position #${positionId} is zombie (zero collateral, debt=${pos.currentDebt}) — clearing`, "warn");
+      return null;
+    }
+    if (!pos.collateralToken || pos.collateralToken === ethers.ZeroAddress) {
+      log(`[RECOVERY] AMBIGUITY: position #${positionId} has no collateral token on-chain — refusing to guess`, "warn");
+      return null;
+    }
+    const recoveredSide = pos.isLong ? "LONG" : "SHORT";
+    log(`[RECOVERY] found active position #${positionId} (chain: ${recoveredSide}, collateral=${short(pos.collateralToken)}, amount=${ethers.formatUnits(pos.collateralAmount, 18)} raw=${pos.collateralAmount})`, "warn");
+    return {
+      positionId,
+      side: recoveredSide,
+      collateralToken: pos.collateralToken,
+      collateralAmount: pos.collateralAmount.toString(),
+      currentDebt: pos.currentDebt?.toString?.() ?? String(pos.currentDebt ?? 0),
+      openedAt: lastOpen.blockNumber,
+      managerAddr,
+    };
   } catch (e) {
     log(`[RECOVERY] error: ${e.message?.slice(0, 60)}`, "error");
     return null;
@@ -947,7 +1017,17 @@ async function quoteLeveragedAmountOutMin(provider, { pool, manager, collateralT
     reserve0, reserve1, totalSupply, token0, oraclePrice0: BigInt(oraclePrice[0]),
   });
 
-  if (collateralLp === 0n) throw new Error("Leveraged quoteOut is zero");
+  if (collateralLp === 0n) {
+    // Distinguish "market temporarily unquotable" from a fatal bot error (P4):
+    //   ZERO_LP   — the pool itself has no usable liquidity
+    //   QUOTE_ZERO — liquidity exists but this collateral size truncates to 0 LP
+    const noLiquidity = reserve0 === 0n || reserve1 === 0n || totalSupply === 0n || BigInt(oraclePrice[0]) === 0n;
+    const err = new Error(noLiquidity
+      ? "ZERO_LP: pool has no usable liquidity (reserves/totalSupply/oracle=0)"
+      : "QUOTE_ZERO: collateral size converts to 0 LP for this pool");
+    err.code = noLiquidity ? "ZERO_LP" : "QUOTE_ZERO";
+    throw err;
+  }
 
   // borrowAmount = collateralLp * (leverage - 1)
   let lpBorrowAmount = collateralLp * BigInt(Math.floor(10000 * Math.max(0, lev - 1))) / BPS;
@@ -964,7 +1044,11 @@ async function quoteLeveragedAmountOutMin(provider, { pool, manager, collateralT
   });
 
   let amountOutMinFinal = applySlippage(amountOutMinRaw, BigInt(200));
-  if (amountOutMinRaw <= 0n || amountOutMinFinal <= 0n) throw new Error("Leveraged amountOutMin is zero");
+  if (amountOutMinRaw <= 0n || amountOutMinFinal <= 0n) {
+    const err = new Error("ZERO_AMOUNT_OUT_MIN: borrow LP yields 0 amountOut after integer math (dust liquidity)");
+    err.code = "ZERO_AMOUNT_OUT_MIN";
+    throw err;
+  }
 
   // SAFETY CAP: Emergency upper bound for amountOutMin.
   // When pool state shifts between quote and execution, lpBorrowToExpectedOut()
@@ -979,6 +1063,37 @@ async function quoteLeveragedAmountOutMin(provider, { pool, manager, collateralT
 
   log(`[QUOTE] collateralLp=${collateralLp} borrowAmount=${lpBorrowAmount} amountOutMinRaw=${amountOutMinRaw} amountOutMinFinal=${amountOutMinFinal}`, "info");
   return { amountOutMinFinal, borrowAmount: lpBorrowAmount };
+}
+
+/**
+ * READ-ONLY viability check for one MARKET×SIDE candidate (eth_call-style reads only:
+ * getReserves / totalSupply / token0 / getOraclePrice / swapFeeBps / manager views).
+ *
+ * Returns { ok:true, borrowAmount, amountOutMin } or { ok:false, reason }.
+ *
+ * Used BEFORE the open flow so a candidate whose minimum collateral size is dust for
+ * the pool's liquidity (zero LP / zero amountOutMin) is SKIPPED with a clear reason
+ * instead of being counted as a direction failure — a liquidity skip must never
+ * disable a MARKET×SIDE. No transaction is built or sent here.
+ */
+export async function precheckMarketQuote(provider, { pool, manager, collateralToken, collateralAmount, leverageX10, isLong, log = () => {} }) {
+  try {
+    const q = await quoteLeveragedAmountOutMin(provider, {
+      pool, manager, collateralToken, collateralAmount, leverageX10, isLong, log,
+    });
+    if (!q || q.borrowAmount <= 0n) {
+      return { ok: false, code: "QUOTE_ZERO", reason: "borrowAmount is zero for minimum collateral size" };
+    }
+    if (q.amountOutMinFinal <= 0n) {
+      return { ok: false, code: "ZERO_AMOUNT_OUT_MIN", reason: "zero amountOutMin for minimum collateral size" };
+    }
+    return { ok: true, borrowAmount: q.borrowAmount, amountOutMin: q.amountOutMinFinal };
+  } catch (e) {
+    // QUOTE_ZERO / ZERO_LP / ZERO_AMOUNT_OUT_MIN = "market temporarily unquotable"
+    // (skip the candidate); anything else is reported as a real quote error.
+    const code = e?.code || (/zero/i.test(String(e?.message || "")) ? "QUOTE_ZERO" : "QUOTE_ERROR");
+    return { ok: false, code, reason: e?.message || String(e) };
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1020,7 +1135,6 @@ async function ensureCollateral({ wallet, provider, side, collateralToken: colla
 
   const activeRoutes = routes || getDiscoveredRoutes();
   const sources = swapSourcesFor(collateralToken, side, allTokens || getDiscoveredTokens());
-  const router = new ethers.Contract(routerAddr, ROUTER_ABI, provider);
 
   for (const sourceToken of sources) {
     const sourceContract = new ethers.Contract(sourceToken, ERC20_ABI, provider);
@@ -1038,17 +1152,20 @@ async function ensureCollateral({ wallet, provider, side, collateralToken: colla
     if (sourceBalance <= 0n) { log(`[SWAP] ${sourceSym} balance=0 — skip`, "info"); continue; }
     log(`[SWAP] Trying ${sourceSym} → ${sym}: balance=${ethers.formatUnits(sourceBalance, sourceDecimals)}`, "info");
 
-    // Route discovery: direct A→B first, validated multi-hop A→HUB→B otherwise
-    const route = findRoute(activeRoutes, sourceToken, collateralToken);
-    const path = route ? route.path : [sourceToken, collateralToken];
-    if (activeRoutes.length && !route) {
-      log(`[SWAP] ${sourceSym} → ${sym}: no validated route — skip`, "warn");
+    // P6: validated direct (or read-only probed direct) → validated 2-hop → SKIP.
+    // No invented paths, never a quote of 0.
+    const best = await quoteBestPath({
+      provider, routerAddress: routerAddr, routes: activeRoutes,
+      fromAddr: sourceToken, toAddr: collateralToken, amountIn: sourceBalance, log,
+    });
+    if (!best) {
+      log(`[SWAP] ${sourceSym} → ${sym}: no viable route (direct/2-hop quote zero) — skip`, "warn");
       continue;
     }
+    const path = best.path;
 
     try {
-      const fullQuote = await router.getAmountsOut(sourceBalance, path);
-      const expectedOut = fullQuote[fullQuote.length - 1];
+      const expectedOut = best.amountOut;
       if (expectedOut < deficit) {
         log(`[SWAP] ${sourceSym} insufficient: max output < deficit`, "warn");
         continue;
@@ -1527,8 +1644,20 @@ export class AutoTrader {
     this.tokenList = [];
     this.metaCache = new TokenMetaCache();
     this.rotation = RotationMemory.fromJSON(this.state.rotation || null);
-    // MARKET×SIDE runtime kill-switch: { "SYMBOL:SIDE": failCount }
-    this.directionDisabled = this.state.directionDisabled || {};
+    // MARKET×SIDE runtime kill-switch:
+    //   { "SYMBOL|SIDE": { fails: n, disabled: false } }  → soft counter, still selectable
+    //   { "SYMBOL|SIDE": { disabled: true, since, reason } } → hard-disabled
+    this.directionDisabled = normalizeDirectionDisabled(this.state);
+    // Enforce the threshold on load too (soft counters below it stay selectable).
+    const maxFailsOnLoad = Number(this.config.maxDirectionFailures || 2);
+    for (const entry of Object.values(this.directionDisabled)) {
+      if (entry && typeof entry === "object" && entry.disabled !== true && Number(entry.fails || 0) >= maxFailsOnLoad) {
+        entry.disabled = true;
+        entry.since = entry.since ?? Date.now();
+        entry.reason = entry.reason || `${entry.fails} consecutive preflight/open failures`;
+      }
+    }
+    this.state.directionDisabled = this.directionDisabled;
     this._marketsReady = false;
     this._lastMarketRefresh = 0;
     this._planned = null;
@@ -1591,34 +1720,54 @@ export class AutoTrader {
   }
 
   _isDirectionDisabled(marketSymbol, side) {
-    if (this.directionDisabled[this._directionKey(marketSymbol, side)]) return true;
+    if (isDirectionEntryDisabled(this.directionDisabled[this._directionKey(marketSymbol, side)])) return true;
     const m = this.markets.find(x => (x.marketSymbol || x.symbol) === marketSymbol);
     return m ? !supportsSide(m, side) : false;
   }
 
   _disableDirection(marketSymbol, side, reason = "") {
     const key = this._directionKey(marketSymbol, side);
-    if (this.directionDisabled[key]) return;
-    this.directionDisabled[key] = { since: Date.now(), reason };
+    const prev = this.directionDisabled[key];
+    if (prev && typeof prev === "object" && prev.disabled === true) return;
+    this.directionDisabled[key] = {
+      ...(prev && typeof prev === "object" ? prev : {}),
+      disabled: true,
+      since: (prev && prev.since) ?? Date.now(),
+      reason: reason || (prev && prev.reason) || "",
+    };
     this.state.directionDisabled = this.directionDisabled;
     saveState(this.state);
     this.log(`[DISCOVERY] DISABLED ${key} — ${reason}`, "warn");
   }
 
+  /**
+   * Soft failure counter. Reaching maxDirectionFailures is what disables a direction —
+   * a counter below the threshold keeps the direction fully selectable.
+   */
   _recordDirectionFailure(marketSymbol, side) {
     const key = this._directionKey(marketSymbol, side);
-    const entry = this.directionDisabled[key] || { fails: 0 };
-    entry.fails = (entry.fails || 0) + 1;
+    const prev = this.directionDisabled[key];
+    if (prev && typeof prev === "object" && prev.disabled === true) return;
+
+    const entry = { ...(prev && typeof prev === "object" ? prev : {}), disabled: false };
+    entry.fails = Number(entry.fails || 0) + 1;
     const maxFails = Number(this.config.maxDirectionFailures || 2);
+
     if (entry.fails >= maxFails) {
-      this._disableDirection(marketSymbol, side, `${entry.fails} consecutive preflight/open failures`);
+      entry.disabled = true;
+      entry.since = Date.now();
+      entry.reason = `${entry.fails} consecutive preflight/open failures`;
+      this.log(`[DISCOVERY] DISABLED ${key} — ${entry.reason}`, "warn");
     } else {
-      this.directionDisabled[key] = entry;
-      this.state.directionDisabled = this.directionDisabled;
-      saveState(this.state);
+      this.log(`[DISCOVERY] direction ${key} failure ${entry.fails}/${maxFails} — still selectable`, "warn");
     }
+
+    this.directionDisabled[key] = entry;
+    this.state.directionDisabled = this.directionDisabled;
+    saveState(this.state);
   }
 
+  /** Success (confirmed OPEN) resets the counter and clears any hard-disable. */
   _recordDirectionSuccess(marketSymbol, side) {
     const key = this._directionKey(marketSymbol, side);
     if (this.directionDisabled[key]) {
@@ -1752,7 +1901,13 @@ export class AutoTrader {
     const first = this.markets.find(m => m.managerAddr) || Object.values(this.deps.confirmedPools || {}).find(p => p?.manager);
     if (first?.managerAddr) return first.managerAddr;
     if (first?.manager) return first.manager;
-    return this.deps.confirmedPools?.["NEMESIS/USDT"]?.manager || null;
+    // P8: last-resort default (market-agnostic). Loudly visible — never use it to
+    // target/close a specific position.
+    const fallbackManager = this.deps.confirmedPools?.["NEMESIS/USDT"]?.manager || null;
+    if (fallbackManager) {
+      this.log(`[FALLBACK] manager from confirmedPools["NEMESIS/USDT"]=${short(fallbackManager)} — NOT market-specific, verify before any action`, "warn");
+    }
+    return fallbackManager;
   }
 
   getPoolAddr(side) {
@@ -1766,7 +1921,12 @@ export class AutoTrader {
     const first = this.markets.find(m => m.poolAddr) || Object.values(this.deps.confirmedPools || {}).find(p => p?.pool);
     if (first?.poolAddr) return first.poolAddr;
     if (first?.pool) return first.pool;
-    return this.deps.confirmedPools?.["NEMESIS/USDT"]?.pool || null;
+    // P8: last-resort default (market-agnostic) — loudly visible on purpose.
+    const fallbackPool = this.deps.confirmedPools?.["NEMESIS/USDT"]?.pool || null;
+    if (fallbackPool) {
+      this.log(`[FALLBACK] pool from confirmedPools["NEMESIS/USDT"]=${short(fallbackPool)} — NOT market-specific, verify before any action`, "warn");
+    }
+    return fallbackPool;
   }
 
   setState(newState) {
@@ -1786,10 +1946,8 @@ export class AutoTrader {
       const walletAddr = wallet.address;
       // Discover all markets/routes before any planning
       await this.ensureMarkets();
-      // Default market for inventory logs / recovery — actual OPEN resolves per side
-      const defaultMarket = this.resolveMarket(this.state.lastSide || "SHORT") || this.resolveMarket("LONG");
-      const managerAddr = defaultMarket?.managerAddr || this.getManagerAddr();
-      const poolAddr = defaultMarket?.poolAddr || this.getPoolAddr();
+      // NOTE: no cycle-level default manager/pool is carried into CLOSE/OPEN —
+      // every target is resolved per position/candidate (P2/P7).
 
       this.log("[CYCLE] ═══ CYCLE START ═══", "info");
 
@@ -1810,10 +1968,12 @@ export class AutoTrader {
         const maxSwaps = autoSwapConfig.maxSwapsPerCycle || 2;
         let swapsDone = 0;
 
-        // Dynamic token map: discovered tokens (on-chain decimals) ∪ deployment tokens
+        // Dynamic token map: discovered tokens (on-chain decimals) ∪ deployment tokens.
+        // P8 precedence: deployment fallback starts as null so the on-chain read wins;
+        // TOKEN_DECIMALS is only used (with a warning) if the RPC read fails.
         const tokenAddrs = {};
         const tokenDecimalsMap = {};
-        for (const t of (this.tokenList.length ? this.tokenList : Object.entries(getAllTokens()).map(([symbol, address]) => ({ symbol, address, decimals: TOKEN_DECIMALS[symbol] ?? null })))) {
+        for (const t of (this.tokenList.length ? this.tokenList : Object.entries(getAllTokens()).map(([symbol, address]) => ({ symbol, address, decimals: null })))) {
           tokenAddrs[t.symbol] = t.address;
           tokenDecimalsMap[t.symbol] = t.decimals;
         }
@@ -1823,7 +1983,7 @@ export class AutoTrader {
         // Refresh inventory for auto-swap decisions
         const inventoryTokenMap = {};
         for (const [sym, addr] of Object.entries(tokenAddrs)) {
-          inventoryTokenMap[sym] = { address: addr, decimals: tokenDecimalsMap[sym] ?? TOKEN_DECIMALS[sym] ?? 6 };
+          inventoryTokenMap[sym] = { address: addr, decimals: this._decimalsPrecedence(sym, tokenDecimalsMap) };
         }
         try {
           await this.inventory.refreshBalances(provider, walletAddr, inventoryTokenMap, this.log.bind(this));
@@ -1861,14 +2021,15 @@ export class AutoTrader {
               continue;
             }
 
-            const amountResult = calculateRandomSwapAmount(pair.from, fromBal.float, autoSwapConfig, tokenDecimalsMap[pair.from]);
+            const fromDecimals = this._decimalsPrecedence(pair.from, tokenDecimalsMap);
+            const amountResult = calculateRandomSwapAmount(pair.from, fromBal.float, autoSwapConfig, fromDecimals, this.log.bind(this));
             if (!amountResult) {
               this.log(`[AUTO-SWAP] Amount too small for ${pair.from} — skip`, "info");
               continue;
             }
 
-            // Convert float amount to raw BigInt
-            const decimals = tokenDecimalsMap[pair.from] ?? TOKEN_DECIMALS[pair.from] ?? 6;
+            // Convert float amount to raw BigInt (same decimals source as the balance read)
+            const decimals = amountResult.decimals ?? fromDecimals;
             const amountRaw = ethers.parseUnits(amountResult.amountFloat.toFixed(decimals), decimals);
 
             // Safety: don't use more than 90% of balance
@@ -1883,26 +2044,30 @@ export class AutoTrader {
               continue;
             }
 
-            // Validated route path (direct or multi-hop via hub)
-            const route = findRoute(this.routes, pair.fromAddr, pair.toAddr);
-            const path = route ? route.path : [pair.fromAddr, pair.toAddr];
-
-            // Get quote from Router along the route
-            const router = new ethers.Contract(getRouterAddress(), ROUTER_ABI, provider);
-            let quote;
-            try {
-              quote = await router.getAmountsOut(amountRaw, path);
-            } catch (e) {
-              this.log(`[AUTO-SWAP] Quote failed for ${pair.from}→${pair.to}: ${e.message?.slice(0, 60)}`, "error");
+            // P6: validated routes only — direct first, then bounded validated 2-hop.
+            // Never invent a path, never swap with amountOut = 0.
+            const best = await quoteBestPath({
+              provider, routerAddress: getRouterAddress(), routes: this.routes,
+              fromAddr: pair.fromAddr, toAddr: pair.toAddr, amountIn: amountRaw,
+              log: this.log.bind(this),
+            });
+            if (!best) {
+              this.log(`[AUTO-SWAP] ${pair.from} → ${pair.to}: no viable route (direct/2-hop quote zero) — skipping pair`, "warn");
               continue;
             }
-
-            const expectedOut = quote[quote.length - 1];
-            const toDecimals = tokenDecimalsMap[pair.to] ?? TOKEN_DECIMALS[pair.to] ?? 6;
+            const path = best.path;
+            const expectedOut = best.amountOut;
+            const toDecimals = this._decimalsPrecedence(pair.to, tokenDecimalsMap);
+            // Read-only guard: a zero-output quote would produce amountOutMin=0 and a
+            // guaranteed-loss (or reverting) swap — skip this pair, try another one.
+            if (expectedOut <= 0n) {
+              this.log(`[AUTO-SWAP] ${pair.from} → ${pair.to}: quote returned zero output — skipping pair`, "warn");
+              continue;
+            }
             const amountOutMin = applySlippage(expectedOut, BigInt(autoSwapConfig.slippageBps || 50));
 
             // Log pre-swap details
-            this.log(`[SWAP] pair=${pair.from}→${pair.to} hops=${route?.type || "direct"}`, "warn");
+            this.log(`[SWAP] pair=${pair.from}→${pair.to} hops=${best.type}`, "warn");
             this.log(`[SWAP] amountIn=${ethers.formatUnits(amountRaw, decimals)} ${pair.from}`, "warn");
             this.log(`[SWAP] expectedOut=${ethers.formatUnits(expectedOut, toDecimals)} ${pair.to}`, "warn");
             this.log(`[SWAP] amountOutMin=${ethers.formatUnits(amountOutMin, toDecimals)} ${pair.to}`, "warn");
@@ -1966,13 +2131,18 @@ export class AutoTrader {
         await logInventory(provider, walletAddr, this.log.bind(this));
       }
 
-      // PHASE 1: If active position → CLOSE (always via the position's own manager)
+      // PHASE 1: If active position → CLOSE (always via the position's OWN manager)
       if (this.state.activePosition) {
         this.setState(STATES.CLOSE);
-        const activeManager = this.state.activePosition.managerAddr
-          || this.getManagerAddr(this.state.activePosition.side)
-          || managerAddr;
-        this.log(`[CLOSE] position #${this.state.activePosition.positionId} (${this.state.activePosition.side}) market=${this.state.activePosition.marketSymbol || "?"} manager=${short(activeManager)}`, "warn");
+        const resolved = this.resolveManagerForPosition(this.state.activePosition);
+        if (!resolved || !resolved.managerAddr) {
+          this.log(`[CLOSE] cannot resolve manager for position #${this.state.activePosition.positionId} — NOT closing, NOT clearing (retry after discovery)`, "warn");
+          this.lastCycleAction = "close";
+          this.log("[CYCLE] ═══ CYCLE END ═══", "info");
+          return;
+        }
+        const activeManager = resolved.managerAddr;
+        this.log(`[CLOSE] position #${this.state.activePosition.positionId} (${this.state.activePosition.side}) market=${this.state.activePosition.marketSymbol || resolved.marketSymbol || "?"} manager=${short(activeManager)} src=${resolved.source}`, "warn");
 
         const closeResult = await closePositionFn({
           wallet, provider, managerAddr: activeManager,
@@ -2031,7 +2201,7 @@ export class AutoTrader {
       }
       this.log(`[DIRECTION] ${side}${planned ? ` (rotated candidate: ${planned.marketSymbol || planned.symbol}×${planned.side})` : ""}`, "warn");
 
-      // PHASE 3: PREPARE COLLATERAL — INVENTORY-AWARE, pool-aware market (with fallbacks)
+      // PHASE 3: plan market candidates for the chosen side (rotation-aware)
       this.setState(STATES.PREPARE_COLLATERAL);
       const marketCandidates = await this.planMarketsForSide(side, {
         max: Number(this.config.maxMarketAttemptsPerCycle || 3),
@@ -2042,177 +2212,70 @@ export class AutoTrader {
       }
       const market = marketCandidates[0];
       this.log(`[MARKET] ${market.symbol} manager=${short(market.managerAddr)} pool=${short(market.poolAddr)} coll=${market.collateralSym || "?"} (candidates: ${marketCandidates.map(m => m.symbol).join(", ")})`, "info");
-      const collateralToken = market.collateralToken;
-      if (!collateralToken) {
-        this.log(`[BLOCKED] Market ${market.symbol} has no collateral token for ${side}`, "error");
-        return;
-      }
-      // decimals/symbol ALWAYS from token contract (never hardcoded)
-      const collateralDecimals = market.decimals ?? await tokenDecimalsOnChain(provider, collateralToken);
-      const collateralSym = market.collateralSym ?? await tokenSymbolOnChain(provider, collateralToken);
-
-      // Required collateral for position open
-      const targetStr = collateralTargetStr(this.config, collateralToken);
-      const collateralAmount = ethers.parseUnits(targetStr, collateralDecimals);
-
-      // Inventory target — swap UP TO this level (not just critical deficit)
-      const reserveStr = reserveTargetStr(this.config, collateralToken);
-      const targetReserve = ethers.parseUnits(reserveStr, collateralDecimals);
-
-      const tokenContract = new ethers.Contract(collateralToken, ERC20_ABI, provider);
-      const balance = await tokenContract.balanceOf(walletAddr);
-
-      this.log(`[INVENTORY] ═══ COLLATERAL CHECK ═══`, "info");
-      this.log(`[INVENTORY] ${collateralSym} balance=${ethers.formatUnits(balance, collateralDecimals)}`, "info");
-      this.log(`[INVENTORY] ${collateralSym} required=${ethers.formatUnits(collateralAmount, collateralDecimals)} (position open)`, "info");
-      this.log(`[INVENTORY] ${collateralSym} targetReserve=${ethers.formatUnits(targetReserve, collateralDecimals)} (inventory target)`, "info");
-
-      if (collateralAmount <= 0n) {
-        this.log(`[BLOCKED] Invalid collateral target`, "error");
-        return;
-      }
-
-      // Calculate inventory deficit using the new method
-      const deficit = calculateInventoryDeficit({
-        balance,
-        required: collateralAmount,
-        targetReserve,
-        decimals: collateralDecimals,
-        sym: collateralSym,
-        log: this.log.bind(this),
-      });
-
-      if (deficit.action === "none") {
-        // Sufficient — no swap needed, proceed to OPEN
-        this.log(`[INVENTORY] RESERVE OK — ${collateralSym} ${ethers.formatUnits(balance, collateralDecimals)} >= target ${ethers.formatUnits(targetReserve, collateralDecimals)}`, "success");
-      } else {
-        // SWAP needed — critical deficit OR top-up to target
-        this.setState(STATES.SWAP);
-        this.log(`[SWAP] ${deficit.reason}`, "warn");
-        this.log(`[SWAP] searching inventory for source tokens...`, "warn");
-
-        // Select swap source from discovered routes (direct or multi-hop)
-        const sources = swapSourcesFor(collateralToken, side, this.tokenList);
-        let swapSuccess = false;
-
-        for (const sourceToken of sources) {
-          const sourceContract = new ethers.Contract(sourceToken, ERC20_ABI, provider);
-          const sourceBalance = await sourceContract.balanceOf(walletAddr);
-          let sourceDecimals, sourceSym;
-          try {
-            const meta = await tokenMetaOnChain(provider, sourceToken);
-            sourceDecimals = meta.decimals;
-            sourceSym = meta.symbol;
-          } catch {
-            this.log(`[SWAP] source ${short(sourceToken)} meta failed — skip`, "warn");
-            continue;
-          }
-
-          if (sourceBalance <= 0n) {
-            this.log(`[SWAP] ${sourceSym} balance=0 — skip`, "info");
-            continue;
-          }
-
-          this.log(`[SWAP] ${sourceSym} balance=${ethers.formatUnits(sourceBalance, sourceDecimals)} — trying ${sourceSym} → ${collateralSym}`, "info");
-
-          try {
-            const route = findRoute(this.routes, sourceToken, collateralToken);
-            const path = route ? route.path : [sourceToken, collateralToken];
-            if (this.routes.length && !route) {
-              this.log(`[SWAP] ${sourceSym} → ${collateralSym}: no validated route — skip`, "warn");
-              continue;
-            }
-            const router = new ethers.Contract(getRouterAddress(), ROUTER_ABI, provider);
-            const fullQuote = await router.getAmountsOut(sourceBalance, path);
-            const expectedOut = fullQuote[fullQuote.length - 1];
-
-            if (expectedOut < deficit.swapAmount) {
-              this.log(`[SWAP] ${sourceSym} insufficient: max output ${ethers.formatUnits(expectedOut, collateralDecimals)} < needed ${ethers.formatUnits(deficit.swapAmount, collateralDecimals)}`, "warn");
-              continue;
-            }
-
-            // Calculate exact swap amount — don't swap more than needed
-            const neededWithBuffer = deficit.swapAmount * 101n / 100n; // 1% buffer for slippage
-            let swapAmount = neededWithBuffer * sourceBalance / expectedOut;
-            if (swapAmount > sourceBalance) swapAmount = sourceBalance;
-            const amountOutMin = deficit.swapAmount * 98n / 100n; // 2% slippage protection
-
-            this.log(`[SWAP] quote: ${ethers.formatUnits(swapAmount, sourceDecimals)} ${sourceSym} → ~${ethers.formatUnits(expectedOut * swapAmount / sourceBalance, collateralDecimals)} ${collateralSym}`, "info");
-            this.log(`[SWAP] amountOutMin=${ethers.formatUnits(amountOutMin, collateralDecimals)} ${collateralSym}`, "info");
-
-            if (dryRun) {
-              this.log(`[DRY] Would swap ${ethers.formatUnits(swapAmount, sourceDecimals)} ${sourceSym} → ${collateralSym}`, "info");
-              swapSuccess = true;
-              break;
-            }
-
-            // Execute swap — wait for receipt before proceeding
-            const swapResult = await executeSwap({
-              wallet, provider, fromToken: sourceToken, toToken: collateralToken,
-              amount: swapAmount, amountOutMin, config: this.config,
-              log: this.log.bind(this), txManager: this.txManager, path,
-            });
-
-            if (!swapResult) {
-              this.log(`[SWAP] ${sourceSym} → ${collateralSym} FAILED — trying next source`, "error");
-              continue;
-            }
-
-            // Verify balance after swap
-            const newBalance = await tokenContract.balanceOf(walletAddr);
-            this.log(`[SWAP] ${collateralSym} balance_after=${ethers.formatUnits(newBalance, collateralDecimals)} (target=${ethers.formatUnits(targetReserve, collateralDecimals)})`, "info");
-
-            if (newBalance >= collateralAmount) {
-              this.log(`[SWAP] CONFIRMED — ${collateralSym} sufficient after swap`, "success");
-              swapSuccess = true;
-              break;
-            } else {
-              this.log(`[SWAP] ${collateralSym} still below required after swap: ${ethers.formatUnits(newBalance, collateralDecimals)} < ${ethers.formatUnits(collateralAmount, collateralDecimals)}`, "warn");
-            }
-          } catch (e) {
-            this.log(`[SWAP] ${sourceSym} → ${collateralSym} failed: ${e.message?.slice(0, 80)}`, "error");
-            continue;
-          }
-        }
-
-        if (!swapSuccess && !dryRun) {
-          this.log(`[BLOCKED] No source token could cover ${collateralSym} deficit — skipping cycle`, "error");
-          return;
-        }
-
-        // Final verification before OPEN
-        const finalBalance = await tokenContract.balanceOf(walletAddr);
-        if (finalBalance < collateralAmount) {
-          this.log(`[BLOCKED] ${collateralSym} still insufficient after all swaps: ${ethers.formatUnits(finalBalance, collateralDecimals)} < ${ethers.formatUnits(collateralAmount, collateralDecimals)}`, "error");
-          return;
-        }
-        this.log(`[INVENTORY] POST-SWAP ${collateralSym}=${ethers.formatUnits(finalBalance, collateralDecimals)} — ready for OPEN`, "success");
-      }
-
-      // PHASE 4: OPEN — try market candidates in order, record rotation + direction health
-      this.setState(STATES.OPEN);
+      // PHASE 3+4: per-candidate preparation + OPEN. Every candidate gets its OWN
+      // isolated collateral context (token, decimals, amount, paymentToken, quote)
+      // via _candidateContext() / _ensureCollateralForCtx() — nothing market-specific
+      // is carried over from a candidate that already failed quote/balance/preflight.
       this.log(`[OPEN] ${side} ${this.config.defaultLeverage}x...`, "warn");
 
       let openResult = null;
       let openedMarket = null;
+      let openedCtx = null;
       for (const candidate of marketCandidates) {
         this.log(`[OPEN] trying market ${candidate.symbol} manager=${short(candidate.managerAddr)}`, "info");
+
+        const ctx = await this._candidateContext(candidate, side, { provider, walletAddr });
+        if (!ctx) continue;
+
+        // P2 hard invariants — manager/pool/paymentToken/collateral/decimals must all
+        // belong to THIS candidate's market. Any mismatch → SKIP (never open).
+        const inv = await this._assertCandidateInvariants(candidate, ctx, side, provider);
+        if (!inv.ok) {
+          this.log(`[SKIP] ${candidate.symbol} ${side}: invariant failed — ${inv.reason} — trying next candidate`, "warn");
+          this.rotation.recordMarketSideSkip(candidate.symbol, side);
+          this.state.rotation = this.rotation.toJSON();
+          continue;
+        }
+
+        // READ-ONLY viability pre-check (pool/manager view calls only, no transaction).
+        // A candidate whose minimum collateral size is dust for this pool's liquidity is
+        // SKIPPED with an explicit reason — it is NOT counted as a direction failure.
+        const pre = await precheckMarketQuote(provider, {
+          pool: ctx.poolAddr, manager: ctx.managerAddr,
+          collateralToken: ctx.collateralToken, collateralAmount: ctx.collateralAmount,
+          leverageX10: BigInt(Math.round(Number(this.config.defaultLeverage) * 10)),
+          isLong: side === "LONG", log: this.log.bind(this),
+        });
+        if (!pre.ok) {
+          this.log(`[SKIP] ${candidate.symbol} ${side}: quote not viable (${pre.code || "QUOTE_UNUSABLE"}: ${pre.reason}) — trying next candidate`, "warn");
+          this.rotation.recordMarketSideSkip(candidate.symbol, side);
+          this.state.rotation = this.rotation.toJSON();
+          continue;
+        }
+
+        // Collateral top-up derived from scratch for THIS candidate
+        const ready = await this._ensureCollateralForCtx(ctx, { provider, wallet, walletAddr, dryRun, allowEthWrap: false });
+        if (!ready) continue;
+
+        this.setState(STATES.OPEN);
         const attempt = await openPosition({
-          wallet, provider, managerAddr: candidate.managerAddr, poolAddr: candidate.poolAddr,
-          side, collateralToken, collateralAmount,
+          wallet, provider, managerAddr: ctx.managerAddr, poolAddr: ctx.poolAddr,
+          side, collateralToken: ctx.collateralToken, collateralAmount: ctx.collateralAmount,
           leverage: this.config.defaultLeverage,
           config: this.config, log: this.log.bind(this), dryRun, txManager: this.txManager,
-          paymentToken: candidate.paymentToken,
+          paymentToken: ctx.paymentToken,
         });
         openResult = attempt;
         if (attempt) {
           openedMarket = candidate;
+          openedCtx = ctx;
           break;
         }
         this._recordDirectionFailure(candidate.symbol, side);
         this.log(`[OPEN] market ${candidate.symbol} failed — trying next candidate`, "warn");
       }
       const marketUsed = openedMarket || market;
+      const ctxUsed = openedCtx;
 
       if (openResult?.dryRun) {
         this.log(`[DRY] Open would execute on ${marketUsed.symbol}`, "info");
@@ -2227,8 +2290,10 @@ export class AutoTrader {
         this.state.activePosition = {
           positionId: openResult.positionId,
           side,
-          collateralToken,
-          collateralAmount: collateralAmount.toString(),
+          // All of these come from the SAME candidate that actually opened
+          collateralToken: ctxUsed?.collateralToken || marketUsed.collateralToken,
+          collateralAmount: String(ctxUsed?.collateralAmount ?? ""),
+          paymentToken: ctxUsed?.paymentToken || marketUsed.paymentToken || null,
           leverage: this.config.defaultLeverage,
           openedAt: Date.now(),
           txHash: openResult.txHash,
@@ -2293,12 +2358,14 @@ export class AutoTrader {
             if (mk) {
               recovered.marketSymbol = mk.marketSymbol || mk.symbol;
               recovered.poolAddr = mk.poolAddr;
+              recovered.paymentToken = mk.paymentToken || paymentTokenForMarket(mk);
             } else {
               const sym = Object.entries(this.deps.confirmedPools || {})
                 .find(([, p]) => p?.manager?.toLowerCase() === mgr.toLowerCase())?.[0];
               if (sym) {
                 recovered.marketSymbol = sym;
                 recovered.poolAddr = this.deps.confirmedPools?.[sym]?.pool;
+                recovered.paymentToken = this.deps.confirmedPools?.[sym]?.paymentToken || null;
               }
             }
             break;
@@ -2387,10 +2454,11 @@ export class AutoTrader {
     const walletAddr = wallet.address;
     const dryRun = this.config.dryRun;
 
-    // Dynamic token map from discovery (on-chain decimals)
+    // Dynamic token map from discovery (on-chain decimals; P8: hardcoded only as a
+    // warned fallback if the RPC read fails — never silently preferred)
     const tokenAddrs = {};
     const decimalsMap = {};
-    for (const t of (this.tokenList.length ? this.tokenList : Object.entries(getAllTokens()).map(([symbol, address]) => ({ symbol, address, decimals: TOKEN_DECIMALS[symbol] ?? null })))) {
+    for (const t of (this.tokenList.length ? this.tokenList : Object.entries(getAllTokens()).map(([symbol, address]) => ({ symbol, address, decimals: null })))) {
       tokenAddrs[t.symbol] = t.address;
       decimalsMap[t.symbol] = t.decimals;
     }
@@ -2423,25 +2491,39 @@ export class AutoTrader {
         const fromBal = freshBalances[pair.from];
         if (!fromBal || fromBal.float <= 0) continue;
 
-        const amountResult = calculateRandomSwapAmount(pair.from, fromBal.float, autoSwapConfig, decimalsMap[pair.from]);
+        const fromDecimals = this._decimalsPrecedence(pair.from, decimalsMap);
+        const amountResult = calculateRandomSwapAmount(pair.from, fromBal.float, autoSwapConfig, fromDecimals, this.log.bind(this));
         if (!amountResult) continue;
 
-        const decimals = decimalsMap[pair.from] ?? TOKEN_DECIMALS[pair.from] ?? 6;
+        const decimals = amountResult.decimals ?? fromDecimals;
         const amountRaw = ethers.parseUnits(amountResult.amountFloat.toFixed(decimals), decimals);
 
         if (amountRaw > fromBal.raw * 90n / 100n) continue;
         if (amountRaw > fromBal.raw) continue;
 
-        const route = findRoute(this.routes, pair.fromAddr, pair.toAddr);
-        const path = route ? route.path : [pair.fromAddr, pair.toAddr];
-
-        const router = new ethers.Contract(getRouterAddress(), ROUTER_ABI, provider);
-        const quote = await router.getAmountsOut(amountRaw, path);
-        const expectedOut = quote[quote.length - 1];
-        const toDecimals = decimalsMap[pair.to] ?? TOKEN_DECIMALS[pair.to] ?? 6;
+        // P6: validated routes only — direct first, then bounded validated 2-hop.
+        // Never invent a path, never swap with amountOut = 0.
+        const best = await quoteBestPath({
+          provider, routerAddress: getRouterAddress(), routes: this.routes,
+          fromAddr: pair.fromAddr, toAddr: pair.toAddr, amountIn: amountRaw,
+          log: this.log.bind(this),
+        });
+        if (!best) {
+          this.log(`[AUTO-SWAP] ${pair.from} → ${pair.to}: no viable route (direct/2-hop quote zero) — skipping pair`, "warn");
+          continue;
+        }
+        const path = best.path;
+        const expectedOut = best.amountOut;
+        const toDecimals = this._decimalsPrecedence(pair.to, decimalsMap);
+        // Read-only guard: a zero-output quote would produce amountOutMin=0 and a
+        // guaranteed-loss (or reverting) swap — skip this pair, try another one.
+        if (expectedOut <= 0n) {
+          this.log(`[AUTO-SWAP] ${pair.from} → ${pair.to}: quote returned zero output — skipping pair`, "warn");
+          continue;
+        }
         const amountOutMin = applySlippage(expectedOut, BigInt(autoSwapConfig.slippageBps || 50));
 
-        this.log(`[AUTO] SWAPPING ${pair.from} → ${pair.to} [${ethers.formatUnits(amountRaw, decimals)}] hops=${route?.type || "direct"}`, "warn");
+        this.log(`[AUTO] SWAPPING ${pair.from} → ${pair.to} [${ethers.formatUnits(amountRaw, decimals)}] hops=${best.type}`, "warn");
 
         if (dryRun) {
           this.log(`[DRY] Would swap ${amountResult.amountFloat.toFixed(4)} ${pair.from} → ${pair.to}`, "info");
@@ -2479,15 +2561,86 @@ export class AutoTrader {
     }
   }
 
+  /**
+   * Resolve manager/pool/paymentToken for a stored position WITHOUT ever falling
+   * back to a side-derived manager (P7: the fallback could target ANOTHER market's
+   * manager, i.e. close the wrong contract).
+   *
+   * Match order: poolAddr → marketSymbol → managerAddr, then the identity recorded
+   * at OPEN time. Never uses getManagerAddr(side).
+   *
+   * @returns {object|null} {resolved, managerAddr, poolAddr, marketSymbol, paymentToken, source}
+   *          or null when the position carries no usable identity → caller MUST NOT
+   *          close or clear the position.
+   */
+  resolveManagerForPosition(pos) {
+    if (!pos || typeof pos !== "object") return null;
+    const markets = Array.isArray(this.markets) ? this.markets : [];
+    const confirmed = this.deps?.confirmedPools || {};
+    const poolAddr = pos.poolAddr || null;
+    const storedManager = pos.managerAddr || null;
+
+    let mk = null;
+    if (poolAddr) {
+      mk = markets.find(m => m.poolAddr && m.poolAddr.toLowerCase() === poolAddr.toLowerCase()) || null;
+    }
+    if (!mk && pos.marketSymbol) {
+      const want = String(pos.marketSymbol).toLowerCase();
+      mk = markets.find(m => String(m.marketSymbol || m.symbol || "").toLowerCase() === want) || null;
+    }
+    if (!mk && storedManager) {
+      mk = markets.find(m => m.managerAddr && m.managerAddr.toLowerCase() === storedManager.toLowerCase()) || null;
+    }
+
+    if (mk) {
+      const discoveredManager = mk.managerAddr;
+      if (storedManager && discoveredManager && storedManager.toLowerCase() !== discoveredManager.toLowerCase()) {
+        this.log(`[CLOSE] manager mismatch for position #${pos.positionId}: state=${short(storedManager)} discovery=${short(discoveredManager)} — using discovery for pool ${short(mk.poolAddr)}`, "warn");
+      }
+      return {
+        resolved: true,
+        managerAddr: discoveredManager,
+        poolAddr: mk.poolAddr || poolAddr,
+        marketSymbol: mk.marketSymbol || mk.symbol || pos.marketSymbol || null,
+        paymentToken: mk.paymentToken || paymentTokenForMarket(mk),
+        source: "discovery",
+      };
+    }
+
+    // Not in current discovery — keep the identity recorded at OPEN time
+    if (storedManager) {
+      const sym = Object.entries(confirmed)
+        .find(([, p]) => p?.manager && p.manager.toLowerCase() === storedManager.toLowerCase())?.[0]
+        || pos.marketSymbol || null;
+      const cp = sym ? confirmed[sym] : null;
+      return {
+        resolved: true,
+        managerAddr: storedManager,
+        poolAddr: poolAddr || cp?.pool || null,
+        marketSymbol: sym,
+        paymentToken: pos.paymentToken || cp?.paymentToken || null,
+        source: "state",
+      };
+    }
+    return null;
+  }
+
   async closeActivePosition() {
     if (!this.state.activePosition) return false;
 
     const { provider, wallet } = this.getRuntime();
-    const managerAddr = this.state.activePosition?.managerAddr || this.getManagerAddr();
+    // P7: the manager comes from THIS position's identity — never from a
+    // side-derived getManagerAddr() fallback (that can target another market).
+    const resolved = this.resolveManagerForPosition(this.state.activePosition);
+    if (!resolved || !resolved.managerAddr) {
+      this.log(`[CLOSE] cannot resolve manager for position #${this.state.activePosition.positionId} — NOT closing, NOT clearing (retry after discovery)`, "warn");
+      return false;
+    }
+    const managerAddr = resolved.managerAddr;
     const dryRun = this.config.dryRun;
 
     this.setState(STATES.CLOSE);
-    this.log(`[AUTO] CLOSING position #${this.state.activePosition.positionId} (${this.state.activePosition.side}) manager=${short(managerAddr)}`, "warn");
+    this.log(`[AUTO] CLOSING position #${this.state.activePosition.positionId} (${this.state.activePosition.side}) market=${this.state.activePosition.marketSymbol || resolved.marketSymbol || "?"} manager=${short(managerAddr)} src=${resolved.source}`, "warn");
 
     const closeResult = await closePositionFn({
       wallet, provider, managerAddr,
@@ -2513,6 +2666,328 @@ export class AutoTrader {
     }
   }
 
+  /**
+   * Isolated collateral context for ONE market candidate.
+   *
+   * Everything market-specific is derived from this candidate alone — token, decimals,
+   * amount and paymentToken are never reused from a previously tried candidate, so a
+   * fallback candidate can never open on manager B with candidate A's collateral.
+   *
+   * Validates the contract rule LONG → token0 / SHORT → token1.
+   *
+   * @returns {Promise<object|null>} ctx, or null when the candidate is unusable (skipped)
+   */
+  async _candidateContext(candidate, side, { provider, walletAddr }) {
+    const market = candidate?.market || null;
+    const symbol = candidate?.symbol || market?.marketSymbol || market?.symbol || "?";
+
+    const ruleToken = market ? collateralForSide(market, side) : null;
+    const collateralToken = candidate.collateralToken || ruleToken;
+    if (!collateralToken) {
+      this.log(`[SKIP] ${symbol} ${side}: no collateral token for this side`, "warn");
+      return null;
+    }
+    if (ruleToken && ruleToken.toLowerCase() !== collateralToken.toLowerCase()) {
+      this.log(`[SKIP] ${symbol} ${side}: collateral mismatch candidate=${short(collateralToken)} rule=${short(ruleToken)}`, "warn");
+      return null;
+    }
+    if (market?.token0 && market?.token1) {
+      const expectedLeg = side === "LONG" ? market.token0 : market.token1;
+      const legName = side === "LONG" ? "token0" : "token1";
+      if (expectedLeg && expectedLeg.toLowerCase() !== collateralToken.toLowerCase()) {
+        this.log(`[SKIP] ${symbol} ${side}: collateral is not the ${legName} leg`, "warn");
+        return null;
+      }
+    }
+
+    let collateralDecimals, collateralSym;
+    try {
+      // decimals/symbol ALWAYS from the token contract (never hardcoded)
+      collateralDecimals = candidate.decimals ?? await tokenDecimalsOnChain(provider, collateralToken);
+      collateralSym = candidate.collateralSym ?? await tokenSymbolOnChain(provider, collateralToken);
+    } catch (e) {
+      this.log(`[SKIP] ${symbol} ${side}: token meta failed (${e.message?.slice(0, 40)})`, "warn");
+      return null;
+    }
+
+    const collateralAmount = ethers.parseUnits(collateralTargetStr(this.config, collateralToken), collateralDecimals);
+    const targetReserve = ethers.parseUnits(reserveTargetStr(this.config, collateralToken), collateralDecimals);
+    if (collateralAmount <= 0n) {
+      this.log(`[SKIP] ${symbol} ${side}: invalid collateral target`, "warn");
+      return null;
+    }
+
+    return {
+      candidate, side,
+      marketSymbol: symbol,
+      managerAddr: candidate.managerAddr,
+      poolAddr: candidate.poolAddr,
+      paymentToken: candidate.paymentToken || (market ? paymentTokenForMarket(market) : null),
+      token0: candidate.token0 || market?.token0 || null,
+      token1: candidate.token1 || market?.token1 || null,
+      leverage: this.config.defaultLeverage,
+      collateralToken, collateralDecimals, collateralSym, collateralAmount, targetReserve,
+      tokenContract: new ethers.Contract(collateralToken, ERC20_ABI, provider),
+      balance: 0n,
+    };
+  }
+
+  /**
+   * Hard invariant checks run immediately before openPosition (P2).
+   * Every market-specific value MUST belong to THIS candidate's market — a candidate
+   * that inherited candidate[0]'s collateral/manager/pool/paymentToken/decimals is
+   * skipped instead of opened.
+   *
+   * @returns {Promise<{ok:true}|{ok:false, reason:string}>}
+   */
+  async _assertCandidateInvariants(candidate, ctx, side, provider) {
+    const eq = (a, b) => String(a || "").toLowerCase() === String(b || "").toLowerCase();
+    const fail = (reason) => ({ ok: false, reason });
+    if (!ctx) return fail("no collateral context");
+    const market = candidate?.market || null;
+    const label = candidate?.symbol || ctx.marketSymbol || "?";
+
+    // 1) market identity
+    if (candidate?.marketSymbol && ctx.marketSymbol && candidate.marketSymbol !== ctx.marketSymbol) {
+      return fail(`marketSymbol mismatch candidate=${candidate.marketSymbol} ctx=${ctx.marketSymbol}`);
+    }
+    if (candidate?.managerAddr && !eq(candidate.managerAddr, ctx.managerAddr)) {
+      return fail(`managerAddr not candidate's (candidate=${short(candidate.managerAddr)} ctx=${short(ctx.managerAddr)})`);
+    }
+    if (candidate?.poolAddr && !eq(candidate.poolAddr, ctx.poolAddr)) {
+      return fail(`poolAddr not candidate's (candidate=${short(candidate.poolAddr)} ctx=${short(ctx.poolAddr)})`);
+    }
+    if (market?.managerAddr && !eq(market.managerAddr, ctx.managerAddr)) {
+      return fail(`managerAddr not from market record (market=${short(market.managerAddr)} ctx=${short(ctx.managerAddr)})`);
+    }
+    if (market?.poolAddr && !eq(market.poolAddr, ctx.poolAddr)) {
+      return fail(`poolAddr not from market record (market=${short(market.poolAddr)} ctx=${short(ctx.poolAddr)})`);
+    }
+
+    // 2) collateral belongs to this market's legs (LONG→token0 / SHORT→token1)
+    const legs = [market?.token0, market?.token1, candidate?.token0, candidate?.token1]
+      .filter(Boolean).map((a) => String(a).toLowerCase());
+    if (legs.length && !legs.includes(String(ctx.collateralToken).toLowerCase())) {
+      return fail(`collateralToken ${short(ctx.collateralToken)} is not a leg of ${label}`);
+    }
+    const rule = market ? collateralForSide(market, side) : null;
+    if (rule && !eq(rule, ctx.collateralToken)) {
+      return fail(`collateralToken violates ${side === "LONG" ? "LONG→token0" : "SHORT→token1"} rule for ${label}`);
+    }
+
+    // 3) paymentToken belongs to this market (explicit market record value only —
+    //    a derived "risky token" can legitimately differ from the declared one)
+    if (candidate?.paymentToken && ctx.paymentToken && !eq(candidate.paymentToken, ctx.paymentToken)) {
+      return fail(`paymentToken not candidate's (candidate=${short(candidate.paymentToken)} ctx=${short(ctx.paymentToken)})`);
+    }
+    if (market?.paymentToken && ctx.paymentToken && !eq(market.paymentToken, ctx.paymentToken)) {
+      return fail(`paymentToken not market's (market=${short(market.paymentToken)} ctx=${short(ctx.paymentToken)})`);
+    }
+
+    // 4) collateral decimals must correspond to the collateral token (on-chain truth)
+    let onChainDecimals = null;
+    try {
+      onChainDecimals = await tokenDecimalsOnChain(provider, ctx.collateralToken);
+    } catch (e) {
+      return fail(`cannot verify collateral decimals for ${short(ctx.collateralToken)} (${e.message?.slice(0, 40)})`);
+    }
+    if (Number(onChainDecimals) !== Number(ctx.collateralDecimals)) {
+      return fail(`collateral decimals ${ctx.collateralDecimals} != on-chain ${onChainDecimals} for ${short(ctx.collateralToken)}`);
+    }
+    return { ok: true };
+  }
+
+  /**
+   * Decimals precedence (P8): on-chain > runtime/discovered metadata > hardcoded
+   * TOKEN_DECIMALS fallback — and the fallback ALWAYS emits a diagnostic warning.
+   */
+  _decimalsPrecedence(sym, map) {
+    const v = map?.[sym];
+    if (v !== null && v !== undefined) return v;
+    const fb = TOKEN_DECIMALS[String(sym).toUpperCase()];
+    if (fb !== null && fb !== undefined) {
+      this.log(`[DECIMALS] ${sym}: no on-chain/runtime decimals — using hardcoded fallback ${fb} (diagnostic)`, "warn");
+      return fb;
+    }
+    this.log(`[DECIMALS] ${sym}: no on-chain/runtime/hardcoded decimals — assuming 6 (diagnostic)`, "warn");
+    return 6;
+  }
+
+  /**
+   * Make sure THIS candidate's collateral is available (inventory-aware top-up).
+   * Balance/deficit are re-derived from ctx from scratch for every candidate.
+   *
+   * @returns {Promise<boolean>} true when balance >= ctx.collateralAmount
+   */
+  async _ensureCollateralForCtx(ctx, { provider, wallet, walletAddr, dryRun, allowEthWrap = false, resetNonceOnError = false }) {
+    const { collateralToken, collateralDecimals, collateralSym, collateralAmount, targetReserve, tokenContract, side, marketSymbol } = ctx;
+
+    const balance = await tokenContract.balanceOf(walletAddr);
+    ctx.balance = balance;
+
+    this.log(`[INVENTORY] ═══ COLLATERAL CHECK (${marketSymbol} ${side}) ═══`, "info");
+    this.log(`[INVENTORY] ${collateralSym} balance=${ethers.formatUnits(balance, collateralDecimals)}`, "info");
+    this.log(`[INVENTORY] ${collateralSym} required=${ethers.formatUnits(collateralAmount, collateralDecimals)} (position open)`, "info");
+    this.log(`[INVENTORY] ${collateralSym} targetReserve=${ethers.formatUnits(targetReserve, collateralDecimals)} (inventory target)`, "info");
+
+    if (collateralAmount <= 0n) {
+      this.log(`[BLOCKED] Invalid collateral target`, "error");
+      return false;
+    }
+
+    const deficit = calculateInventoryDeficit({
+      balance, required: collateralAmount, targetReserve,
+      decimals: collateralDecimals, sym: collateralSym,
+      log: this.log.bind(this),
+    });
+
+    if (deficit.action === "none") {
+      this.log(`[INVENTORY] RESERVE OK — ${collateralSym} ${ethers.formatUnits(balance, collateralDecimals)} >= target ${ethers.formatUnits(targetReserve, collateralDecimals)}`, "success");
+      return true;
+    }
+
+    this.setState(STATES.SWAP);
+    this.log(`[SWAP] ${deficit.reason}`, "warn");
+    this.log(`[SWAP] searching inventory for source tokens...`, "warn");
+
+    // Source tokens come from the discovered inventory + validated routes only
+    const sources = swapSourcesFor(collateralToken, side, this.tokenList);
+    let swapSuccess = false;
+
+    for (const sourceToken of sources) {
+      try {
+        const sourceContract = new ethers.Contract(sourceToken, ERC20_ABI, provider);
+        const sourceBalance = await sourceContract.balanceOf(walletAddr);
+        let sourceDecimals, sourceSym;
+        try {
+          const meta = await tokenMetaOnChain(provider, sourceToken);
+          sourceDecimals = meta.decimals;
+          sourceSym = meta.symbol;
+        } catch {
+          this.log(`[SWAP] source ${short(sourceToken)} meta failed — skip`, "warn");
+          continue;
+        }
+
+        if (sourceBalance <= 0n) {
+          this.log(`[SWAP] ${sourceSym} balance=0 — skip`, "info");
+          continue;
+        }
+
+        this.log(`[SWAP] ${sourceSym} balance=${ethers.formatUnits(sourceBalance, sourceDecimals)} — trying ${sourceSym} → ${collateralSym}`, "info");
+
+        // P6: direct (validated or read-only probed) → validated 2-hop → SKIP.
+        const best = await quoteBestPath({
+          provider, routerAddress: getRouterAddress(), routes: this.routes,
+          fromAddr: sourceToken, toAddr: collateralToken, amountIn: sourceBalance,
+          log: this.log.bind(this),
+        });
+        if (!best) {
+          this.log(`[SWAP] ${sourceSym} → ${collateralSym}: no viable route (direct/2-hop quote zero) — skip`, "warn");
+          continue;
+        }
+        const path = best.path;
+        const expectedOut = best.amountOut;
+
+        // Never swap into a zero/insufficient quote — skip this source, try the next
+        if (expectedOut < deficit.swapAmount) {
+          this.log(`[SWAP] ${sourceSym} insufficient: max output ${ethers.formatUnits(expectedOut, collateralDecimals)} < needed ${ethers.formatUnits(deficit.swapAmount, collateralDecimals)}`, "warn");
+          continue;
+        }
+
+        // Calculate exact swap amount — don't swap more than needed
+        const neededWithBuffer = deficit.swapAmount * 101n / 100n; // 1% buffer for slippage
+        let swapAmount = neededWithBuffer * sourceBalance / expectedOut;
+        if (swapAmount > sourceBalance) swapAmount = sourceBalance;
+        const amountOutMin = deficit.swapAmount * 98n / 100n; // 2% slippage protection
+
+        this.log(`[SWAP] quote: ${ethers.formatUnits(swapAmount, sourceDecimals)} ${sourceSym} → ~${ethers.formatUnits(expectedOut * swapAmount / sourceBalance, collateralDecimals)} ${collateralSym}`, "info");
+        this.log(`[SWAP] amountOutMin=${ethers.formatUnits(amountOutMin, collateralDecimals)} ${collateralSym}`, "info");
+
+        if (dryRun) {
+          this.log(`[DRY] Would swap ${ethers.formatUnits(swapAmount, sourceDecimals)} ${sourceSym} → ${collateralSym}`, "info");
+          swapSuccess = true;
+          break;
+        }
+
+        const swapResult = await executeSwap({
+          wallet, provider, fromToken: sourceToken, toToken: collateralToken,
+          amount: swapAmount, amountOutMin, config: this.config,
+          log: this.log.bind(this), txManager: this.txManager, path,
+        });
+
+        if (!swapResult) {
+          this.log(`[SWAP] ${sourceSym} → ${collateralSym} FAILED — trying next source`, "error");
+          continue;
+        }
+
+        const newBalance = await tokenContract.balanceOf(walletAddr);
+        ctx.balance = newBalance;
+        this.log(`[SWAP] ${collateralSym} balance_after=${ethers.formatUnits(newBalance, collateralDecimals)} (target=${ethers.formatUnits(targetReserve, collateralDecimals)})`, "info");
+
+        if (newBalance >= collateralAmount) {
+          this.log(`[SWAP] CONFIRMED — ${collateralSym} sufficient after swap`, "success");
+          swapSuccess = true;
+          break;
+        } else {
+          this.log(`[SWAP] ${collateralSym} still below required after swap: ${ethers.formatUnits(newBalance, collateralDecimals)} < ${ethers.formatUnits(collateralAmount, collateralDecimals)}`, "warn");
+        }
+      } catch (e) {
+        this.log(`[SWAP] ${short(sourceToken)} → ${collateralSym} failed: ${e.message?.slice(0, 80)}`, "error");
+        if (resetNonceOnError) this.txManager.resetNonce();
+        continue;
+      }
+    }
+
+    if (!swapSuccess && !dryRun) {
+      this.log(`[BLOCKED] No source token could cover ${collateralSym} deficit for ${marketSymbol} — trying next candidate`, "error");
+      return false;
+    }
+
+    // Last resort: ETH → WETH wrap when the candidate's collateral is WETH
+    if (!swapSuccess && !dryRun && allowEthWrap && collateralToken.toLowerCase() === WETH.toLowerCase()) {
+      try {
+        const currentWethBal = await tokenContract.balanceOf(walletAddr);
+        const remainingDeficit = collateralAmount > currentWethBal ? collateralAmount - currentWethBal : 0n;
+        if (remainingDeficit > 0n) {
+          const ethBalance = await provider.getBalance(walletAddr);
+          const gasReserve = ethers.parseEther(String(this.config.ethGuard?.MIN_ETH_GAS_RESERVE ?? 0.003));
+          const ethAvail = ethBalance - gasReserve - ethers.parseEther("0.005");
+          const wrapAmount = remainingDeficit > ethAvail ? ethAvail : remainingDeficit;
+          if (wrapAmount > ethers.parseEther("0.0001")) {
+            this.log(`[SWAP] ETH → WETH (wrap ${ethers.formatEther(wrapAmount)})`, "warn");
+            const wethContract = new ethers.Contract(WETH, ["function deposit() payable", "function balanceOf(address) view returns (uint256)"], wallet);
+            const feeParams = await getFeeParams(provider);
+            const r = await this.txManager.sendAndWait({
+              wallet, provider, txType: "WETH-WRAP",
+              sendFn: (nonce) => wethContract.deposit({ value: wrapAmount, gasLimit: 100000n, ...feeParams, nonce }),
+              log: this.log.bind(this),
+            });
+            if (r && r.status === 1) {
+              const wethBal = await tokenContract.balanceOf(walletAddr);
+              ctx.balance = wethBal;
+              if (wethBal >= collateralAmount) swapSuccess = true;
+            }
+          }
+        }
+      } catch (e) {
+        this.log(`[SWAP] ETH→WETH wrap failed: ${e.message?.slice(0, 60)}`, "error");
+      }
+    }
+
+    const finalBalance = await tokenContract.balanceOf(walletAddr);
+    ctx.balance = finalBalance;
+    if (!dryRun && finalBalance < collateralAmount) {
+      this.log(`[BLOCKED] ${collateralSym} still insufficient after all swaps: ${ethers.formatUnits(finalBalance, collateralDecimals)} < ${ethers.formatUnits(collateralAmount, collateralDecimals)} — trying next candidate`, "error");
+      return false;
+    }
+    if (dryRun) {
+      this.log(`[DRY] ${collateralSym}=${ethers.formatUnits(finalBalance, collateralDecimals)} (required ${ethers.formatUnits(collateralAmount, collateralDecimals)})`, "info");
+      return true;
+    }
+    this.log(`[INVENTORY] POST-SWAP ${collateralSym}=${ethers.formatUnits(finalBalance, collateralDecimals)} — ready for OPEN`, "success");
+    return true;
+  }
+
   async prepareAndOpen(side) {
     const { provider, wallet } = this.getRuntime();
     const walletAddr = wallet.address;
@@ -2529,165 +3004,77 @@ export class AutoTrader {
     const market = marketCandidates[0];
     this.log(`[MARKET] ${market.symbol} manager=${short(market.managerAddr)} coll=${market.collateralSym || "?"} (candidates: ${marketCandidates.map(m => m.symbol).join(", ")})`, "info");
 
-    const collateralToken = market.collateralToken;
-    if (!collateralToken) {
-      this.log(`[BLOCKED] Market ${market.symbol} has no collateral token for ${side}`, "error");
-      return false;
-    }
-    // decimals/symbol ALWAYS from token contract
-    const collateralDecimals = market.decimals ?? await tokenDecimalsOnChain(provider, collateralToken);
-    const collateralSym = market.collateralSym ?? await tokenSymbolOnChain(provider, collateralToken);
-
-    const targetStr = collateralTargetStr(this.config, collateralToken);
-    const collateralAmount = ethers.parseUnits(targetStr, collateralDecimals);
-
-    const reserveStr = reserveTargetStr(this.config, collateralToken);
-    const targetReserve = ethers.parseUnits(reserveStr, collateralDecimals);
-
-    this.log(`[AUTO] OPENING ${side} ${this.config.defaultLeverage}x — collateral: ${collateralSym}`, "warn");
-
-    // Check collateral
-    const tokenContract = new ethers.Contract(collateralToken, ERC20_ABI, provider);
-    const balance = await tokenContract.balanceOf(walletAddr);
-
-    if (collateralAmount <= 0n) {
-      this.log(`[BLOCKED] Invalid collateral`, "error");
-      return false;
-    }
-
-    const deficit = calculateInventoryDeficit({
-      balance, required: collateralAmount, targetReserve,
-      decimals: collateralDecimals, sym: collateralSym,
-      log: this.log.bind(this),
-    });
-
-    if (deficit.action !== "none") {
-      this.log(`[AUTO] SWAPPING for ${collateralSym} collateral`, "warn");
-      const sources = swapSourcesFor(collateralToken, side, this.tokenList);
-      let swapSuccess = false;
-
-      for (const sourceToken of sources) {
-        try {
-          const sourceContract = new ethers.Contract(sourceToken, ERC20_ABI, provider);
-          const sourceBalance = await sourceContract.balanceOf(walletAddr);
-          const srcMeta = await tokenMetaOnChain(provider, sourceToken);
-          const sourceDecimals = srcMeta.decimals;
-          const sourceSym = srcMeta.symbol;
-
-          if (sourceBalance <= 0n) {
-            this.log(`[SWAP] ${sourceSym} balance=0 — skip`, "info");
-            continue;
-          }
-
-          this.log(`[SWAP] ${sourceSym} → ${collateralSym}: balance=${ethers.formatUnits(sourceBalance, sourceDecimals)}`, "info");
-
-          const route = findRoute(this.routes, sourceToken, collateralToken);
-          const path = route ? route.path : [sourceToken, collateralToken];
-          if (this.routes.length && !route) {
-            this.log(`[SWAP] ${sourceSym} → ${collateralSym}: no validated route — skip`, "warn");
-            continue;
-          }
-          const router = new ethers.Contract(getRouterAddress(), ROUTER_ABI, provider);
-          const fullQuote = await router.getAmountsOut(sourceBalance, path);
-          const expectedOut = fullQuote[fullQuote.length - 1];
-
-          if (expectedOut < deficit.swapAmount) {
-            this.log(`[SWAP] ${sourceSym} insufficient: max output < needed`, "warn");
-            continue;
-          }
-
-          const neededWithBuffer = deficit.swapAmount * 101n / 100n;
-          let swapAmount = neededWithBuffer * sourceBalance / expectedOut;
-          if (swapAmount > sourceBalance) swapAmount = sourceBalance;
-          const amountOutMin = deficit.swapAmount * 98n / 100n;
-
-          this.log(`[AUTO] SWAPPING ${sourceSym} → ${collateralSym}`, "warn");
-
-          if (dryRun) {
-            this.log(`[DRY] Would swap ${sourceSym} → ${collateralSym}`, "info");
-            swapSuccess = true;
-            break;
-          }
-
-          const swapResult = await executeSwap({
-            wallet, provider, fromToken: sourceToken, toToken: collateralToken,
-            amount: swapAmount, amountOutMin, config: this.config,
-            log: this.log.bind(this), txManager: this.txManager, path,
-          });
-
-          if (swapResult) {
-            const newBalance = await tokenContract.balanceOf(walletAddr);
-            this.log(`[SWAP] ${collateralSym} balance_after=${ethers.formatUnits(newBalance, collateralDecimals)}`, "info");
-            if (newBalance >= collateralAmount) {
-              swapSuccess = true;
-              break;
-            }
-          }
-        } catch (e) {
-          this.log(`[SWAP] source failed: ${e.message?.slice(0, 60)}`, "error");
-          this.txManager.resetNonce();
-          continue;
-        }
-      }
-
-      // Last resort: ETH → WETH wrap when collateral is WETH
-      if (!swapSuccess && !dryRun && collateralToken.toLowerCase() === WETH.toLowerCase()) {
-        try {
-          const currentWethBal = await new ethers.Contract(WETH, ERC20_ABI, provider).balanceOf(walletAddr);
-          const remainingDeficit = collateralAmount > currentWethBal ? collateralAmount - currentWethBal : 0n;
-          if (remainingDeficit > 0n) {
-            const ethBalance = await provider.getBalance(walletAddr);
-            const gasReserve = ethers.parseEther(String(this.config.ethGuard?.MIN_ETH_GAS_RESERVE ?? 0.003));
-            const ethAvail = ethBalance - gasReserve - ethers.parseEther("0.005");
-            const wrapAmount = remainingDeficit > ethAvail ? ethAvail : remainingDeficit;
-            if (wrapAmount > ethers.parseEther("0.0001")) {
-              this.log(`[AUTO] SWAPPING ETH → WETH (wrap ${ethers.formatEther(wrapAmount)})`, "warn");
-              const wethContract = new ethers.Contract(WETH, ["function deposit() payable", "function balanceOf(address) view returns (uint256)"], wallet);
-              const feeParams = await getFeeParams(provider);
-              const r = await this.txManager.sendAndWait({
-                wallet, provider, txType: "WETH-WRAP",
-                sendFn: (nonce) => wethContract.deposit({ value: wrapAmount, gasLimit: 100000n, ...feeParams, nonce }),
-                log: this.log.bind(this),
-              });
-              if (r && r.status === 1) {
-                const wethBal = await new ethers.Contract(WETH, ERC20_ABI, provider).balanceOf(walletAddr);
-                if (wethBal >= collateralAmount) swapSuccess = true;
-              }
-            }
-          }
-        } catch (e) {
-          this.log(`[SWAP] ETH→WETH wrap failed: ${e.message?.slice(0, 60)}`, "error");
-        }
-      }
-
-      if (!swapSuccess && !dryRun) {
-        this.log(`[BLOCKED] No source for ${collateralSym}`, "error");
-        return false;
-      }
-    }
-
-    // Open position — try market candidates in order
+    // Per-candidate isolation: collateral context + top-up are built inside the OPEN
+    // loop below (_candidateContext / _ensureCollateralForCtx), each candidate gets its
+    // own read-only quote precheck — a fallback candidate never inherits candidate[0]'s
+    // token/decimals/amount/paymentToken.
+    this.log(`[AUTO] OPENING ${side} ${this.config.defaultLeverage}x`, "warn");
     this.setState(STATES.OPEN);
     let openResult = null;
     let openedMarket = null;
+    let openedCtx = null;
     for (const candidate of marketCandidates) {
       this.log(`[OPEN] trying market ${candidate.symbol} manager=${short(candidate.managerAddr)}`, "info");
+
+      const ctx = await this._candidateContext(candidate, side, { provider, walletAddr });
+      if (!ctx) {
+        this.log(`[OPEN] market ${candidate.symbol} skipped (collateral context) — trying next candidate`, "warn");
+        continue;
+      }
+
+      // P2 hard invariants — everything market-specific must belong to THIS candidate.
+      const inv = await this._assertCandidateInvariants(candidate, ctx, side, provider);
+      if (!inv.ok) {
+        this.log(`[SKIP] ${candidate.symbol} ${side}: invariant failed — ${inv.reason} — trying next candidate`, "warn");
+        this.rotation.recordMarketSideSkip(candidate.symbol, side);
+        this.state.rotation = this.rotation.toJSON();
+        continue;
+      }
+
+      // READ-ONLY viability pre-check (view calls only, no transaction).
+      // Minimum-size/dust candidates are SKIPPED with a reason, never counted
+      // as a direction failure (see P4).
+      const pre = await precheckMarketQuote(provider, {
+        pool: ctx.poolAddr, manager: ctx.managerAddr,
+        collateralToken: ctx.collateralToken, collateralAmount: ctx.collateralAmount,
+        leverageX10: BigInt(Math.round(Number(this.config.defaultLeverage) * 10)),
+        isLong: side === "LONG", log: this.log.bind(this),
+      });
+      if (!pre.ok) {
+        this.log(`[SKIP] ${candidate.symbol} ${side}: quote not viable (${pre.code || "QUOTE_UNUSABLE"}: ${pre.reason}) — trying next candidate`, "warn");
+        this.rotation.recordMarketSideSkip(candidate.symbol, side);
+        this.state.rotation = this.rotation.toJSON();
+        continue;
+      }
+
+      // Collateral top-up derived from scratch for THIS candidate (ETH→WETH wrap allowed)
+      const ready = await this._ensureCollateralForCtx(ctx, {
+        provider, wallet, walletAddr, dryRun, allowEthWrap: true, resetNonceOnError: true,
+      });
+      if (!ready) {
+        this.rotation.recordMarketSideSkip(candidate.symbol, side);
+        this.state.rotation = this.rotation.toJSON();
+        continue;
+      }
+
       const attempt = await openPosition({
-        wallet, provider, managerAddr: candidate.managerAddr, poolAddr: candidate.poolAddr,
-        side, collateralToken, collateralAmount,
+        wallet, provider, managerAddr: ctx.managerAddr, poolAddr: ctx.poolAddr,
+        side, collateralToken: ctx.collateralToken, collateralAmount: ctx.collateralAmount,
         leverage: this.config.defaultLeverage,
         config: this.config, log: this.log.bind(this), dryRun, txManager: this.txManager,
-        paymentToken: candidate.paymentToken,
+        paymentToken: ctx.paymentToken,
       });
       openResult = attempt;
       if (attempt) {
         openedMarket = candidate;
+        openedCtx = ctx;
         break;
       }
       this._recordDirectionFailure(candidate.symbol, side);
       this.log(`[OPEN] market ${candidate.symbol} failed — trying next candidate`, "warn");
     }
     const marketUsed = openedMarket || market;
+    const ctxUsed = openedCtx;
 
     if (openResult?.dryRun) {
       this.log(`[DRY] Open ${side} would execute on ${marketUsed.symbol}`, "info");
@@ -2702,8 +3089,11 @@ export class AutoTrader {
       this.state.rotation = this.rotation.toJSON();
       this.state.activePosition = {
         positionId: openResult.positionId,
-        side, collateralToken,
-        collateralAmount: collateralAmount.toString(),
+        side,
+        // All of these come from the SAME candidate that actually opened
+        collateralToken: ctxUsed?.collateralToken || marketUsed.collateralToken,
+        collateralAmount: String(ctxUsed?.collateralAmount ?? ""),
+        paymentToken: ctxUsed?.paymentToken || marketUsed.paymentToken || null,
         leverage: this.config.defaultLeverage,
         openedAt: Date.now(),
         txHash: openResult.txHash,
@@ -2727,5 +3117,5 @@ export class AutoTrader {
   }
 }
 
-export { STATES, DEFAULT_AUTO_CONFIG, openPosition, closePositionFn, resolveTradingMarket, encodeOpenPositionCalldata, TxManager };
+export { STATES, DEFAULT_AUTO_CONFIG, openPosition, closePositionFn, resolveTradingMarket, encodeOpenPositionCalldata, TxManager, normalizeDirectionDisabled, recoverPosition };
 export default AutoTrader;

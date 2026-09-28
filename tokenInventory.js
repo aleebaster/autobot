@@ -237,17 +237,23 @@ class TokenInventory {
     }
 
     for (const [sym, info] of tokensToFetch) {
+      // P8 decimals precedence: on-chain/runtime metadata > warned hardcoded fallback
+      let dec = info?.decimals;
+      if (dec === null || dec === undefined) {
+        dec = 6;
+        log(`[DECIMALS] ${sym}: no on-chain/runtime decimals — using hardcoded fallback 6 (diagnostic)`, "warn");
+      }
       try {
         const contract = new ethers.Contract(info.address, ERC20_ABI, provider);
         const bal = await contract.balanceOf(walletAddress);
         balances[sym] = {
           raw: bal,
-          float: Number(bal) / Math.pow(10, info.decimals || 6),
-          decimals: info.decimals || 6,
+          float: Number(bal) / Math.pow(10, dec),
+          decimals: dec,
         };
       } catch (e) {
         log(`[INVENTORY] Failed to fetch ${sym} balance: ${e.message}`, "warn");
-        balances[sym] = { raw: 0n, float: 0, decimals: info.decimals || 6 };
+        balances[sym] = { raw: 0n, float: 0, decimals: dec };
       }
     }
 
@@ -917,9 +923,10 @@ const SWAP_AMOUNT_BOUNDS = {
  * @param {number} fromBalanceFloat
  * @param {object} autoSwapConfig
  * @param {number} [decimalsOverride] on-chain decimals (preferred over TOKEN_DECIMALS)
+ * @param {Function} [log] optional logger for the hardcoded-decimals diagnostic
  * @returns {{ amountFloat: number, reason: string } | null}
  */
-function calculateRandomSwapAmount(fromSym, fromBalanceFloat, autoSwapConfig, decimalsOverride) {
+function calculateRandomSwapAmount(fromSym, fromBalanceFloat, autoSwapConfig, decimalsOverride, log = () => {}) {
   const minPercent = autoSwapConfig.swapMinPercent || 3;
   const maxPercent = autoSwapConfig.swapMaxPercent || 15;
 
@@ -947,9 +954,19 @@ function calculateRandomSwapAmount(fromSym, fromBalanceFloat, autoSwapConfig, de
 
   if (!(amountFloat > 0)) return null;
 
+  // Decimals precedence (P8): on-chain > runtime metadata > hardcoded fallback (warned)
+  let decimals;
+  if (decimalsOverride !== null && decimalsOverride !== undefined) {
+    decimals = decimalsOverride;
+  } else {
+    const fb = TOKEN_DECIMALS[String(fromSym).toUpperCase()];
+    decimals = fb ?? 6;
+    log(`[DECIMALS] ${fromSym}: no on-chain/runtime value — using hardcoded fallback ${decimals} (diagnostic)`, "warn");
+  }
+
   return {
     amountFloat,
-    decimals: decimalsOverride ?? TOKEN_DECIMALS[fromSym] ?? 6,
+    decimals,
     reason: `random ${percent.toFixed(1)}% of ${fromBalanceFloat} balance`,
   };
 }

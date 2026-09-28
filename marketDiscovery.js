@@ -162,13 +162,34 @@ export function paymentTokenForMarket(market) {
   return t0 || null;
 }
 
+/**
+ * Runtime direction kill-switch entry semantics.
+ *
+ * Entries are either:
+ *   - soft failure counters: { fails: n }                       → NOT disabled
+ *   - hard disabled:        { disabled:true, since, reason }    → disabled
+ *   - legacy hard:          { since, reason }                   → disabled (old format)
+ *   - legacy boolean:       true                                → disabled (doc format)
+ *
+ * A truthy entry alone must NEVER mean "disabled" — that is what made a single
+ * { fails:1 } counter lock a direction permanently (re-enable could never fire).
+ *
+ * @param {*} entry value from `directionDisabled[key]`
+ * @returns {boolean} true only for an explicit hard-disable
+ */
+export function isDirectionEntryDisabled(entry) {
+  if (entry === true) return true;
+  if (!entry || typeof entry !== "object") return false;
+  return entry.disabled === true || entry.since !== undefined && entry.since !== null;
+}
+
 export function supportsSide(market, side, runtimeDisabled = null) {
   if (!market || market.isActive === false) return false;
   if (side === "LONG" && market.supportsLong === false) return false;
   if (side === "SHORT" && market.supportsShort === false) return false;
   if (runtimeDisabled) {
     const key = `${marketKey(market)}|${side}`;
-    if (runtimeDisabled[key]) return false;
+    if (isDirectionEntryDisabled(runtimeDisabled[key])) return false;
   }
   return true;
 }
@@ -373,10 +394,11 @@ export function finalizeMarket(cand, onChain, runtime = {}) {
   market.supportsLong = cand.supportsLong !== false;
   market.supportsShort = cand.supportsShort !== false;
 
-  // Runtime direction kill-switch (learned from repeated preflight failures)
+  // Runtime direction kill-switch — ONLY an explicit hard-disable hides a side here.
+  // Soft counters ({ fails: n } below the threshold) must stay selectable.
   if (runtime?.directionDisabled) {
-    if (runtime.directionDisabled[`${marketKey(market)}|LONG`]) market.supportsLong = false;
-    if (runtime.directionDisabled[`${marketKey(market)}|SHORT`]) market.supportsShort = false;
+    if (isDirectionEntryDisabled(runtime.directionDisabled[`${marketKey(market)}|LONG`])) market.supportsLong = false;
+    if (isDirectionEntryDisabled(runtime.directionDisabled[`${marketKey(market)}|SHORT`])) market.supportsShort = false;
   }
 
   market.collateralLong = collateralForSide(market, "LONG");

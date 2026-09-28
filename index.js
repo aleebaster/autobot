@@ -505,13 +505,15 @@ async function closeManual() {
       return;
     }
 
-    // ALWAYS close via the position's own manager (per-market) — never a hardcoded default
-    const managerAddr = posState.managerAddr || autoTrader?.getManagerAddr?.(posState.side);
+    // ALWAYS close via THIS position's own manager — never a side-derived fallback,
+    // which can target a DIFFERENT market's manager (P7).
+    const resolved = autoTrader?.resolveManagerForPosition?.(posState) || null;
+    const managerAddr = resolved?.managerAddr || posState.managerAddr || null;
     if (!managerAddr) {
-      addLog("No manager address for active position", "error");
+      addLog(`Cannot resolve manager for position #${posState.positionId} — NOT closing, NOT clearing`, "error");
       return;
     }
-    addLog(`Closing position #${posState.positionId} on manager ${managerAddr.slice(0,10)}... (market=${posState.marketSymbol || "?"})`, "info");
+    addLog(`Closing position #${posState.positionId} on manager ${managerAddr.slice(0,10)}... (market=${posState.marketSymbol || resolved?.marketSymbol || "?"}, src=${resolved?.source || "state"})`, "info");
 
     const { closePositionFn } = await import("./autoTrader.js");
     const result = await closePositionFn({

@@ -82,6 +82,20 @@ export class RotationMemory {
   }
 
   /**
+   * Record that a MARKET×SIDE was TRIED AND SKIPPED (e.g. its quote is not viable
+   * for the minimum collateral size) without counting it as an open.
+   *
+   * Only recency is updated, so the picker moves on to the next candidate instead of
+   * re-selecting the same unusable combo forever — while coverage counters stay
+   * honest (skips are not opens).
+   */
+  recordMarketSideSkip(symbol, side) {
+    const key = `${symbol}|${side}`;
+    this.recentMarkets.push(key);
+    if (this.recentMarkets.length > this.historyLimit) this.recentMarkets = this.recentMarkets.slice(-this.historyLimit);
+  }
+
+  /**
    * Pick a side for a specific market, avoiding immediate repetition when possible.
    */
   pickSideForMarket(symbol, allowedSides) {
