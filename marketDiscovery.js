@@ -167,20 +167,34 @@ export function paymentTokenForMarket(market) {
  *
  * Entries are either:
  *   - soft failure counters: { fails: n }                       → NOT disabled
- *   - hard disabled:        { disabled:true, since, reason }    → disabled
+ *   - hard disabled:        { disabled:true, since, reason }    → disabled until TTL
  *   - legacy hard:          { since, reason }                   → disabled (old format)
  *   - legacy boolean:       true                                → disabled (doc format)
  *
  * A truthy entry alone must NEVER mean "disabled" — that is what made a single
  * { fails:1 } counter lock a direction permanently (re-enable could never fire).
  *
- * @param {*} entry value from `directionDisabled[key]`
- * @returns {boolean} true only for an explicit hard-disable
+ * A hard-disable is also NEVER permanent: after DIRECTION_DISABLE_TTL_MS the entry
+ * expires, the direction becomes selectable again, and a confirmed OPEN clears it
+ * via `_recordDirectionSuccess`. Without expiry a single bad stretch locked a
+ * direction forever (no success could ever be recorded to re-enable it).
  */
-export function isDirectionEntryDisabled(entry) {
+export const DIRECTION_DISABLE_TTL_MS = 6 * 60 * 60 * 1000;
+
+/**
+ * @param {*} entry value from `directionDisabled[key]`
+ * @param {number} [now]
+ * @returns {boolean} true only for an explicit, still-active hard-disable
+ */
+export function isDirectionEntryDisabled(entry, now = Date.now()) {
   if (entry === true) return true;
   if (!entry || typeof entry !== "object") return false;
-  return entry.disabled === true || entry.since !== undefined && entry.since !== null;
+  const hard = entry.disabled === true || entry.since !== undefined && entry.since !== null;
+  if (!hard) return false;
+  if (entry.since !== undefined && entry.since !== null && now - Number(entry.since) > DIRECTION_DISABLE_TTL_MS) {
+    return false;
+  }
+  return true;
 }
 
 export function supportsSide(market, side, runtimeDisabled = null) {

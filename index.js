@@ -524,10 +524,20 @@ async function closeManual() {
       dryRun: false,
     });
 
-    if (result?.failed) {
-      addLog("Position may no longer exist", "warn");
+    if (result?.pending) {
+      addLog(`Close TX ${result.txHash || ""} pending — keeping position in state`, "warn");
+    } else if (result?.failed) {
+      if (result.clearState === false) {
+        addLog(`Close blocked (${result.code || result.reason}) — keeping position in state`, "warn");
+      } else {
+        addLog("Position no longer exists", "warn");
+        autoTrader.state.activePosition = null;
+        autoTrader.state.sessionStats.closes++;
+      }
+    } else if (result?.closed === false) {
+      addLog(`Close not finished (${result.code || "still active"}) — keeping position in state`, "warn");
     } else if (result) {
-      addLog("Position CLOSED", "success");
+      addLog("Position CLOSED (verified on-chain)", "success");
       autoTrader.state.activePosition = null;
       autoTrader.state.sessionStats.closes++;
     }
@@ -561,6 +571,7 @@ async function startAutoTrading() {
     targetCollateralUSDT: config.targetCollateralUSDT || "10",
     targetCollateralWETH: config.targetCollateralWETH || "0.002",
     targetCollateralGeneric: config.targetCollateralGeneric || "10",
+    maxCollateralTargetShort: config.maxCollateralTargetShort || "10000",
     targetReserveUSDT: config.targetReserveUSDT || "20",
     targetReserveWETH: config.targetReserveWETH || "0.004",
     targetReserveGeneric: config.targetReserveGeneric || "20",

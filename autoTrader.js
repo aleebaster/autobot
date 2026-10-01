@@ -35,6 +35,44 @@ const BPS = 10000n;
 // bytes32 r (constant across successful opens), uint256 v, address paymentToken
 const OPEN_EXTRAS_R = "0x1fef349898a4b7d9f2092024bb4addeca01b5c4f708aac30a980544b3a70bac5";
 
+// On-chain custom error selectors — computed from the DEPLOYED source (never
+// guessed): MAMActionBase.sol / IMarginAccountManger.sol. They are used to
+// classify read-only close previews so a liquidity-blocked close is retried with
+// a partial close instead of clearing state.
+const ERR_INSUFFICIENT_LIQUIDITY = "0xf71ff020"; // MAM_InsufficientLiquidity()
+const ERR_CLOSE_AMOUNT_TOO_SMALL = "0x01556191"; // MAM_CloseAmountTooSmall()
+const ERR_INVALID_CLOSE_BPS      = "0xa782ca90"; // MAM_InvalidCloseBps()
+const ERR_INVALID_POSITION       = "0xa5732d32"; // MAM_InvalidPosition()
+// partialClose() rejects closeBps == 10000 (MAM_InvalidCloseBps) — a full close
+// only ever happens through closePosition().
+const MAX_PARTIAL_CLOSE_BPS = 9999n;
+const BPS_DENOM = 10000n;
+
+const CLOSE_VIEW_ABI = [
+  "function previewClosePosition(uint256 positionId, uint256 closeBps) view returns (tuple(uint256 repayAmount, uint256 collateralReduced, uint256 collateralReturned, uint256 protocolFee, uint256 costBasisReduced, int256 realizedPnl, uint256 closePrice, uint256 projectedHealthBps))",
+  "function positions(uint256) view returns (bool isLong, address user, address collateralToken, uint256 collateralAmount, uint256 debtAmount, uint256 currentDebt, bool active)",
+];
+const CLOSE_WRITE_ABI = [
+  "function closePosition(uint256 positionId, uint256 amountOutMin, uint256 deadline)",
+  "function partialClose(uint256 positionId, uint256 closeBps, uint256 amountOutMin, uint256 deadline)",
+];
+
+/**
+ * Extract the 4-byte custom-error selector from an ethers revert. Handles both
+ * the raw-string and the `{data}`-object shapes ethers v6 produces.
+ */
+function revertSelector(e) {
+  const grab = (v) => {
+    if (typeof v === "string" && v.startsWith("0x") && v.length >= 10) return v.slice(0, 10);
+    if (v && typeof v === "object" && typeof v.data === "string" && v.data.startsWith("0x")) return v.data.slice(0, 10);
+    return "";
+  };
+  const direct = grab(e?.data) || grab(e?.info?.error?.data) || grab(e?.cause?.data) || grab(e?.cause?.info?.error?.data);
+  if (direct) return direct;
+  const m = (e?.shortMessage || e?.message || "").match(/0x[0-9a-fA-F]{8}/);
+  return m ? m[0].toLowerCase() : "";
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  TX MANAGER — centralized nonce + serialization + retry
 //  All state-changing blockchain transactions MUST go through this manager
@@ -582,6 +620,180 @@ function applySlippage(amount, slippageBps = 50n) {
   return amount * (BPS - bps) / BPS;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  SHORT COLLATERAL SIZING — configured target ∩ measured pool minimum ∩ cap
+//  Read-only: view calls + pure BigInt maths. Never builds or sends a TX.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** One batch of view calls — every input the quote maths needs for one pool. */
+async function readPoolQuoteState(provider, { pool, manager }) {
+  const poolContract = new ethers.Contract(pool, POOL_ABI, provider);
+  const managerContract = new ethers.Contract(manager, MANAGER_ABI, provider);
+  const [reserves, totalSupply, token0, oraclePrice, swapFeeBps, availableLiquidity, ltvBps, protocolFeeBps] = await Promise.all([
+    poolContract.getReserves(),
+    poolContract.totalSupply(),
+    poolContract.token0(),
+    poolContract.getOraclePrice(),
+    poolContract.swapFeeBps(),
+    managerContract.getAvailableLiquidity(),
+    managerContract.LTV_BPS(),
+    managerContract.PROTOCOL_FEE_BPS().catch(() => 100n),
+  ]);
+  return {
+    reserve0: BigInt(reserves[0]),
+    reserve1: BigInt(reserves[1]),
+    totalSupply: BigInt(totalSupply),
+    token0: String(token0),
+    oraclePrice0: BigInt(oraclePrice[0]),
+    swapFeeBps: BigInt(swapFeeBps),
+    availableLiquidity: BigInt(availableLiquidity),
+    ltvBps: BigInt(ltvBps),
+    protocolFeeBps: BigInt(protocolFeeBps),
+  };
+}
+
+/**
+ * The EXACT quote chain (feeAdjusted → collateralAsLp → LTV/liquidity caps →
+ * lpBorrowToExpectedOut → applySlippage) evaluated on an already-read state.
+ * Same functions, same order, same 2% slippage as quoteLeveragedAmountOutMin(),
+ * so a size measured here cannot disagree with the precheck that follows it.
+ *
+ * @returns {{ok:true, borrowAmount:bigint, amountOutMin:bigint} | {ok:false, code:string, borrowAmount:bigint, amountOutMin:bigint}}
+ */
+function evaluateQuoteOnState(state, { collateralToken, collateralAmount, leverageX10 }) {
+  const lev = Number(leverageX10) / 10;
+  if (!Number.isFinite(lev) || lev <= 1) {
+    return { ok: false, code: "INVALID_LEVERAGE", borrowAmount: 0n, amountOutMin: 0n };
+  }
+  const noLiquidity = state.reserve0 === 0n || state.reserve1 === 0n || state.totalSupply === 0n || state.oraclePrice0 === 0n;
+  const effectiveCollateral = feeAdjusted(collateralAmount, state.protocolFeeBps);
+  const collateralLp = collateralAsLp({
+    collateralToken, collateralAmount: effectiveCollateral,
+    reserve0: state.reserve0, reserve1: state.reserve1, totalSupply: state.totalSupply,
+    token0: state.token0, oraclePrice0: state.oraclePrice0,
+  });
+  if (collateralLp === 0n) {
+    return { ok: false, code: noLiquidity ? "ZERO_LP" : "QUOTE_ZERO", borrowAmount: 0n, amountOutMin: 0n };
+  }
+  let lpBorrowAmount = collateralLp * BigInt(Math.floor(10000 * Math.max(0, lev - 1))) / BPS;
+  const maxByLtv = state.ltvBps >= BPS ? lpBorrowAmount : collateralLp * state.ltvBps / (BPS - state.ltvBps);
+  if (lpBorrowAmount > maxByLtv) lpBorrowAmount = maxByLtv;
+  if (lpBorrowAmount > state.availableLiquidity) lpBorrowAmount = state.availableLiquidity;
+  const amountOutMinRaw = lpBorrowToExpectedOut({
+    lpBorrowAmount, collateralToken,
+    reserve0: state.reserve0, reserve1: state.reserve1, totalSupply: state.totalSupply,
+    token0: state.token0, swapFeeBps: state.swapFeeBps,
+  });
+  const amountOutMinFinal = applySlippage(amountOutMinRaw, 200n);
+  if (lpBorrowAmount === 0n || amountOutMinRaw <= 0n || amountOutMinFinal <= 0n) {
+    return { ok: false, code: "ZERO_AMOUNT_OUT_MIN", borrowAmount: lpBorrowAmount, amountOutMin: amountOutMinFinal };
+  }
+  return { ok: true, borrowAmount: lpBorrowAmount, amountOutMin: amountOutMinFinal };
+}
+
+const POOL_MIN_SEARCH_MAX_STEPS = 512;
+const POOL_MIN_SEARCH_HARD_MAX = 10n ** 60n;
+
+/**
+ * Smallest raw collateral amount ONE pool can quote at all.
+ *
+ * Doubling ladder + binary refinement over evaluateQuoteOnState() — pure BigInt
+ * maths on a single state snapshot, so the whole search costs one batch of view
+ * calls. The dust window of a pool spans many octaves, so the ladder lands inside
+ * it; if it somehow does not, we return POOL_MIN_NOT_FOUND and the caller falls
+ * back to the configured target (never an inflated amount).
+ *
+ * @returns {Promise<{amount: bigint|null, code: string|null, state: object}>}
+ */
+async function measureMinCollateralForPool(provider, { pool, manager, collateralToken, leverageX10 }) {
+  let state;
+  try {
+    state = await readPoolQuoteState(provider, { pool, manager });
+  } catch (e) {
+    return { amount: null, code: "POOL_STATE_READ_ERROR", state: null, error: e?.message || String(e) };
+  }
+  const ev = (amount) => evaluateQuoteOnState(state, { collateralToken, collateralAmount: amount, leverageX10 });
+  let steps = 0;
+  let lastBad = 0n;
+  let found = null;
+  for (let x = 1n; x <= POOL_MIN_SEARCH_HARD_MAX; x *= 2n) {
+    if (++steps > POOL_MIN_SEARCH_MAX_STEPS) break;
+    if (ev(x).ok) { found = x; break; }
+    lastBad = x;
+  }
+  if (found === null) return { amount: null, code: "POOL_MIN_NOT_FOUND", state };
+  let lo = lastBad + 1n;
+  let hi = found;
+  while (lo < hi) {
+    if (++steps > POOL_MIN_SEARCH_MAX_STEPS) break;
+    const mid = (lo + hi) / 2n;
+    if (mid < lo) break;
+    if (ev(mid).ok) hi = mid;
+    else lo = mid + 1n;
+  }
+  return { amount: lo, code: null, state };
+}
+
+/**
+ * SHORT-only collateral sizing.
+ *
+ *   collateralAmount = max(configuredTarget, measuredPoolMinimum)
+ *   collateralAmount <= cap  (config.maxCollateralTargetShort, same decimals)
+ *
+ * A pool whose measured minimum sits above the cap is NEVER inflated — it is
+ * rejected with the machine-readable code POOL_MIN_EXCEEDS_CAP so the caller
+ * skips that candidate. LONG never calls this function.
+ *
+ * Measurement failures do not inflate either: `fallbackToConfigured` tells the
+ * caller to keep the configured target and let the unchanged precheck report
+ * QUOTE_ZERO / ZERO_AMOUNT_OUT_MIN for it.
+ *
+ * @returns {Promise<{ok:true, amount:bigint, configured:bigint, poolMin:bigint, cap:bigint} |
+ *                   {ok:false, code:string, reason:string, poolMin:bigint|null, cap:bigint|null, configured:bigint, fallbackToConfigured?:boolean}>}
+ */
+export async function resolveShortCollateralAmount(provider, { pool, manager, collateralToken, configuredRaw, capRaw, leverageX10 }) {
+  const input = { pool, manager, collateralToken, configuredRaw, capRaw };
+  for (const [k, v] of Object.entries(input)) {
+    if (v === null || v === undefined || v === "") {
+      return { ok: false, code: "SIZING_INPUT_MISSING", reason: `SIZING_INPUT_MISSING: ${k} required for SHORT sizing`, poolMin: null, cap: null, configured: configuredRaw ?? 0n };
+    }
+  }
+  if (!(configuredRaw > 0n)) {
+    return { ok: false, code: "INVALID_COLLATERAL_TARGET", reason: `INVALID_COLLATERAL_TARGET: configured=${configuredRaw}`, poolMin: null, cap: capRaw, configured: configuredRaw };
+  }
+  if (!(capRaw > 0n)) {
+    return { ok: false, code: "INVALID_COLLATERAL_CAP", reason: `INVALID_COLLATERAL_CAP: maxCollateralTargetShort=${capRaw}`, poolMin: null, cap: capRaw, configured: configuredRaw };
+  }
+
+  const measured = await measureMinCollateralForPool(provider, { pool, manager, collateralToken, leverageX10 });
+  if (measured.amount === null) {
+    return {
+      ok: false, code: measured.code || "POOL_MIN_NOT_FOUND",
+      reason: `${measured.code || "POOL_MIN_NOT_FOUND"}: could not measure pool minimum for pool=${pool}`,
+      poolMin: null, cap: capRaw, configured: configuredRaw, fallbackToConfigured: true,
+    };
+  }
+
+  const poolMin = measured.amount;
+  if (poolMin > capRaw) {
+    return {
+      ok: false, code: "POOL_MIN_EXCEEDS_CAP",
+      reason: `POOL_MIN_EXCEEDS_CAP: poolMinimum=${poolMin} > maxCollateralTargetShort=${capRaw} (configured=${configuredRaw})`,
+      poolMin, cap: capRaw, configured: configuredRaw,
+    };
+  }
+
+  const amount = poolMin > configuredRaw ? poolMin : configuredRaw;
+  if (amount > capRaw) {
+    return {
+      ok: false, code: "COLLATERAL_EXCEEDS_CAP",
+      reason: `COLLATERAL_EXCEEDS_CAP: configured=${configuredRaw} > maxCollateralTargetShort=${capRaw}`,
+      poolMin, cap: capRaw, configured: configuredRaw,
+    };
+  }
+  return { ok: true, amount, configured: configuredRaw, poolMin, cap: capRaw };
+}
+
 async function getFeeParams(provider) {
   try {
     const feeData = await provider.getFeeData();
@@ -668,6 +880,10 @@ const DEFAULT_AUTO_CONFIG = {
   targetCollateralUSDT: "10",
   targetCollateralWETH: "0.002",
   targetCollateralGeneric: "10",
+  // SHORT-only ceiling, in THIS candidate's collateral token decimals.
+  // SHORT sizing = max(configuredTarget, measuredPoolMinimum), but never above this:
+  // a pool whose minimum is higher is SKIPPED (never inflated) with POOL_MIN_EXCEEDS_CAP.
+  maxCollateralTargetShort: "10000",
   // Inventory targets — when collateral balance < targetReserve, SWAP from other tokens
   // This triggers inventory-aware rebalancing, not just critical deficit swaps
   targetReserveUSDT: "20",
@@ -680,6 +896,9 @@ const DEFAULT_AUTO_CONFIG = {
   cooldownAfterCloseMs: 30_000,
   maxRetries: 3,
   retryDelayMs: 5000,
+  // How many partialClose TXs a single close attempt may send before giving up
+  // (the position is then KEPT in state — never cleared).
+  maxPartialCloseAttempts: 3,
   dryRun: false,
   ethGuard: { ...DEFAULT_ETH_GUARD },
   availableMarkets: [],
@@ -1251,6 +1470,7 @@ async function executeSwap({ wallet, provider, fromToken, toToken, amount, amoun
 
   const allowance = await fromContract.allowance(walletAddr, routerAddr);
   log(`[SWAP-DEBUG] executeSwap: from=${fromSym} to=${toMeta.symbol} amount=${ethers.formatUnits(amount, srcDecimals)} allowance=${ethers.formatUnits(allowance, srcDecimals)}`, "info");
+  let approveTxHash = null;
   if (allowance < amount) {
     log(`[SWAP] Approve ${fromSym} → Router...`, "info");
     if (txManager) {
@@ -1260,8 +1480,10 @@ async function executeSwap({ wallet, provider, fromToken, toToken, amount, amoun
         log,
       });
       if (r.status === 0) { log(`[SWAP] Approve REVERTED`, "error"); return false; }
+      approveTxHash = r.hash || null;
     } else {
       const approveTx = await fromContract.approve(routerAddr, ethers.MaxUint256, { gasLimit: 100000n });
+      approveTxHash = approveTx.hash;
       await approveTx.wait();
     }
     log(`[SWAP] Approved`, "success");
@@ -1295,9 +1517,9 @@ async function executeSwap({ wallet, provider, fromToken, toToken, amount, amoun
       log,
     });
     if (!r || r.status === 0) { log(`[SWAP] TX FAILED`, "error"); return false; }
-    if (r.pending) { log(`[SWAP] TX pending — will confirm later`, "warn"); return true; }
+    if (r.pending) { log(`[SWAP] TX pending — will confirm later`, "warn"); return { ok: true, pending: true, txHash: r.hash || null, approveTxHash }; }
     log(`[SWAP] SUCCESS gas=${r.receipt.gasUsed}`, "success");
-    return true;
+    return { ok: true, txHash: r.hash, blockNumber: r.receipt?.blockNumber ?? null, approveTxHash, path };
   } else {
     log(`[SWAP] TX_SENT`, "warn");
     const swapTx = await router.swapExactTokensForTokens(amount, amountOutMin, path, walletAddr, deadline, { gasLimit });
@@ -1305,8 +1527,31 @@ async function executeSwap({ wallet, provider, fromToken, toToken, amount, amoun
     const receipt = await swapTx.wait();
     if (receipt.status !== 1) { log(`[SWAP] TX FAILED (status=0)`, "error"); return false; }
     log(`[SWAP] SUCCESS gas=${receipt.gasUsed}`, "success");
-    return true;
+    return { ok: true, txHash: swapTx.hash, blockNumber: receipt.blockNumber, approveTxHash, path };
   }
+}
+
+/**
+ * POST-SWAP ON-CHAIN VERIFICATION (read-only).
+ *
+ * A mined TX only proves the router was called; the wallet's balances prove the
+ * swap actually moved value in the requested direction. Works identically for
+ * A→B and B→A — nothing here is direction-specific.
+ *
+ * @returns {Promise<{ok:boolean, inDelta:bigint, outDelta:bigint}>}
+ */
+async function verifySwapBalances({ provider, walletAddr, pair, beforeFrom, beforeTo, amountIn, amountOutMin, log = () => {} }) {
+  const afterFrom = await new ethers.Contract(pair.fromAddr, ERC20_ABI, provider).balanceOf(walletAddr);
+  const afterTo = await new ethers.Contract(pair.toAddr, ERC20_ABI, provider).balanceOf(walletAddr);
+  const inDelta = beforeFrom - afterFrom;
+  const outDelta = afterTo - beforeTo;
+  const minOk = amountOutMin === null || amountOutMin === undefined ? true : outDelta >= amountOutMin;
+  const ok = inDelta > 0n && outDelta > 0n && minOk;
+  log(
+    `[VERIFY-SWAP] ${pair.from}→${pair.to} inDelta=${inDelta} (amountIn=${amountIn}) outDelta=${outDelta} (amountOutMin=${amountOutMin}) => ${ok ? "PASS" : "FAIL"}`,
+    ok ? "success" : "error",
+  );
+  return { ok, inDelta, outDelta, afterFrom, afterTo };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1340,11 +1585,17 @@ async function openPosition({ wallet, provider, managerAddr, poolAddr, side, col
   }
 
   // STEP 1: Oracle checkpoint (fixes 0x56e7f09d)
-  try {
-    await ensureOracleReady(wallet, poolAddr, side, provider, log, txManager);
-  } catch (e) {
-    log(`[BLOCKED] Oracle checkpoint failed: ${e.message?.slice(0, 80)}`, "error");
-    return null;
+  // Read-only mode must never send a TX: checkpointOracle() is a real transaction,
+  // so it is skipped entirely when dryRun is on (the quote below still runs).
+  if (dryRun) {
+    log(`[DRY] skipping oracle checkpoint TX (read-only mode)`, "info");
+  } else {
+    try {
+      await ensureOracleReady(wallet, poolAddr, side, provider, log, txManager);
+    } catch (e) {
+      log(`[BLOCKED] Oracle checkpoint failed: ${e.message?.slice(0, 80)}`, "error");
+      return null;
+    }
   }
 
   // STEP 2: Quote — compute borrowAmount + amountOutMin
@@ -1545,12 +1796,276 @@ async function openPosition({ wallet, provider, managerAddr, poolAddr, side, col
   }
 
   log(`[OPEN] Position ID: ${positionId}`, "success");
-  return { txHash, positionId, gasUsed: receipt.gasUsed, blockNumber: receipt.blockNumber };
+
+  // POST-OPEN ON-CHAIN VERIFICATION (read-only): the receipt says the TX mined,
+  // but only `positions(positionId)` proves WHO opened WHAT, with WHICH collateral.
+  const verify = await verifyOpenedPosition(provider, managerAddr, positionId, walletAddr, {
+    side, collateralToken, collateralAmount, log,
+  });
+  if (!verify.ok) {
+    log(`[VERIFY] OPEN #${positionId} MISMATCH — ${verify.reason} (position stays tracked so it can be closed)`, "error");
+  }
+
+  return { txHash, positionId, gasUsed: receipt.gasUsed, blockNumber: receipt.blockNumber, verify };
+}
+
+/**
+ * Read-only post-OPEN proof: `positions(positionId)` on the manager that actually
+ * executed the TX. Checks owner, direction, collateral token and collateral size
+ * against what THIS open requested — never against a hardcoded market.
+ */
+async function verifyOpenedPosition(provider, managerAddr, positionId, walletAddr, { side, collateralToken, collateralAmount, log = () => {} }) {
+  let pos = null;
+  try {
+    const mgr = new ethers.Contract(managerAddr, CLOSE_VIEW_ABI, provider);
+    pos = await mgr.positions(positionId);
+  } catch (e) {
+    return { ok: false, reason: `cannot read positions(${positionId}) (${e.message?.slice(0, 60)})`, pos: null };
+  }
+  if (!pos) return { ok: false, reason: `positions(${positionId}) returned nothing`, pos: null };
+
+  const eq = (a, b) => String(a || "").toLowerCase() === String(b || "").toLowerCase();
+  const expectLong = side === "LONG";
+  const checks = [
+    ["owner", eq(pos.user, walletAddr), `${pos.user}`],
+    ["isLong", pos.isLong === expectLong, `${pos.isLong} (expected ${expectLong})`],
+    ["collateralToken", eq(pos.collateralToken, collateralToken), `${pos.collateralToken}`],
+    ["active", pos.active === true, `${pos.active}`],
+    ["collateralAmount>0", pos.collateralAmount > 0n, `${pos.collateralAmount}`],
+  ];
+  const failed = checks.filter(([, ok]) => !ok);
+  // Size is reported but a 0-difference is not required for the position to be
+  // usable — the token/owner/direction checks are the hard ones.
+  const sizeMatch = pos.collateralAmount === BigInt(collateralAmount ?? -1n);
+
+  log(`[VERIFY] OPEN #${positionId} on-chain: isLong=${pos.isLong} user=${short(pos.user)} coll=${short(pos.collateralToken)} amount=${pos.collateralAmount} expected=${collateralAmount} active=${pos.active} sizeMatch=${sizeMatch}`, failed.length ? "error" : "success");
+  for (const [name, ok, got] of failed) log(`[VERIFY] OPEN #${positionId} check ${name} FAILED: got ${got}`, "error");
+
+  return {
+    ok: failed.length === 0,
+    sizeMatch,
+    pos: {
+      isLong: pos.isLong, user: pos.user, collateralToken: pos.collateralToken,
+      collateralAmount: pos.collateralAmount, debtAmount: pos.debtAmount,
+      currentDebt: pos.currentDebt, active: pos.active,
+    },
+    reason: failed.length ? `failed checks: ${failed.map(([n]) => n).join(",")}` : null,
+  };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  CLOSE POSITION
+//  CLOSE POSITION — full close first, then read-only closeBps search + partialClose
 // ═══════════════════════════════════════════════════════════════════════════
+
+/** Read-only `positions(positionId)` snapshot; null when unreadable. */
+async function readOnChainPosition(provider, managerAddr, positionId) {
+  try {
+    const mgr = new ethers.Contract(managerAddr, CLOSE_VIEW_ABI, provider);
+    const p = await mgr.positions(positionId);
+    return {
+      isLong: p.isLong, user: p.user, collateralToken: p.collateralToken,
+      collateralAmount: p.collateralAmount, debtAmount: p.debtAmount,
+      currentDebt: p.currentDebt, active: p.active,
+    };
+  } catch (e) {
+    return null;
+  }
+}
+
+/** True only when the manager itself says the position is no longer active. */
+function positionIsClosed(pos) {
+  return !!pos && pos.active === false;
+}
+
+/** Read-only `previewClosePosition(positionId, closeBps)`. Never sends a TX. */
+async function previewCloseAt(provider, managerAddr, positionId, bps) {
+  try {
+    const mgr = new ethers.Contract(managerAddr, CLOSE_VIEW_ABI, provider);
+    const r = await mgr.previewClosePosition(positionId, bps);
+    return { ok: true, quote: r };
+  } catch (e) {
+    return { ok: false, err: revertSelector(e) };
+  }
+}
+
+/**
+ * Largest `closeBps` that `previewClosePosition` accepts — pure view calls.
+ *
+ * The predicate is NOT globally monotone: too small a close reverts with
+ * MAM_CloseAmountTooSmall / MAM_InsufficientLiquidity, the middle band passes,
+ * and too large a close reverts with MAM_InsufficientLiquidity again
+ * (`_getAmountOut` is integer-quantised inside `_simulateAddLiquidity`), so a
+ * single binary search would land outside the window. Strategy: descending
+ * ladder to bracket a passing seed with the failing sample directly above it,
+ * then binary refinement inside that bracket, then a final verifying view call.
+ *
+ * @returns {Promise<{ok:true, closeBps:bigint, quote:object, probes:number} |
+ *                    {ok:false, code:string, probes:number}>}
+ */
+async function findMaxCloseBps(provider, managerAddr, positionId, { log = () => {}, maxProbes = 48 } = {}) {
+  const LADDER = [
+    9999n, 9750n, 9500n, 9250n, 9000n, 8750n, 8500n, 8000n, 7500n, 7000n,
+    6000n, 5000n, 4000n, 3000n, 2000n, 1500n, 1000n, 750n, 500n, 250n, 100n,
+    50n, 20n, 10n, 5n, 2n, 1n,
+  ];
+  let probes = 0;
+  const probe = async (bps) => {
+    if (probes >= maxProbes) return { ok: false, err: "PROBE_LIMIT" };
+    probes++;
+    return previewCloseAt(provider, managerAddr, positionId, bps);
+  };
+
+  let seed = null;
+  let upperFail = null; // first (higher) ladder sample that failed
+  let lastErr = null;
+  for (const bps of LADDER) {
+    const r = await probe(bps);
+    if (r.ok) { seed = bps; break; }
+    lastErr = r.err;
+    if (r.err === "PROBE_LIMIT") return { ok: false, code: "PROBE_LIMIT", probes };
+    upperFail = bps;
+  }
+  if (seed === null) {
+    return { ok: false, code: lastErr === ERR_CLOSE_AMOUNT_TOO_SMALL ? "CLOSE_AMOUNT_TOO_SMALL" : "CLOSE_BPS_NOT_FOUND", probes, lastErr };
+  }
+
+  // Bracket: lo passes, hi (if any) fails — refine to the highest passing bps.
+  let lo = seed;
+  let hi = upperFail; // null when even 9999 passes
+  while (hi !== null && lo + 1n < hi) {
+    if (probes >= maxProbes) break;
+    const mid = (lo + hi + 1n) / 2n;
+    const r = await probe(mid);
+    if (r.ok) lo = mid; else hi = mid;
+  }
+
+  const final = await probe(lo);
+  if (!final.ok) return { ok: false, code: "CLOSE_BPS_VERIFY_FAILED", probes, lastErr: final.err };
+
+  log(`[CLOSE] closeBps window: seed=${seed} upperFail=${upperFail ?? "n/a"} → chosen=${lo} (probes=${probes})`, "info");
+  return { ok: true, closeBps: lo, quote: final.quote, probes };
+}
+
+/**
+ * Fallback for a full close blocked by MAM_InsufficientLiquidity:
+ * read-only search for the maximum feasible closeBps, then partialClose().
+ *
+ * Never guesses a closeBps, never sends amountOutMin=0, and never clears state —
+ * a position that is still active afterwards is reported as such so the caller
+ * keeps tracking it. Rounds are capped by config.maxPartialCloseAttempts.
+ */
+async function attemptPartialClose({ wallet, provider, managerAddr, positionId, config, log, txManager }) {
+  const walletAddr = wallet.address;
+  const maxRounds = Math.max(1, Number(config.maxPartialCloseAttempts || 3));
+  const slippageBps = BigInt(config.slippageBps || 50);
+  const iface = new ethers.Interface(CLOSE_WRITE_ABI);
+  let last = null;
+
+  for (let round = 1; round <= maxRounds; round++) {
+    const before = await readOnChainPosition(provider, managerAddr, positionId);
+    if (!before) {
+      log(`[CLOSE] positions(${positionId}) unreadable — cannot verify, keeping state`, "error");
+      return { failed: true, clearState: false, code: "POSITION_UNREADABLE", reason: `positions(${positionId}) unreadable` };
+    }
+    if (positionIsClosed(before)) {
+      log(`[VERIFY] position #${positionId} already closed on-chain`, "success");
+      return { ok: true, closed: true, partial: true, rounds: round - 1, verified: true, onChain: before };
+    }
+
+    log(`[CLOSE] round ${round}/${maxRounds} #${positionId}: collateral=${before.collateralAmount} debt=${before.currentDebt} — searching closeBps (read-only)`, "warn");
+    const found = await findMaxCloseBps(provider, managerAddr, positionId, { log });
+    if (!found.ok) {
+      log(`[BLOCKED] closeBps search failed (${found.code}) — keeping state, NOT clearing`, "error");
+      return { failed: true, clearState: false, code: found.code, reason: `closeBps search failed: ${found.code}` };
+    }
+
+    const closeBps = found.closeBps;
+    const quote = found.quote;
+    const amountOut = quote.collateralReturned;
+    const amountOutMin = (amountOut * (BPS_DENOM - slippageBps)) / BPS_DENOM;
+    if (!(amountOutMin > 0n)) {
+      log(`[BLOCKED] partial close quote returned zero collateral (amountOutMin=0) — keeping state`, "error");
+      return { failed: true, clearState: false, code: "ZERO_AMOUNT_OUT_MIN", reason: "partial close quote returned zero collateral" };
+    }
+
+    log(`[CLOSE] partialClose closeBps=${closeBps} amountOut=${amountOut} amountOutMin=${amountOutMin} repay=${quote.repayAmount} fee=${quote.protocolFee} realizedPnl=${quote.realizedPnl} (probes=${found.probes})`, "info");
+
+    const deadline = Math.floor(Date.now() / 1000) + config.deadlineSeconds;
+    const calldata = iface.encodeFunctionData("partialClose", [positionId, closeBps, amountOutMin, BigInt(deadline)]);
+
+    // Selector sanity: partialClose(uint256,uint256,uint256,uint256) = 0xdc439ba7
+    if (calldata.slice(0, 10) !== "0xdc439ba7") {
+      log(`[BLOCKED] unexpected partialClose selector ${calldata.slice(0, 10)} — refusing to send`, "error");
+      return { failed: true, clearState: false, code: "BAD_PARTIAL_SELECTOR", reason: calldata.slice(0, 10) };
+    }
+
+    try {
+      await provider.call({ from: walletAddr, to: managerAddr, data: calldata, value: 0n });
+      log(`[CLOSE] partialClose pre-flight OK`, "info");
+    } catch (e) {
+      const sel = revertSelector(e);
+      log(`[BLOCKED] partialClose pre-flight REVERTED ${sel || e.message?.slice(0, 60)} — keeping state`, "error");
+      return { failed: true, clearState: false, code: `PARTIAL_PREFLIGHT_${sel || "UNKNOWN"}`, reason: `partialClose pre-flight revert ${sel}` };
+    }
+
+    let gasEstimate;
+    try {
+      gasEstimate = await provider.estimateGas({ from: walletAddr, to: managerAddr, data: calldata, value: 0n });
+    } catch (e) {
+      log(`[BLOCKED] partialClose gas estimation FAILED`, "error");
+      return null;
+    }
+
+    const gasLimit = gasEstimate + gasEstimate / 5n;
+    let txHash, receipt;
+    if (txManager) {
+      const r = await txManager.sendAndWait({
+        wallet, provider, txType: "PARTIAL-CLOSE",
+        sendFn: (nonce) => wallet.sendTransaction({ to: managerAddr, data: calldata, value: 0n, gasLimit, nonce }),
+        log,
+      });
+      if (!r || r.status === 0) { log(`[BLOCKED] partialClose TX FAILED`, "error"); return null; }
+      if (r.pending) {
+        log(`[CLOSE] partialClose TX pending — will confirm later`, "warn");
+        return { txHash: r.hash, gasUsed: 0n, blockNumber: null, pending: true, partial: true, closeBps, clearState: false };
+      }
+      txHash = r.hash;
+      receipt = r.receipt;
+    } else {
+      log(`[CLOSE] Sending partialClose(closeBps=${closeBps}) TX...`, "warn");
+      const tx = await wallet.sendTransaction({ to: managerAddr, data: calldata, value: 0n, gasLimit });
+      txHash = tx.hash;
+      log(`[CLOSE] TX: ${tx.hash}`, "info");
+      receipt = await tx.wait();
+      if (receipt.status !== 1) { log(`[BLOCKED] partialClose TX FAILED (status=0)`, "error"); return null; }
+    }
+
+    last = { round, closeBps, amountOut, amountOutMin, txHash };
+    log(`[CLOSE] partialClose round ${round} SUCCESS gas=${receipt.gasUsed} tx=${txHash}`, "success");
+
+    const after = await readOnChainPosition(provider, managerAddr, positionId);
+    if (!after) {
+      log(`[CLOSE] post-TX positions(${positionId}) unreadable — keeping state`, "error");
+      return { failed: true, clearState: false, code: "VERIFY_READ_FAILED", txHash, partial: true, reason: "post-close read failed" };
+    }
+    if (positionIsClosed(after)) {
+      log(`[VERIFY] position #${positionId} CLOSED on-chain after ${round} partial close(s)`, "success");
+      return {
+        ok: true, closed: true, partial: true, rounds: round, verified: true,
+        txHash, gasUsed: receipt.gasUsed, blockNumber: receipt.blockNumber,
+        closeBps, amountOut, onChain: after,
+      };
+    }
+    log(`[VERIFY] position #${positionId} STILL ACTIVE after partial close: collateral=${after.collateralAmount} debt=${after.currentDebt} (round ${round}/${maxRounds})`, "warn");
+    last.residual = { collateralAmount: String(after.collateralAmount), currentDebt: String(after.currentDebt) };
+  }
+
+  log(`[BLOCKED] position #${positionId} still active after ${maxRounds} partial close round(s) — keeping state (NOT clearing)`, "error");
+  return {
+    failed: true, clearState: false, code: "PARTIAL_CLOSE_LIMIT", partial: true,
+    reason: `position still active after ${maxRounds} partial close round(s)`, last,
+  };
+}
 
 async function closePositionFn({ wallet, provider, managerAddr, positionId, config, log, dryRun, txManager }) {
   const walletAddr = wallet.address;
@@ -1570,17 +2085,21 @@ async function closePositionFn({ wallet, provider, managerAddr, positionId, conf
     await provider.call({ from: walletAddr, to: managerAddr, data: calldata, value: 0n });
     log(`[CLOSE] Pre-flight OK`, "info");
   } catch (e) {
-    const closeErrData = e?.data || e?.info?.error?.data || e?.cause?.data || e?.cause?.info?.error?.data || null;
-    const closeErrMatch = (e?.shortMessage || e?.message || "").match(/0x[0-9a-fA-F]{8,}/);
-    const closeRawErr = closeErrData || closeErrMatch?.[0] || "";
-    // MAM_InvalidPosition (0xa5732d32) — zombie position (zeroed collateral/debt)
-    if (closeRawErr.startsWith("0xa5732d32")) {
+    const sel = revertSelector(e);
+    // MAM_InvalidPosition (0xa5732d32) — the position really does not exist
+    if (sel === ERR_INVALID_POSITION) {
       log(`[CLOSE] MAM_InvalidPosition — zombie position detected, clearing state`, "warn");
-      return { failed: true, reason: "zombie" };
+      return { failed: true, clearState: true, reason: "zombie" };
     }
-    log(`[BLOCKED] Close pre-flight REVERTED: ${e.message?.slice(0, 80)}`, "error");
-    log(`[WARN] Position may no longer exist — clearing state`, "warn");
-    return { failed: true, reason: e.message?.slice(0, 60) };
+    // MAM_InsufficientLiquidity (0xf71ff020) — position EXISTS, it is just not
+    // fully closable right now. Never clear state: search a feasible closeBps
+    // read-only and fall back to partialClose.
+    if (sel === ERR_INSUFFICIENT_LIQUIDITY) {
+      log(`[CLOSE] MAM_InsufficientLiquidity on full close — read-only closeBps search + partialClose fallback`, "warn");
+      return attemptPartialClose({ wallet, provider, managerAddr, positionId, config, log, txManager });
+    }
+    log(`[BLOCKED] Close pre-flight REVERTED ${sel || e.message?.slice(0, 60)} — position KEPT (not clearing state)`, "error");
+    return { failed: true, clearState: false, code: `CLOSE_PREFLIGHT_${sel || "UNKNOWN"}`, reason: `pre-flight revert ${sel || e.message?.slice(0, 40)}` };
   }
 
   let gasEstimate;
@@ -1602,7 +2121,7 @@ async function closePositionFn({ wallet, provider, managerAddr, positionId, conf
     if (!r || r.status === 0) { log(`[BLOCKED] Close TX FAILED`, "error"); return null; }
     if (r.pending) {
       log(`[CLOSE] TX pending — will confirm later`, "warn");
-      return { txHash: r.hash, gasUsed: 0n, blockNumber: null, pending: true };
+      return { txHash: r.hash, gasUsed: 0n, blockNumber: null, pending: true, clearState: false };
     }
     txHash = r.hash;
     receipt = r.receipt;
@@ -1616,7 +2135,23 @@ async function closePositionFn({ wallet, provider, managerAddr, positionId, conf
   }
 
   log(`[CLOSE] SUCCESS gas=${receipt.gasUsed}`, "success");
-  return { txHash, gasUsed: receipt.gasUsed, blockNumber: receipt.blockNumber };
+
+  // POST-CLOSE ON-CHAIN VERIFICATION — a mined TX is not proof of a closed
+  // position; only positions(positionId).active === false is.
+  const after = await readOnChainPosition(provider, managerAddr, positionId);
+  if (!after) {
+    log(`[VERIFY] post-close positions(${positionId}) unreadable — keeping state, will re-verify`, "error");
+    return { failed: true, clearState: false, code: "VERIFY_READ_FAILED", txHash, gasUsed: receipt.gasUsed, blockNumber: receipt.blockNumber, reason: "post-close read failed" };
+  }
+  if (!positionIsClosed(after)) {
+    log(`[VERIFY] CLOSE TX mined but position #${positionId} STILL ACTIVE (collateral=${after.collateralAmount} debt=${after.currentDebt}) — keeping state`, "error");
+    return { failed: true, clearState: false, closed: false, code: "STILL_ACTIVE", txHash, gasUsed: receipt.gasUsed, blockNumber: receipt.blockNumber, onChain: after, reason: "position still active after close TX" };
+  }
+  log(`[VERIFY] position #${positionId} CLOSED on-chain (active=false) gas=${receipt.gasUsed}`, "success");
+  return {
+    ok: true, closed: true, verified: true, onChain: after,
+    txHash, gasUsed: receipt.gasUsed, blockNumber: receipt.blockNumber,
+  };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1728,12 +2263,15 @@ export class AutoTrader {
   _disableDirection(marketSymbol, side, reason = "") {
     const key = this._directionKey(marketSymbol, side);
     const prev = this.directionDisabled[key];
-    if (prev && typeof prev === "object" && prev.disabled === true) return;
+    if (isDirectionEntryDisabled(prev)) return;
+    // An expired hard-disable must be re-armed with a FRESH `since`, otherwise the
+    // stale timestamp keeps it expired and the kill-switch can never fire again.
+    const expiredHard = prev && typeof prev === "object" && (prev.disabled === true || prev.since != null);
     this.directionDisabled[key] = {
-      ...(prev && typeof prev === "object" ? prev : {}),
+      ...(prev && typeof prev === "object" && !expiredHard ? prev : {}),
       disabled: true,
-      since: (prev && prev.since) ?? Date.now(),
-      reason: reason || (prev && prev.reason) || "",
+      since: Date.now(),
+      reason: reason || "",
     };
     this.state.directionDisabled = this.directionDisabled;
     saveState(this.state);
@@ -1747,9 +2285,12 @@ export class AutoTrader {
   _recordDirectionFailure(marketSymbol, side) {
     const key = this._directionKey(marketSymbol, side);
     const prev = this.directionDisabled[key];
-    if (prev && typeof prev === "object" && prev.disabled === true) return;
+    if (isDirectionEntryDisabled(prev)) return;
 
-    const entry = { ...(prev && typeof prev === "object" ? prev : {}), disabled: false };
+    // Expired hard-disable → start a fresh attempt window instead of inheriting
+    // the old counter/`since` (which would keep the entry expired forever).
+    const expiredHard = prev && typeof prev === "object" && (prev.disabled === true || prev.since != null);
+    const entry = expiredHard ? {} : { ...(prev && typeof prev === "object" ? prev : {}), disabled: false };
     entry.fails = Number(entry.fails || 0) + 1;
     const maxFails = Number(this.config.maxDirectionFailures || 2);
 
@@ -1759,6 +2300,8 @@ export class AutoTrader {
       entry.reason = `${entry.fails} consecutive preflight/open failures`;
       this.log(`[DISCOVERY] DISABLED ${key} — ${entry.reason}`, "warn");
     } else {
+      entry.disabled = false;
+      entry.since = null;
       this.log(`[DISCOVERY] direction ${key} failure ${entry.fails}/${maxFails} — still selectable`, "warn");
     }
 
@@ -1866,18 +2409,73 @@ export class AutoTrader {
 
   /**
    * Plan one (or more) market candidates for a side — used by prepareAndOpen fallback.
+   *
+   * SHORT candidates are pre-filtered by the SAME sizing rule `_candidateContext`
+   * applies (pool minimum <= maxCollateralTargetShort). A candidate that would
+   * deterministically return null there is dead on arrival, so it is dropped here
+   * WITHOUT consuming one of the `max` open attempts. Previously the LRU pick could
+   * hand back 3 consecutive unusable pools and the cycle ended with
+   * `[BLOCKED] Open failed on all candidate markets` even though other eligible
+   * SHORT markets could quote. Measurement is read-only (one batched view call per
+   * probe) and never inflates, never approves, never sends.
    */
   async planMarketsForSide(side, { max = 3 } = {}) {
     await this.ensureMarkets();
     const out = [];
     let exclude = [];
-    for (let i = 0; i < max; i++) {
+    if (side !== "SHORT") {
+      for (let i = 0; i < max; i++) {
+        const m = this.resolveMarket(side, { excludeSymbols: exclude });
+        if (!m) break;
+        out.push(m);
+        exclude.push(m.symbol);
+      }
+      return out;
+    }
+
+    const { provider } = this.getRuntime();
+    const hardProbes = Math.max(Number(max) * 8, 40);
+    let probes = 0;
+    while (out.length < max) {
       const m = this.resolveMarket(side, { excludeSymbols: exclude });
       if (!m) break;
-      out.push(m);
       exclude.push(m.symbol);
+      if (++probes > hardProbes) { out.push(m); continue; }
+      if (await this._shortSizingViable(m, provider)) { out.push(m); continue; }
+      this.log(`[PLAN] ${m.symbol} SHORT dropped before attempts — pool minimum exceeds maxCollateralTargetShort (measured read-only)`, "info");
     }
     return out;
+  }
+
+  /**
+   * Read-only SHORT sizing gate. Returns true when `_candidateContext()` would be
+   * able to build a context for this candidate (ok, or measurement failure which
+   * falls back to the configured target). Only a hard `POOL_MIN_EXCEEDS_CAP` /
+   * `COLLATERAL_EXCEEDS_CAP` is rejected. Any error ⇒ true (never block on a probe).
+   */
+  async _shortSizingViable(candidate, provider) {
+    try {
+      const poolAddr = candidate?.poolAddr || null;
+      const managerAddr = candidate?.managerAddr || null;
+      const collateralToken = candidate?.collateralToken || null;
+      const decimals = candidate?.decimals;
+      if (!poolAddr || !managerAddr || !collateralToken || !Number.isFinite(Number(decimals)) || Number(decimals) <= 0) return true;
+      const capStr = String(this.config.maxCollateralTargetShort || DEFAULT_AUTO_CONFIG.maxCollateralTargetShort);
+      let capRaw, configuredRaw;
+      try {
+        capRaw = ethers.parseUnits(capStr, decimals);
+        configuredRaw = ethers.parseUnits(collateralTargetStr(this.config, collateralToken), decimals);
+      } catch { return true; }
+      if (!(capRaw > 0n) || !(configuredRaw > 0n)) return true;
+      const s = await resolveShortCollateralAmount(provider, {
+        pool: poolAddr, manager: managerAddr, collateralToken,
+        configuredRaw, capRaw,
+        leverageX10: BigInt(Math.round(Number(this.config.defaultLeverage || 2) * 10)),
+      });
+      return s.ok || !!s.fallbackToConfigured;
+    } catch {
+      return true;
+    }
   }
 
   /** Rotation-picked next (market, side) pair — for display/planning. */
@@ -2096,15 +2694,22 @@ export class AutoTrader {
             // Wait for balance update
             await new Promise(r => setTimeout(r, 2000));
 
-            // Verify new balance
-            const newFromContract = new ethers.Contract(pair.fromAddr, ERC20_ABI, provider);
-            const newToContract = new ethers.Contract(pair.toAddr, ERC20_ABI, provider);
-            const newFromBal = await newFromContract.balanceOf(walletAddr);
-            const newToBal = await newToContract.balanceOf(walletAddr);
+            // POST-SWAP ON-CHAIN VERIFICATION — token deltas, not just a mined TX
+            const v = await verifySwapBalances({
+              provider, walletAddr, pair,
+              beforeFrom: freshBalances[pair.from].raw,
+              beforeTo: freshBalances[pair.to].raw,
+              amountIn: amountRaw, amountOutMin, log: this.log.bind(this),
+            });
 
             this.log(`[SWAP] SUCCESS ${pair.from}→${pair.to}`, "success");
             this.log(`[SWAP] actualOut≈${ethers.formatUnits(expectedOut, toDecimals)} ${pair.to}`, "success");
-            this.log(`[SWAP] balanceAfter: ${pair.from}=${ethers.formatUnits(newFromBal, decimals)} ${pair.to}=${ethers.formatUnits(newToBal, toDecimals)}`, "success");
+            this.log(`[SWAP] balanceAfter: ${pair.from}=${ethers.formatUnits(v.afterFrom, decimals)} ${pair.to}=${ethers.formatUnits(v.afterTo, toDecimals)}`, "success");
+
+            if (!v.ok) {
+              this.log(`[SWAP] ${pair.from}→${pair.to} VERIFICATION FAILED — not recording as a successful swap`, "error");
+              continue;
+            }
 
             // Record in journal + rotation
             this.swapJournal.record({ from: pair.from, to: pair.to, amount: amountResult.amountFloat });
@@ -2150,21 +2755,13 @@ export class AutoTrader {
           config: this.config, log: this.log.bind(this), dryRun, txManager: this.txManager,
         });
 
-        if (closeResult?.failed) {
-          this.log(`[CLOSE] failed — clearing state`, "warn");
-          this.state.activePosition = null;
-          this.state.sessionStats.closes++;
-          saveState(this.state);
-        } else if (closeResult) {
-          this.log(`[CLOSE] SUCCESS TX: ${closeResult.txHash || "dry-run"}`, "success");
-          this.state.activePosition = null;
-          this.state.sessionStats.closes++;
-          saveState(this.state);
+        const closedOk = this._applyCloseResult(closeResult);
+        if (closedOk) {
           this.setState(STATES.COOLDOWN);
           this.log(`[COOLDOWN] ${this.config.cooldownAfterCloseMs / 1000}s...`, "info");
           await this.sleep(this.config.cooldownAfterCloseMs);
         } else {
-          this.log(`[CLOSE] failed — will retry next cycle`, "warn");
+          this.log(`[CLOSE] not finished — will retry next cycle`, "warn");
         }
 
         this.lastCycleAction = "close";
@@ -2445,9 +3042,36 @@ export class AutoTrader {
     return this.state.lastSide === "LONG" ? "SHORT" : "LONG";
   }
 
-  async doRandomSwaps() {
+  /**
+   * Build a pair object for a FORCED direction (both legs of a market are
+   * exercised separately: A→B and B→A are independent quotes/executions).
+   * Returns null when the direction cannot be resolved to two distinct known
+   * token addresses — the caller then skips with a reason instead of guessing.
+   */
+  _resolveForcedPair(forcePair, tokenAddrs) {
+    const from = forcePair?.from || null;
+    const to = forcePair?.to || null;
+    const fromAddr = forcePair?.fromAddr || (from ? tokenAddrs[from] : null);
+    const toAddr = forcePair?.toAddr || (to ? tokenAddrs[to] : null);
+    if (!from || !to || !fromAddr || !toAddr) return null;
+    if (String(fromAddr).toLowerCase() === String(toAddr).toLowerCase()) return null;
+    return { from, to, fromAddr, toAddr, key: `${from}>${to}`, type: "direct", forced: true };
+  }
+
+  /**
+   * Random (or FORCED-direction) swaps.
+   *
+   * @param {object} [options]
+   * @param {{from:string,to:string,fromAddr?:string,toAddr?:string}} [options.forcePair]
+   *        Execute exactly this direction once — used to prove BOTH directions of
+   *        a market work. Journal cooldowns do not apply to a forced direction.
+   * @returns {Promise<{attempted:number, verified:number, failed:number, results:object[]}>}
+   */
+  async doRandomSwaps(options = {}) {
     const autoSwapConfig = this.config.autoSwap || {};
-    if (!autoSwapConfig.enabled) return;
+    const forcePair = options.forcePair || null;
+    const summary = { attempted: 0, verified: 0, failed: 0, results: [] };
+    if (!autoSwapConfig.enabled && !forcePair) return summary;
 
     await this.ensureMarkets();
     const { provider, wallet } = this.getRuntime();
@@ -2463,8 +3087,8 @@ export class AutoTrader {
       decimalsMap[t.symbol] = t.decimals;
     }
 
-    const swapCount = 1 + Math.floor(Math.random() * 2);
-    this.log(`[AUTO] SWAPPING — ${swapCount} random swap(s) (${this.routes.length} routes)`, "info");
+    const swapCount = forcePair ? 1 : 1 + Math.floor(Math.random() * 2);
+    this.log(`[AUTO] SWAPPING — ${forcePair ? `forced ${forcePair.from}→${forcePair.to}` : `${swapCount} random swap(s)`} (${this.routes.length} routes)`, "info");
 
     for (let i = 0; i < swapCount; i++) {
       if (this.stopRequested) break;
@@ -2482,27 +3106,53 @@ export class AutoTrader {
           } catch { freshBalances[sym] = { raw: 0n, float: 0 }; }
         }
 
-        const pair = selectRandomSwapPair(this.swapJournal, freshBalances, autoSwapConfig, tokenAddrs, this.log.bind(this), this.routes, this.rotation);
+        let pair;
+        if (forcePair) {
+          pair = this._resolveForcedPair(forcePair, tokenAddrs);
+          if (!pair) {
+            this.log(`[AUTO-SWAP] forced direction ${forcePair?.from}→${forcePair?.to}: unknown/duplicate token addresses — SKIP`, "warn");
+            summary.failed++;
+            summary.results.push({ direction: `${forcePair?.from}→${forcePair?.to}`, ok: false, reason: "UNKNOWN_TOKEN" });
+            break;
+          }
+          this.log(`[AUTO-SWAP] forced direction ${pair.from} → ${pair.to}`, "info");
+        } else {
+          pair = selectRandomSwapPair(this.swapJournal, freshBalances, autoSwapConfig, tokenAddrs, this.log.bind(this), this.routes, this.rotation);
+        }
         if (!pair) {
           this.log(`[AUTO-SWAP] No valid pair`, "info");
+          if (forcePair) { summary.failed++; summary.results.push({ direction: `${forcePair.from}→${forcePair.to}`, ok: false, reason: "NO_PAIR" }); }
           break;
         }
 
         const fromBal = freshBalances[pair.from];
-        if (!fromBal || fromBal.float <= 0) continue;
+        if (!fromBal || fromBal.float <= 0) {
+          if (forcePair) { summary.failed++; summary.results.push({ direction: `${pair.from}→${pair.to}`, ok: false, reason: "ZERO_BALANCE" }); }
+          continue;
+        }
 
         const fromDecimals = this._decimalsPrecedence(pair.from, decimalsMap);
         const amountResult = calculateRandomSwapAmount(pair.from, fromBal.float, autoSwapConfig, fromDecimals, this.log.bind(this));
-        if (!amountResult) continue;
+        if (!amountResult) {
+          if (forcePair) { summary.failed++; summary.results.push({ direction: `${pair.from}→${pair.to}`, ok: false, reason: "AMOUNT_TOO_SMALL" }); }
+          continue;
+        }
 
         const decimals = amountResult.decimals ?? fromDecimals;
         const amountRaw = ethers.parseUnits(amountResult.amountFloat.toFixed(decimals), decimals);
 
-        if (amountRaw > fromBal.raw * 90n / 100n) continue;
-        if (amountRaw > fromBal.raw) continue;
+        if (amountRaw > fromBal.raw * 90n / 100n) {
+          if (forcePair) { summary.failed++; summary.results.push({ direction: `${pair.from}→${pair.to}`, ok: false, reason: "OVER_90_PERCENT" }); }
+          continue;
+        }
+        if (amountRaw > fromBal.raw) {
+          if (forcePair) { summary.failed++; summary.results.push({ direction: `${pair.from}→${pair.to}`, ok: false, reason: "INSUFFICIENT_BALANCE" }); }
+          continue;
+        }
 
         // P6: validated routes only — direct first, then bounded validated 2-hop.
-        // Never invent a path, never swap with amountOut = 0.
+        // Never invent a path, never swap with amountOut = 0. The same quote
+        // machinery is used for BOTH directions.
         const best = await quoteBestPath({
           provider, routerAddress: getRouterAddress(), routes: this.routes,
           fromAddr: pair.fromAddr, toAddr: pair.toAddr, amountIn: amountRaw,
@@ -2510,6 +3160,7 @@ export class AutoTrader {
         });
         if (!best) {
           this.log(`[AUTO-SWAP] ${pair.from} → ${pair.to}: no viable route (direct/2-hop quote zero) — skipping pair`, "warn");
+          if (forcePair) { summary.failed++; summary.results.push({ direction: `${pair.from}→${pair.to}`, ok: false, reason: "NO_ROUTE" }); }
           continue;
         }
         const path = best.path;
@@ -2519,11 +3170,17 @@ export class AutoTrader {
         // guaranteed-loss (or reverting) swap — skip this pair, try another one.
         if (expectedOut <= 0n) {
           this.log(`[AUTO-SWAP] ${pair.from} → ${pair.to}: quote returned zero output — skipping pair`, "warn");
+          if (forcePair) { summary.failed++; summary.results.push({ direction: `${pair.from}→${pair.to}`, ok: false, reason: "QUOTE_ZERO" }); }
           continue;
         }
         const amountOutMin = applySlippage(expectedOut, BigInt(autoSwapConfig.slippageBps || 50));
+        if (!(amountOutMin > 0n)) {
+          this.log(`[AUTO-SWAP] ${pair.from} → ${pair.to}: amountOutMin=0 — skipping pair`, "warn");
+          if (forcePair) { summary.failed++; summary.results.push({ direction: `${pair.from}→${pair.to}`, ok: false, reason: "ZERO_AMOUNT_OUT_MIN" }); }
+          continue;
+        }
 
-        this.log(`[AUTO] SWAPPING ${pair.from} → ${pair.to} [${ethers.formatUnits(amountRaw, decimals)}] hops=${best.type}`, "warn");
+        this.log(`[AUTO] SWAPPING ${pair.from} → ${pair.to} [${ethers.formatUnits(amountRaw, decimals)}] hops=${best.type} amountOutMin=${amountOutMin}`, "warn");
 
         if (dryRun) {
           this.log(`[DRY] Would swap ${amountResult.amountFloat.toFixed(4)} ${pair.from} → ${pair.to}`, "info");
@@ -2531,9 +3188,12 @@ export class AutoTrader {
           this.rotation.recordSwapPair(pair.from, pair.to);
           this.state.rotation = this.rotation.toJSON();
           saveState(this.state);
+          summary.attempted++;
+          summary.results.push({ direction: `${pair.from}→${pair.to}`, ok: true, dryRun: true, amountIn: String(amountRaw), amountOutMin: String(amountOutMin), path });
           continue;
         }
 
+        summary.attempted++;
         const swapResult = await executeSwap({
           wallet, provider,
           fromToken: pair.fromAddr, toToken: pair.toAddr,
@@ -2541,15 +3201,34 @@ export class AutoTrader {
           config: this.config, log: this.log.bind(this), txManager: this.txManager, path,
         });
 
-        if (swapResult) {
-          this.swapJournal.record({ from: pair.from, to: pair.to, amount: amountResult.amountFloat });
-          this.rotation.recordSwapPair(pair.from, pair.to);
-          this.state.rotation = this.rotation.toJSON();
-          saveState(this.state);
-          this.log(`[SWAP] SUCCESS ${pair.from}→${pair.to}`, "success");
-        } else {
+        if (!swapResult) {
           this.log(`[SWAP] FAILED ${pair.from}→${pair.to}`, "error");
+          summary.failed++;
+          summary.results.push({ direction: `${pair.from}→${pair.to}`, ok: false, reason: "EXEC_FAILED", amountIn: String(amountRaw), amountOutMin: String(amountOutMin), path });
+          continue;
         }
+
+        // POST-SWAP ON-CHAIN VERIFICATION (both directions use the same check)
+        const v = await verifySwapBalances({
+          provider, walletAddr, pair,
+          beforeFrom: freshBalances[pair.from].raw,
+          beforeTo: freshBalances[pair.to].raw,
+          amountIn: amountRaw, amountOutMin, log: this.log.bind(this),
+        });
+        if (!v.ok) {
+          this.log(`[SWAP] ${pair.from}→${pair.to} VERIFICATION FAILED — not recording`, "error");
+          summary.failed++;
+          summary.results.push({ direction: `${pair.from}→${pair.to}`, ok: false, reason: "VERIFY_FAILED", amountIn: String(amountRaw), amountOutMin: String(amountOutMin), path, inDelta: String(v.inDelta), outDelta: String(v.outDelta) });
+          continue;
+        }
+
+        this.swapJournal.record({ from: pair.from, to: pair.to, amount: amountResult.amountFloat });
+        this.rotation.recordSwapPair(pair.from, pair.to);
+        this.state.rotation = this.rotation.toJSON();
+        saveState(this.state);
+        summary.verified++;
+        summary.results.push({ direction: `${pair.from}→${pair.to}`, ok: true, txHash: swapResult.txHash || null, approveTxHash: swapResult.approveTxHash || null, amountIn: String(amountRaw), expectedOut: String(expectedOut), amountOutMin: String(amountOutMin), inDelta: String(v.inDelta), outDelta: String(v.outDelta), path, hops: best.type });
+        this.log(`[SWAP] SUCCESS ${pair.from}→${pair.to}`, "success");
 
         if (i < swapCount - 1) {
           await this.sleep(this.randomDelay(5000, 15000));
@@ -2557,8 +3236,10 @@ export class AutoTrader {
       } catch (e) {
         this.log(`[AUTO-SWAP] Error: ${e.message?.slice(0, 60)}`, "error");
         this.txManager.resetNonce();
+        summary.failed++;
       }
     }
+    return summary;
   }
 
   /**
@@ -2625,6 +3306,61 @@ export class AutoTrader {
     return null;
   }
 
+  /**
+   * Apply a closePositionFn() result to `state`.
+   *
+   * `activePosition` is cleared ONLY when the position is provably gone:
+   * a dry run, a zombie (MAM_InvalidPosition), or an on-chain verified close.
+   * Every other outcome — pending TX, liquidity-blocked partial close, unreadable
+   * verification — KEEPS the position so the bot can never orphan an open one.
+   *
+   * @returns {boolean} true when state was cleared (position gone)
+   */
+  _applyCloseResult(closeResult) {
+    this.lastCloseTxHash = closeResult?.txHash || null;
+    if (!closeResult) {
+      this.log(`[CLOSE] Failed — will retry (state kept)`, "error");
+      return false;
+    }
+    if (closeResult.dryRun) {
+      this.state.activePosition = null;
+      this.state.sessionStats.closes++;
+      saveState(this.state);
+      return true;
+    }
+    if (closeResult.pending) {
+      this.log(`[CLOSE] TX ${closeResult.txHash || ""} pending — state kept, will verify next cycle`, "warn");
+      return false;
+    }
+    if (closeResult.failed) {
+      if (closeResult.clearState === false) {
+        this.log(`[CLOSE] blocked (${closeResult.code || closeResult.reason || "?"}) — position KEPT, will retry`, "warn");
+        this.state.closeAttempts = (Number(this.state.closeAttempts) || 0) + 1;
+        saveState(this.state);
+        return false;
+      }
+      this.log(`[CLOSE] Position gone (${closeResult.reason || "zombie"}) — clearing state`, "warn");
+      this.state.activePosition = null;
+      this.state.sessionStats.closes++;
+      this.state.closeAttempts = 0;
+      saveState(this.state);
+      return true;
+    }
+    if (closeResult.closed === false) {
+      this.log(`[CLOSE] ${closeResult.code || "not closed"} — position KEPT, will retry`, "warn");
+      this.state.closeAttempts = (Number(this.state.closeAttempts) || 0) + 1;
+      saveState(this.state);
+      return false;
+    }
+    const part = closeResult.partial ? ` (partial closeBps=${closeResult.closeBps})` : "";
+    this.log(`[CLOSE] SUCCESS TX: ${closeResult.txHash || "dry-run"}${part} — verified on-chain`, "success");
+    this.state.activePosition = null;
+    this.state.sessionStats.closes++;
+    this.state.closeAttempts = 0;
+    saveState(this.state);
+    return true;
+  }
+
   async closeActivePosition() {
     if (!this.state.activePosition) return false;
 
@@ -2648,22 +3384,7 @@ export class AutoTrader {
       config: this.config, log: this.log.bind(this), dryRun, txManager: this.txManager,
     });
 
-    if (closeResult?.failed) {
-      this.log(`[CLOSE] Position gone — clearing state`, "warn");
-      this.state.activePosition = null;
-      this.state.sessionStats.closes++;
-      saveState(this.state);
-      return true;
-    } else if (closeResult) {
-      this.log(`[CLOSE] SUCCESS — TX: ${closeResult.txHash || "dry-run"}`, "success");
-      this.state.activePosition = null;
-      this.state.sessionStats.closes++;
-      saveState(this.state);
-      return true;
-    } else {
-      this.log(`[CLOSE] Failed — will retry`, "error");
-      return false;
-    }
+    return this._applyCloseResult(closeResult);
   }
 
   /**
@@ -2710,8 +3431,53 @@ export class AutoTrader {
       return null;
     }
 
-    const collateralAmount = ethers.parseUnits(collateralTargetStr(this.config, collateralToken), collateralDecimals);
+    const configuredTargetStr = collateralTargetStr(this.config, collateralToken);
+    let collateralAmount = ethers.parseUnits(configuredTargetStr, collateralDecimals);
     const targetReserve = ethers.parseUnits(reserveTargetStr(this.config, collateralToken), collateralDecimals);
+    if (collateralAmount <= 0n) {
+      this.log(`[SKIP] ${symbol} ${side}: invalid collateral target`, "warn");
+      return null;
+    }
+
+    // SHORT-only candidate-specific sizing: this candidate's OWN pool decides how
+    // much collateral it can actually quote, never a value inherited from another
+    // candidate and never the unconditional generic target:
+    //     collateralAmount = max(configuredTarget, measuredPoolMinimum) <= cap
+    // A pool whose minimum is above the cap is SKIPPED with a machine-readable code
+    // instead of being inflated. LONG keeps its configured target, unchanged.
+    let sizing = { mode: "configured", configured: configuredTargetStr, poolMin: null, cap: null };
+    if (side === "SHORT") {
+      const capStr = this.config.maxCollateralTargetShort || DEFAULT_AUTO_CONFIG.maxCollateralTargetShort;
+      const poolAddr = candidate.poolAddr || market?.poolAddr || null;
+      const managerAddr = candidate.managerAddr || market?.managerAddr || null;
+      let capRaw = null;
+      try { capRaw = ethers.parseUnits(String(capStr), collateralDecimals); } catch { capRaw = null; }
+      if (!poolAddr || !managerAddr || !capRaw || capRaw <= 0n) {
+        this.log(`[SIZING] ${symbol} SHORT: no pool/manager/cap for candidate sizing — keeping configured target ${configuredTargetStr} ${collateralSym}`, "warn");
+      } else {
+        const s = await resolveShortCollateralAmount(provider, {
+          pool: poolAddr, manager: managerAddr, collateralToken,
+          configuredRaw: collateralAmount, capRaw,
+          leverageX10: BigInt(Math.round(Number(this.config.defaultLeverage || 2) * 10)),
+        });
+        if (s.ok) {
+          if (s.amount !== collateralAmount) {
+            this.log(`[SIZING] ${symbol} SHORT: configured=${configuredTargetStr} poolMin=${ethers.formatUnits(s.poolMin, collateralDecimals)} ${collateralSym} → collateral=${ethers.formatUnits(s.amount, collateralDecimals)} ${collateralSym} (cap=${capStr})`, "info");
+          }
+          collateralAmount = s.amount;
+          sizing = { mode: "pool-min", configured: configuredTargetStr, poolMin: ethers.formatUnits(s.poolMin, collateralDecimals), cap: String(capStr) };
+        } else if (s.fallbackToConfigured) {
+          // Measurement failed — fall back WITHOUT inflating; the unchanged precheck
+          // below still reports QUOTE_ZERO / ZERO_AMOUNT_OUT_MIN for this size.
+          this.log(`[SIZING] ${symbol} SHORT: ${s.code} — keeping configured target ${configuredTargetStr} ${collateralSym} (precheck decides)`, "warn");
+          sizing = { mode: "configured-fallback", configured: configuredTargetStr, poolMin: null, cap: String(capStr), code: s.code };
+        } else {
+          this.log(`[SKIP] ${symbol} ${side}: ${s.reason} (code=${s.code}) — collateral not inflated`, "warn");
+          return null;
+        }
+      }
+    }
+
     if (collateralAmount <= 0n) {
       this.log(`[SKIP] ${symbol} ${side}: invalid collateral target`, "warn");
       return null;
@@ -2726,7 +3492,7 @@ export class AutoTrader {
       token0: candidate.token0 || market?.token0 || null,
       token1: candidate.token1 || market?.token1 || null,
       leverage: this.config.defaultLeverage,
-      collateralToken, collateralDecimals, collateralSym, collateralAmount, targetReserve,
+      collateralToken, collateralDecimals, collateralSym, collateralAmount, targetReserve, sizing,
       tokenContract: new ethers.Contract(collateralToken, ERC20_ABI, provider),
       balance: 0n,
     };
@@ -2938,6 +3704,20 @@ export class AutoTrader {
       }
     }
 
+    // The OPEN itself is already funded. A reserve top-up that no source can
+    // cover must NOT reject the candidate: previously `!swapSuccess` returned
+    // false for `topup` even though balance >= collateralAmount, so a perfectly
+    // openable position was skipped because the inventory reserve could not be
+    // topped up. The top-up stays best-effort; only a CRITICAL deficit
+    // (balance < collateralAmount) is allowed to block.
+    if (balance >= collateralAmount) {
+      if (!swapSuccess) {
+        this.log(`[SWAP] ${deficit.action} not sourced — ${collateralSym} balance ${ethers.formatUnits(balance, collateralDecimals)} already covers required ${ethers.formatUnits(collateralAmount, collateralDecimals)}; proceeding without reserve top-up`, "warn");
+      }
+      this.log(`[INVENTORY] PRE-SWAP ${collateralSym}=${ethers.formatUnits(balance, collateralDecimals)} — ready for OPEN`, "success");
+      return true;
+    }
+
     if (!swapSuccess && !dryRun) {
       this.log(`[BLOCKED] No source token could cover ${collateralSym} deficit for ${marketSymbol} — trying next candidate`, "error");
       return false;
@@ -2982,7 +3762,10 @@ export class AutoTrader {
     }
     if (dryRun) {
       this.log(`[DRY] ${collateralSym}=${ethers.formatUnits(finalBalance, collateralDecimals)} (required ${ethers.formatUnits(collateralAmount, collateralDecimals)})`, "info");
-      return true;
+      // CRITICAL deficit (balance < collateralAmount): a dry run must not claim
+      // readiness when no source token can cover the swap — that hid real
+      // blockers. `swapSuccess` is true only when a source was actually found.
+      return swapSuccess;
     }
     this.log(`[INVENTORY] POST-SWAP ${collateralSym}=${ethers.formatUnits(finalBalance, collateralDecimals)} — ready for OPEN`, "success");
     return true;
@@ -3117,5 +3900,11 @@ export class AutoTrader {
   }
 }
 
-export { STATES, DEFAULT_AUTO_CONFIG, openPosition, closePositionFn, resolveTradingMarket, encodeOpenPositionCalldata, TxManager, normalizeDirectionDisabled, recoverPosition };
+export {
+  STATES, DEFAULT_AUTO_CONFIG, openPosition, closePositionFn, resolveTradingMarket,
+  encodeOpenPositionCalldata, TxManager, normalizeDirectionDisabled, recoverPosition,
+  // Read-only helpers (view calls only — safe to use from tests)
+  readOnChainPosition, previewCloseAt, findMaxCloseBps, positionIsClosed,
+  revertSelector, verifyOpenedPosition, verifySwapBalances,
+};
 export default AutoTrader;

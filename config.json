@@ -183,6 +183,7 @@
   "uiShortTxValueReference": null,
   "targetCollateralUSDT": "10",
   "targetCollateralWETH": "0.002",
+  "maxCollateralTargetShort": "10000",
   "targetReserveUSDT": "20",
   "targetReserveWETH": "0.004",
   "autoRSIEnabled": false,

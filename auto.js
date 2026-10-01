@@ -120,6 +120,7 @@ async function main() {
     targetCollateralUSDT: config.targetCollateralUSDT || "10",
     targetCollateralWETH: config.targetCollateralWETH || "0.002",
     targetCollateralGeneric: config.targetCollateralGeneric || "10",
+    maxCollateralTargetShort: config.maxCollateralTargetShort || "10000",
     targetReserveUSDT: config.targetReserveUSDT || "20",
     targetReserveWETH: config.targetReserveWETH || "0.004",
     targetReserveGeneric: config.targetReserveGeneric || "20",
