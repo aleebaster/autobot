@@ -19,6 +19,7 @@ import {
   formatCoverageTable,
 } from "./marketDiscovery.js";
 import { discoverTokens, discoverSwapRoutes, quoteBestPath, routeCandidates, sourcesForTarget, formatRoutesTable, PROBE_LADDER_WHOLE } from "./swapRoutes.js";
+import { probeRouteEconomics, normalizeEconomyConfig, checkRateConsistency } from "./swapEconomics.js";
 import { RotationMemory } from "./rotation.js";
 import {
   SWAP_FAILURE_CODES,
@@ -29,6 +30,7 @@ import {
   SwapRouteBackoff,
   runSwapRotationQueue,
 } from "./swapEngine.js";
+import { TX_STATE, classifyTx, resolveReceipt, createTxJournal } from "./txStatus.js";
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  AUTONOMOUS TRADING LOOP — Nemesis Sepolia (V2 — MULTI-MARKET)
@@ -92,12 +94,23 @@ function revertSelector(e) {
 //  All state-changing blockchain transactions MUST go through this manager
 // ═══════════════════════════════════════════════════════════════════════════
 
+// Bounded receipt wait. Without it `tx.wait()` polls forever on an endpoint
+// that never answers with a receipt, and the cycle never finishes.
+const TX_WAIT_TIMEOUT_MS = Number(process.env.NEMESIS_TX_WAIT_MS || 90_000);
+// Receipt re-check loop after `wait()` failed (defaults: 12 × 5s = 60s).
+const TX_POLL_ATTEMPTS = Number(process.env.NEMESIS_TX_POLL_ATTEMPTS || 12);
+const TX_POLL_MS = Number(process.env.NEMESIS_TX_POLL_MS || 5_000);
+
 class TxManager {
-  constructor() {
+  constructor({ journal = null, fallbacks = null } = {}) {
     this._mutex = Promise.resolve();
     this._nonce = null;
     this._provider = null;
     this._walletAddr = null;
+    // Durable per-hash state journal (PREPARED → … → CONFIRMED/REVERTED/…).
+    this.journal = journal || createTxJournal();
+    // Extra endpoints consulted when the primary returns no receipt (null = env default).
+    this.fallbacks = fallbacks;
   }
 
   /**
@@ -128,20 +141,22 @@ class TxManager {
 
   /**
    * Send a TX with managed nonce, wait for receipt, handle "replacement fee too low".
-   * @param {Object} opts - { wallet, provider, sendFn, txType, log }
-   *   sendFn(nonce) should return a TransactionResponse
+   * @param {Object} opts - { wallet, provider, sendFn, txType, log, meta }
+   *   sendFn(nonce) should return a TransactionResponse.
+   *   meta — extra fields persisted into the tx journal PREPARED line (e.g.
+   *   { leverage, closeBps, positionId }); forwarded verbatim by TxJournal.
    */
-  async sendAndWait({ wallet, provider, sendFn, txType, log }) {
+  async sendAndWait({ wallet, provider, sendFn, txType, log, meta = null }) {
     const walletAddr = wallet.address;
     const release = await this.acquire();
     try {
-      return await this._sendWithRetry({ wallet, provider, walletAddr, sendFn, txType, log, attempt: 0 });
+      return await this._sendWithRetry({ wallet, provider, walletAddr, sendFn, txType, log, meta, attempt: 0 });
     } finally {
       release();
     }
   }
 
-  async _sendWithRetry({ wallet, provider, walletAddr, sendFn, txType, log, attempt }) {
+  async _sendWithRetry({ wallet, provider, walletAddr, sendFn, txType, log, meta = null, attempt }) {
     const MAX_RETRIES = 3;
     const nonce = await this.getNextNonce(provider, walletAddr);
 
@@ -168,11 +183,16 @@ class TxManager {
     }
 
     log(`[TX] ${txType} SENT nonce=${nonce} hash=${tx.hash}`, "warn");
+    this.journal?.begin({
+      hash: tx.hash, type: txType, nonce, to: tx.to ?? null, wallet: walletAddr,
+      ...(meta && typeof meta === "object" ? meta : {}),
+    });
+    this.journal?.transition(tx.hash, TX_STATE.SUBMITTED);
 
-    // Wait for receipt with timeout
+    // Wait for receipt with timeout (bounded: a receipt-less RPC must not hang the loop)
     let receipt;
     try {
-      receipt = await tx.wait();
+      receipt = await tx.wait(1, TX_WAIT_TIMEOUT_MS);
     } catch (waitErr) {
       const waitMsg = waitErr?.message || String(waitErr);
       // TX might still be pending — check on-chain
@@ -183,12 +203,12 @@ class TxManager {
           log(`[TX] ${txType} found on-chain: status=${receipt.status} block=${receipt.blockNumber}`, "info");
         } else {
           // TX might be pending — wait more
-          log(`[TX] ${txType} not yet mined — waiting up to 60s...`, "warn");
-          for (let i = 0; i < 12; i++) {
-            await new Promise(r => setTimeout(r, 5000));
+          log(`[TX] ${txType} not yet mined — waiting up to ${Math.round((TX_POLL_ATTEMPTS * TX_POLL_MS) / 1000)}s...`, "warn");
+          for (let i = 0; i < TX_POLL_ATTEMPTS; i++) {
+            await new Promise(r => setTimeout(r, TX_POLL_MS));
             receipt = await provider.getTransactionReceipt(tx.hash);
             if (receipt) {
-              log(`[TX] ${txType} confirmed after ${(i+1)*5}s: status=${receipt.status}`, "info");
+              log(`[TX] ${txType} confirmed after ${(i+1) * (TX_POLL_MS / 1000)}s: status=${receipt.status}`, "info");
               break;
             }
           }
@@ -198,22 +218,51 @@ class TxManager {
       }
     }
 
+    // MULTI-SOURCE RECOVERY — one node answering null for a receipt that IS
+    // mined must never turn CONFIRMED into "pending". Cross-check fallbacks.
     if (!receipt) {
-      log(`[TX] ${txType} TIMEOUT — no receipt after extended wait. TX may still confirm later.`, "warn");
+      const resolved = await resolveReceipt({ provider, hash: tx.hash, fallbacks: this.fallbacks, log });
+      if (resolved.receipt) {
+        receipt = resolved.receipt;
+        log(`[TX] ${txType} receipt recovered from ${resolved.source} (primary returned null)`, "warn");
+      }
+    }
+
+    if (!receipt) {
+      // Distinguish "not mined" from "mined but unprovable" from "replaced".
+      let txObj;
+      let latestNonce;
+      try { txObj = await provider.getTransaction(tx.hash); } catch { txObj = undefined; }
+      try { latestNonce = await provider.getTransactionCount(walletAddr, "latest"); } catch { latestNonce = null; }
+      const txState = classifyTx({ receipt: null, tx: txObj, nonce, latestNonce });
+      this.journal?.transition(tx.hash, txState, { nonce });
+      if (txState === TX_STATE.UNKNOWN) {
+        log(`[TX] ${txType} UNKNOWN — tx mined in block ${txObj?.blockNumber} but NO endpoint returned a receipt; status not asserted`, "error");
+      } else if (txState === TX_STATE.PENDING) {
+        log(`[TX] ${txType} PENDING — not mined after extended wait. TX may still confirm later.`, "warn");
+      } else if (txState === TX_STATE.DROPPED_OR_REPLACED) {
+        log(`[TX] ${txType} DROPPED_OR_REPLACED — no receipt for ${tx.hash} and nonce ${nonce} is spent`, "warn");
+      }
       // Invalidate nonce cache since TX might be pending
       this._nonce = null;
-      return { hash: tx.hash, status: null, pending: true };
+      return { hash: tx.hash, status: null, pending: true, txState };
     }
 
     if (receipt.status !== 1) {
       log(`[TX] ${txType} REVERTED status=0 nonce=${receipt.nonce} gas=${receipt.gasUsed}`, "error");
       // Nonce was consumed by failed TX — invalidate cache
       this._nonce = null;
-      return { hash: tx.hash, status: 0, receipt };
+      this.journal?.transition(tx.hash, TX_STATE.REVERTED, {
+        blockNumber: receipt.blockNumber, gasUsed: String(receipt.gasUsed),
+      });
+      return { hash: tx.hash, status: 0, receipt, txState: TX_STATE.REVERTED };
     }
 
     log(`[TX] ${txType} CONFIRMED status=1 nonce=${receipt.nonce} block=${receipt.blockNumber} gas=${receipt.gasUsed}`, "success");
-    return { hash: tx.hash, status: 1, receipt };
+    this.journal?.transition(tx.hash, TX_STATE.CONFIRMED, {
+      blockNumber: receipt.blockNumber, gasUsed: String(receipt.gasUsed),
+    });
+    return { hash: tx.hash, status: 1, receipt, txState: TX_STATE.CONFIRMED };
   }
 
   /**
@@ -235,6 +284,7 @@ const POSITION_CREATED_TOPIC = "0x2e462fabb57854af0ee2383faf948da3dc380bd08e5825
 const MANAGER_ABI = [
   "function openPosition(bool isLong, address collateralToken, uint256 collateralAmount, uint256 borrowAmount, uint256 leverageX10, uint256 amountOutMin, uint256 deadline) returns (uint256)",
   "function closePosition(uint256 positionId, uint256 amountOutMin, uint256 deadline)",
+  "function partialClose(uint256 positionId, uint256 closeBps, uint256 amountOutMin, uint256 deadline)",
   "function nonces(address user) view returns (uint256)",
   "function balanceOf(address account) view returns (uint256)",
   "function totalSupply() view returns (uint256)",
@@ -242,6 +292,28 @@ const MANAGER_ABI = [
   "function getAvailableLiquidity() view returns (uint256)",
   "function LTV_BPS() view returns (uint256)",
   "function PROTOCOL_FEE_BPS() view returns (uint256)",
+  // Leverage + risk bounds — verified against the deployed manager impl
+  // (MAX/MIN_LEVERAGE_X10 are `pure`, selector probes returned 200/10 on bot
+  // manager 0x6562…FD82 and on the site manager alike).
+  "function MAX_LEVERAGE_X10() view returns (uint256)",
+  "function MIN_LEVERAGE_X10() view returns (uint256)",
+  "function MAX_OPEN_LTV_BPS() view returns (uint256)",
+  "function MIN_OPEN_HEALTH_BPS() view returns (uint256)",
+  "function LIQUIDATION_LTV_BPS() view returns (uint256)",
+  // Position status — on-chain truth (borr/collateral/health/PnL inputs)
+  "function positions(uint256 positionId) view returns (bool isLong, address user, address collateralToken, uint256 collateralAmount, uint256 debtAmount, uint256 borrowIndex, bool active)",
+  "function getPosition(uint256 positionId) view returns (bool isLong, address user, address collateralToken, uint256 collateralAmount, uint256 debtAmount, uint256 currentDebt, uint256 healthFactor)",
+  "function getPositionDebt(uint256 positionId) view returns (uint256)",
+  "function getHealthFactor(uint256 positionId) view returns (uint256)",
+  "function getUserPositions(address user) view returns (uint256[])",
+  "function getPositionRisk(uint256 positionId) view returns (tuple(uint256 positionId, bool isActive, bool isLong, address user, address collateralToken, uint256 collateralAmount, uint256 storedDebt, uint256 currentDebt, address debtAsset, uint256 lpTokenPriceToken1X18, uint256 currentDebtValueToken1, uint256 notionalValue, int256 equityValue, uint256 healthBps, uint256 liquidationPrice, bool liquidatable, bool oracleReady))",
+  // Preview / preflight — same layout the site frontend uses (verified: 11-word
+  // return data on both bot and site managers).
+  "function previewOpenPosition(bool isLong, address collateralToken, uint256 collateralAmount, uint256 borrowAmount, uint256 leverageX10) view returns (tuple(uint256 projectedEntryPrice, uint256 projectedDebt, uint256 projectedHealthBps, uint256 projectedLiquidationPrice, uint256 protocolFee, uint256 projectedCollateral, bool projectedLiquidatable, bool oracleReady, uint256 requestedLeverageX10, uint256 realizedLeverageX10, uint256 projectedLtvBps))",
+  "function previewMaxOpenBorrow(address collateralToken, uint256 collateralAmount) view returns (uint256 maxBorrowAmount)",
+  "function previewClosePosition(uint256 positionId, uint256 closeBps) view returns (tuple(uint256 repayAmount, uint256 collateralReduced, uint256 collateralReturned, uint256 protocolFee, uint256 costBasisReduced, int256 realizedPnl, uint256 closePrice, uint256 projectedHealthBps))",
+  "function previewClosePositionDetailed(uint256 positionId, uint256 closeBps) view returns (tuple(uint256 repayAmount, uint256 collateralReduced, uint256 collateralReturned, uint256 otherTokenRefund, uint256 protocolFee, uint256 costBasisReduced, int256 realizedPnl, uint256 closePrice, uint256 projectedHealthBps, uint256 lpRefund))",
+  "function previewLiquidation(uint256 positionId) view returns (tuple(uint256 debtToPay, uint256 collateralClaimable, uint256 collateralRefund, uint256 otherTokenRefund, uint256 excessLpRefund, bool fullClose, uint256 liquidationFee, uint256 protocolFee, uint256 liquidatorReward, uint256 collateralBudget, uint256 badDebtShortfall, uint256 effectiveFeeBps, uint256 teamEscrowUsed, uint256 lpReserveUsed, uint256 remainingShortfall, uint256 currentDebt, uint256 safelyRealizableResidual, uint256 debtReimbursement))",
 ];
 
 const POOL_ABI = [
@@ -878,6 +950,15 @@ const DEFAULT_AUTO_CONFIG = {
   maxOpenPositions: 1,
   defaultLeverage: 2,
   maxLeverage: 5,
+  // Leverage window enforced by resolveLeverageForOpen(): contract bounds
+  // (MIN/MAX_LEVERAGE_X10) ∩ these config bounds ∩ marketLeverage[symbol].
+  leverageMin: 1,
+  leverageMax: 5,
+  // Per-market leverage — { "WETH/UNI": 5 } style integer multipliers.
+  marketLeverage: {},
+  // When the contract rejects the requested leverage (MAM_OpenExceedsMaxLTV /
+  // MAM_InvalidLeverage) step down whole turns before giving up on the market.
+  leverageAutoStep: true,
   targetCollateralUSDT: "10",
   targetCollateralWETH: "0.002",
   targetCollateralGeneric: "10",
@@ -1343,6 +1424,180 @@ export async function precheckMarketQuote(provider, { pool, manager, collateralT
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+//  LEVERAGE MODULE — contract-derived bounds + per-market overrides
+// ═══════════════════════════════════════════════════════════════════════════
+//  Semantics recovered from the deployed implementation + real transactions
+//  (NOT from argument order):
+//    • leverageX10 is the 5th openPosition arg; a4=200 in tx 0xfa397f56… is
+//      echoed by event MAM_LoopPositionCreated(positionId,user,leverageX10=200)
+//      → tenths of a multiplier (200 = 20.0x).
+//    • Only multiples of 10 are accepted (preview with 11/15/25/97 →
+//      MAM_InvalidLeverage); MIN_LEVERAGE_X10()/MAX_LEVERAGE_X10() give the
+//      on-chain window (10 = 1.0x … 200 = 20.0x on both deployments).
+//    • Effective per-market cap is enforced through MAM_OpenExceedsMaxLTV()
+//      (MAX_OPEN_LTV_BPS=9700, MIN_OPEN_HEALTH_BPS=10309): WETH/DAI with 12
+//      DAI collateral passes at 2.0x and fails at 3.0x, while WETH/UNI passes
+//      up to 20.0x → the cap is market/collateral dependent, so it is probed
+//      with previewOpenPosition() (read-only) instead of hardcoding.
+// ═══════════════════════════════════════════════════════════════════════════
+
+const LEV_ERR_INVALID = "0xc48faa3a"; // MAM_InvalidLeverage()
+const LEV_ERR_MAX_LTV = "0xee744528"; // MAM_OpenExceedsMaxLTV()
+const LEV_ERR_ORACLE = "0x56e7f09d";  // MAM_OpenOracleDivergence()
+
+/**
+ * Read leverage/risk bounds from the manager. Falls back to configuration
+ * when a view is missing (older deployment), never throws.
+ */
+export async function readLeverageBounds(provider, managerAddr, config = {}) {
+  const out = {
+    minX10: null, maxX10: null, maxOpenLtvBps: null, minHealthBps: null,
+    source: "none",
+  };
+  try {
+    const mgr = new ethers.Contract(managerAddr, MANAGER_ABI, provider);
+    const [minX10, maxX10, ltv, health] = await Promise.all([
+      mgr.MIN_LEVERAGE_X10().catch(() => null),
+      mgr.MAX_LEVERAGE_X10().catch(() => null),
+      mgr.MAX_OPEN_LTV_BPS().catch(() => null),
+      mgr.MIN_OPEN_HEALTH_BPS().catch(() => null),
+    ]);
+    if (minX10 !== null && maxX10 !== null && maxX10 > 0n) {
+      out.minX10 = Number(minX10);
+      out.maxX10 = Number(maxX10);
+      out.source = "contract";
+    }
+    if (ltv !== null) out.maxOpenLtvBps = Number(ltv);
+    if (health !== null) out.minHealthBps = Number(health);
+  } catch {}
+  if (out.source === "none") {
+    const cfgMin = Number(config.leverageMin ?? 1);
+    const cfgMax = Number(config.leverageMax ?? config.maxLeverage ?? 5);
+    out.minX10 = Math.max(10, Math.round((Number.isFinite(cfgMin) ? cfgMin : 1) * 10));
+    out.maxX10 = Math.round((Number.isFinite(cfgMax) ? cfgMax : 5) * 10);
+    out.source = "config";
+  }
+  return out;
+}
+
+function _clampIntLeverage(lev, minL, maxL) {
+  let v = Math.trunc(Number(lev));
+  if (!Number.isFinite(v)) return null;
+  if (v < minL) v = minL;
+  if (v > maxL) v = maxL;
+  return v;
+}
+
+/**
+ * Resolve the leverage for one OPEN attempt:
+ *   requested → per-market override (config.marketLeverage[SYMBOL]) → clamped
+ *   by contract bounds ∩ config bounds → probe previewOpenPosition and step
+ *   DOWN (whole integer turns, never above the requested value) while the
+ *   contract rejects with MAM_InvalidLeverage / MAM_OpenExceedsMaxLTV.
+ *
+ * Read-only: only view calls, no transaction. Returns a machine-readable plan
+ * so the caller can print what will actually be sent.
+ */
+export async function resolveLeverageForOpen(provider, {
+  managerAddr, marketSymbol = null, isLong, collateralToken = null,
+  collateralAmount = null, requestedLeverage = null, config = {}, log = () => {},
+} = {}) {
+  const requested = Number(
+    requestedLeverage ?? config.marketLeverage?.[marketSymbol] ?? config.defaultLeverage ?? 2,
+  );
+  const bounds = await readLeverageBounds(provider, managerAddr, config);
+  const minContract = Math.max(1, Math.ceil(bounds.minX10 / 10));
+  const maxContract = Math.max(1, Math.floor(bounds.maxX10 / 10));
+  const cfgMin = Number.isFinite(Number(config.leverageMin)) ? Math.max(1, Math.trunc(Number(config.leverageMin))) : 1;
+  const cfgMaxRaw = Number(config.leverageMax ?? config.maxLeverage);
+  const cfgMax = Number.isFinite(cfgMaxRaw) && cfgMaxRaw > 0 ? Math.trunc(cfgMaxRaw) : maxContract;
+  const minL = Math.max(minContract, cfgMin);
+  const maxL = Math.min(maxContract, cfgMax);
+
+  const base = {
+    requested, marketSymbol, boundsSource: bounds.source,
+    contractMin: minContract, contractMax: maxContract,
+    configMin: cfgMin, configMax: cfgMax,
+    min: minL, max: maxL, maxOpenLtvBps: bounds.maxOpenLtvBps, minHealthBps: bounds.minHealthBps,
+  };
+
+  let start = _clampIntLeverage(requested, minL, maxL);
+  if (start === null) {
+    return { ...base, ok: false, code: "LEVERAGE_UNRESOLVED", reason: `requested=${requested} not a usable leverage` };
+  }
+  if (start !== Math.trunc(requested)) {
+    log(`[LEVERAGE] requested ${requested}x clamped to ${start}x (allowed ${minL}x..${maxL}x, bounds=${bounds.source})`, "warn");
+  }
+
+  const previewAt = async (lev) => {
+    if (!collateralToken || collateralAmount === null || collateralAmount === undefined) return null;
+    try {
+      const mgr = new ethers.Contract(managerAddr, MANAGER_ABI, provider);
+      const p = await mgr.previewOpenPosition(isLong, collateralToken, BigInt(collateralAmount), 0n, BigInt(lev * 10));
+      return {
+        ok: true,
+        projectedEntryPrice: p.projectedEntryPrice.toString(),
+        projectedDebt: p.projectedDebt.toString(),
+        projectedHealthBps: Number(p.projectedHealthBps),
+        projectedLiquidationPrice: p.projectedLiquidationPrice.toString(),
+        protocolFee: p.protocolFee.toString(),
+        projectedCollateral: p.projectedCollateral.toString(),
+        projectedLiquidatable: !!p.projectedLiquidatable,
+        oracleReady: !!p.oracleReady,
+        requestedLeverageX10: Number(p.requestedLeverageX10),
+        realizedLeverageX10: Number(p.realizedLeverageX10),
+        projectedLtvBps: Number(p.projectedLtvBps),
+      };
+    } catch (e) {
+      const sel = revertSelector(e);
+      return { ok: false, selector: sel, err: sel === LEV_ERR_INVALID ? "INVALID_LEVERAGE"
+        : sel === LEV_ERR_MAX_LTV ? "EXCEEDS_MAX_LTV"
+        : sel === LEV_ERR_ORACLE ? "ORACLE_DIVERGENCE"
+        : (e?.shortMessage || e?.message || "preview failed").slice(0, 120) };
+    }
+  };
+
+  const autoStep = config.leverageAutoStep !== false;
+  let lev = start;
+  let preview = await previewAt(lev);
+  let steppedFrom = null;
+  while (preview && preview.ok === false &&
+    (preview.err === "INVALID_LEVERAGE" || preview.err === "EXCEEDS_MAX_LTV") &&
+    autoStep && lev > minL) {
+    if (steppedFrom === null) steppedFrom = start;
+    lev -= 1;
+    log(`[LEVERAGE] ${marketSymbol || "market"} ${lev + 1}x rejected by contract (${preview.err}) — trying ${lev}x`, "warn");
+    preview = await previewAt(lev);
+  }
+
+  if (preview && preview.ok === false && (preview.err === "INVALID_LEVERAGE" || preview.err === "EXCEEDS_MAX_LTV")) {
+    return {
+      ...base, ok: false, leverage: lev, leverageX10: lev * 10, requestedStart: start,
+      code: preview.err === "INVALID_LEVERAGE" ? "LEVERAGE_INVALID" : "LEVERAGE_EXCEEDS_MAX_LTV",
+      reason: `no leverage in ${minL}x..${start}x passes this market/collateral (last: ${preview.err})`,
+      preview,
+    };
+  }
+
+  const result = {
+    ...base, ok: true, leverage: lev, leverageX10: lev * 10, requestedStart: start,
+    steppedFrom, probed: preview !== null, preview: preview && preview.ok ? preview : null,
+  };
+  if (preview && preview.ok) {
+    if (preview.projectedLiquidatable) {
+      result.code = "OPEN_LIQUIDATABLE";
+      result.ok = false;
+      result.reason = `preview says the position would be liquidatable immediately (health ${preview.projectedHealthBps} bps)`;
+    } else if (!preview.oracleReady) {
+      // Non-fatal: the OPEN flow runs an oracle checkpoint before sending.
+      log(`[LEVERAGE] preview oracleReady=false — checkpoint will run before the open`, "warn");
+    }
+  }
+  log(`[LEVERAGE] resolved ${lev}x for ${marketSymbol || "market"} ${isLong ? "LONG" : "SHORT"} (requested ${requested}x, bounds ${bounds.source} ${minContract}x..${maxContract}x${steppedFrom ? `, stepped down from ${steppedFrom}x` : ""}${result.probed ? `, ltv=${result.preview.projectedLtvBps}bps health=${result.preview.projectedHealthBps}bps` : ""})`, "info");
+  return result;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 //  SWAP LOGIC — ETH safety preserved
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -1355,7 +1610,7 @@ export async function precheckMarketQuote(provider, { pool, manager, collateralT
  *        On success the return value is truthy AND report.ok === true; on failure
  *        the return value is `false` (falsy) and report.code carries the reason.
  */
-async function executeSwap({ wallet, provider, fromToken, toToken, amount, amountOutMin, config, log, txManager, path: pathArg = null, report = null }) {
+async function executeSwap({ wallet, provider, fromToken, toToken, amount, amountOutMin, config, log, txManager, path: pathArg = null, report = null, allowApprove = true }) {
   const R = (report && typeof report === "object") ? report : {};
   R.ok = false;
   const fail = (code, reason) => { R.ok = false; R.code = code; R.reason = reason; return false; };
@@ -1378,6 +1633,12 @@ async function executeSwap({ wallet, provider, fromToken, toToken, amount, amoun
     : `[SWAP] approve required ${fromSym}: allowance ${ethers.formatUnits(allowance, srcDecimals)} < needed ${ethers.formatUnits(amount, srcDecimals)}`, "info");
   let approveTxHash = null;
   if (allowance < amount) {
+    if (!allowApprove) {
+      // SINGLE-SWAP contract: exactly ONE transaction. An approval would be a
+      // second one, so the operation is refused instead of silently expanded.
+      log(`[SWAP] BLOCKED — allowance ${ethers.formatUnits(allowance, srcDecimals)} < needed ${ethers.formatUnits(amount, srcDecimals)} and approvals are not allowed in single-swap mode`, "error");
+      return fail("APPROVAL_REQUIRED", `allowance ${ethers.formatUnits(allowance, srcDecimals)} < needed ${ethers.formatUnits(amount, srcDecimals)} (allowApprove=false)`);
+    }
     log(`[SWAP] Approve ${fromSym} → Router...`, "info");
     if (txManager) {
       const r = await txManager.sendAndWait({
@@ -1671,11 +1932,19 @@ async function openPosition({ wallet, provider, managerAddr, poolAddr, side, col
       wallet, provider, txType: `OPEN-${side}`,
       sendFn: (nonce) => wallet.sendTransaction({ to: managerAddr, data: calldata, value: 0n, gasLimit, nonce }),
       log,
+      // Journal enrichment — leverage is part of the on-chain evidence for this open.
+      meta: {
+        side,
+        leverage: Number(leverage),
+        leverageX10: Number(leverage) * 10,
+        manager: managerAddr,
+        pool: poolAddr ?? null,
+      },
     });
     if (!r || r.status === 0) { log(`[BLOCKED] TX FAILED`, "error"); return null; }
     if (r.pending) {
-      log(`[OPEN] TX pending — will confirm later`, "warn");
-      return { txHash: r.hash, positionId: null, gasUsed: 0n, blockNumber: null, pending: true };
+      log(`[OPEN] TX ${r.txState || "PENDING"} hash=${r.hash} — not confirmed, NOT counted as an open`, "warn");
+      return { txHash: r.hash, positionId: null, gasUsed: 0n, blockNumber: null, pending: true, txState: r.txState || TX_STATE.PENDING };
     }
     txHash = r.hash;
     receipt = r.receipt;
@@ -1713,6 +1982,8 @@ async function openPosition({ wallet, provider, managerAddr, poolAddr, side, col
   });
   if (!verify.ok) {
     log(`[VERIFY] OPEN #${positionId} MISMATCH — ${verify.reason} (position stays tracked so it can be closed)`, "error");
+    // The receipt says CONFIRMED but the post-confirmation read contradicts it.
+    txManager?.journal?.transition(txHash, TX_STATE.CONFIRMED_STATE_MISMATCH, { reason: verify.reason, positionId });
   }
 
   return { txHash, positionId, gasUsed: receipt.gasUsed, blockNumber: receipt.blockNumber, verify };
@@ -1894,7 +2165,7 @@ async function findMaxCloseBps(provider, managerAddr, positionId, { log = () => 
  * a position that is still active afterwards is reported as such so the caller
  * keeps tracking it. Rounds are capped by config.maxPartialCloseAttempts.
  */
-async function attemptPartialClose({ wallet, provider, managerAddr, positionId, config, log, txManager }) {
+async function attemptPartialClose({ wallet, provider, managerAddr, positionId, config, log, txManager, targetCloseBps = null }) {
   const walletAddr = wallet.address;
   const maxRounds = Math.max(1, Number(config.maxPartialCloseAttempts || 3));
   const slippageBps = BigInt(config.slippageBps || 50);
@@ -1913,14 +2184,62 @@ async function attemptPartialClose({ wallet, provider, managerAddr, positionId, 
     }
 
     log(`[CLOSE] round ${round}/${maxRounds} #${positionId}: collateral=${before.collateralAmount} debt=${before.currentDebt} — searching closeBps (read-only)`, "warn");
-    const found = await findMaxCloseBps(provider, managerAddr, positionId, { log });
-    if (!found.ok) {
-      log(`[BLOCKED] closeBps search failed (${found.code}) — keeping state, NOT clearing`, "error");
-      return { failed: true, clearState: false, code: found.code, reason: `closeBps search failed: ${found.code}` };
+    let closeBps;
+    let quote;
+    let probes = 0;
+    if (targetCloseBps !== null && targetCloseBps !== undefined) {
+      // Operator-specified percentage (--single=partial --pct=N): validate the
+      // exact closeBps with one read-only preview instead of searching.
+      const wanted = BigInt(targetCloseBps);
+      if (wanted < 1n || wanted > MAX_PARTIAL_CLOSE_BPS) {
+        return {
+          failed: true, clearState: false, code: "PARTIAL_BPS_RANGE",
+          reason: `closeBps ${wanted} outside 1..${MAX_PARTIAL_CLOSE_BPS} (100% is only possible through closePosition())`,
+        };
+      }
+      const pv = await previewCloseAt(provider, managerAddr, positionId, wanted);
+      if (!pv.ok) {
+        const sel = pv.err;
+        const detail = sel === ERR_CLOSE_AMOUNT_TOO_SMALL
+          ? "MAM_CloseAmountTooSmall — requested slice is below the contract minimum"
+          : sel === ERR_INSUFFICIENT_LIQUIDITY || sel === ERR_POOL_INSUFFICIENT_OUTPUT
+            ? "pool liquidity cannot absorb this slice"
+            : `preview revert ${sel || "unknown"}`;
+        log(`[BLOCKED] partial ${wanted}bps preview FAILED: ${detail} — keeping state`, "error");
+        return { failed: true, clearState: false, code: `TARGET_BPS_${sel || "REVERT"}`, reason: detail };
+      }
+      closeBps = wanted;
+      quote = pv.quote;
+      log(`[CLOSE] operator closeBps=${closeBps} accepted by previewClosePosition`, "info");
+    } else {
+      const found = await findMaxCloseBps(provider, managerAddr, positionId, { log });
+      if (!found.ok) {
+      // ─── CONTROLLED WAIT (not a failure, not an error, not a clear) ───────
+      // No closeBps in 1..9999 satisfies BOTH contract invariants at once:
+      //   bps too small → MAM_CloseAmountTooSmall (0x01556191)
+      //   bps too large → MAM_InsufficientLiquidity (0xf71ff020)
+      // That is a genuine on-chain market condition (degraded pool / thin
+      // liquidity), NOT a bot bug. The position is STAYS ACTIVE and STAYS
+      // TRACKED; the cycle continues with SWAP/OPEN and re-probes read-only
+      // after an exponential backoff. Nothing is cleared, nothing is sent.
+      const detail = found.code === "CLOSE_AMOUNT_TOO_SMALL"
+        ? "every bps ≥ 1 reverts MAM_CloseAmountTooSmall — position is dust-sized relative to the contract minimum"
+        : found.code === "PROBE_LIMIT"
+          ? `probe budget exhausted after ${found.probes} eth_calls`
+          : `no bps in 1..9999 passes previewClosePosition (${found.probes} read-only probes, last revert=${found.lastErr || "none"}) — pool liquidity cannot absorb even 1% of this position`;
+      log(`[WAIT] CLOSE_BPS_NOT_FOUND #${positionId}: ${detail}`, "warn");
+      log(`[WAIT] position #${positionId} REMAINS ACTIVE and TRACKED — no state cleared, no TX sent; re-probing read-only after backoff`, "info");
+      return {
+        failed: true, clearState: false, code: found.code, wait: true,
+        reason: `CLOSE_BPS_NOT_FOUND: ${detail}`,
+      };
+      }
+
+      closeBps = found.closeBps;
+      quote = found.quote;
+      probes = found.probes;
     }
 
-    const closeBps = found.closeBps;
-    const quote = found.quote;
     const amountOut = quote.collateralReturned;
     const amountOutMin = (amountOut * (BPS_DENOM - slippageBps)) / BPS_DENOM;
     if (!(amountOutMin > 0n)) {
@@ -1928,7 +2247,7 @@ async function attemptPartialClose({ wallet, provider, managerAddr, positionId, 
       return { failed: true, clearState: false, code: "ZERO_AMOUNT_OUT_MIN", reason: "partial close quote returned zero collateral" };
     }
 
-    log(`[CLOSE] partialClose closeBps=${closeBps} amountOut=${amountOut} amountOutMin=${amountOutMin} repay=${quote.repayAmount} fee=${quote.protocolFee} realizedPnl=${quote.realizedPnl} (probes=${found.probes})`, "info");
+    log(`[CLOSE] partialClose closeBps=${closeBps} amountOut=${amountOut} amountOutMin=${amountOutMin} repay=${quote.repayAmount} fee=${quote.protocolFee} realizedPnl=${quote.realizedPnl} (probes=${probes})`, "info");
 
     const deadline = Math.floor(Date.now() / 1000) + config.deadlineSeconds;
     const calldata = iface.encodeFunctionData("partialClose", [positionId, closeBps, amountOutMin, BigInt(deadline)]);
@@ -1963,6 +2282,7 @@ async function attemptPartialClose({ wallet, provider, managerAddr, positionId, 
         wallet, provider, txType: "PARTIAL-CLOSE",
         sendFn: (nonce) => wallet.sendTransaction({ to: managerAddr, data: calldata, value: 0n, gasLimit, nonce }),
         log,
+        meta: { positionId: String(positionId), closeBps: Number(closeBps) },
       });
       if (!r || r.status === 0) {
         log(`[BLOCKED] partialClose TX FAILED — keeping state`, "error");
@@ -2068,6 +2388,7 @@ async function closePositionFn({ wallet, provider, managerAddr, positionId, conf
       wallet, provider, txType: "CLOSE",
       sendFn: (nonce) => wallet.sendTransaction({ to: managerAddr, data: calldata, value: 0n, gasLimit, nonce }),
       log,
+      meta: { positionId: String(positionId) },
     });
     if (!r || r.status === 0) {
       log(`[BLOCKED] Close TX FAILED — position KEPT`, "error");
@@ -2507,7 +2828,7 @@ export class AutoTrader {
       const pre = await precheckMarketQuote(provider, {
         pool: ctx.poolAddr, manager: ctx.managerAddr,
         collateralToken: ctx.collateralToken, collateralAmount: ctx.collateralAmount,
-        leverageX10: BigInt(Math.round(Number(this.config.defaultLeverage) * 10)),
+        leverageX10: BigInt(Math.round(Number(this.config.marketLeverage?.[candidate.symbol] ?? this.config.defaultLeverage) * 10)),
         isLong: side === "LONG", log: () => {},
       });
       if (!pre.ok) return { ok: false, reason: `quote precheck ${pre.code || "UNUSABLE"}` };
@@ -2540,7 +2861,7 @@ export class AutoTrader {
       const s = await resolveShortCollateralAmount(provider, {
         pool: poolAddr, manager: managerAddr, collateralToken,
         configuredRaw, capRaw,
-        leverageX10: BigInt(Math.round(Number(this.config.defaultLeverage || 2) * 10)),
+        leverageX10: BigInt(Math.round(Number((this.config.marketLeverage?.[candidate?.symbol] ?? this.config.defaultLeverage) || 2) * 10)),
       });
       return s.ok || !!s.fallbackToConfigured;
     } catch {
@@ -2622,6 +2943,10 @@ export class AutoTrader {
 
       // Log full token inventory
       await logInventory(provider, walletAddr, this.log.bind(this));
+
+      // Settle any OPEN tx that is still PENDING before anything is decided.
+      // Only a receipt may turn a submitted open into a counted open.
+      await this._settlePendingOpen();
 
       // NEXT ACTION prediction for TUI
       if (this.state.activePosition) {
@@ -2737,6 +3062,7 @@ export class AutoTrader {
       let openResult = null;
       let openedMarket = null;
       let openedCtx = null;
+      let openedLeverage = null;
       for (const candidate of marketCandidates) {
         this.log(`[OPEN] trying market ${candidate.symbol} manager=${short(candidate.managerAddr)}`, "info");
 
@@ -2756,13 +3082,23 @@ export class AutoTrader {
           continue;
         }
 
+        // LEVERAGE — contract bounds ∩ config ∩ per-market override, probed with
+        // previewOpenPosition (read-only). A market that cannot reach any legal
+        // leverage is SKIPPED with an explicit reason, never opened blind.
+        const levPlan = await this._resolveOpenLeverage(candidate, side, ctx, provider);
+        if (!levPlan.ok) {
+          this.log(`[SKIP] ${candidate.symbol} ${side}: leverage unresolved (${levPlan.code}: ${levPlan.reason}) — trying next candidate`, "warn");
+          this._rotMarketSkip(candidate.symbol, side);
+          continue;
+        }
+
         // READ-ONLY viability pre-check (pool/manager view calls only, no transaction).
         // A candidate whose minimum collateral size is dust for this pool's liquidity is
         // SKIPPED with an explicit reason — it is NOT counted as a direction failure.
         const pre = await precheckMarketQuote(provider, {
           pool: ctx.poolAddr, manager: ctx.managerAddr,
           collateralToken: ctx.collateralToken, collateralAmount: ctx.collateralAmount,
-          leverageX10: BigInt(Math.round(Number(this.config.defaultLeverage) * 10)),
+          leverageX10: BigInt(levPlan.leverageX10),
           isLong: side === "LONG", log: this.log.bind(this),
         });
         if (!pre.ok) {
@@ -2783,7 +3119,7 @@ export class AutoTrader {
         const attempt = await openPosition({
           wallet, provider, managerAddr: ctx.managerAddr, poolAddr: ctx.poolAddr,
           side, collateralToken: ctx.collateralToken, collateralAmount: ctx.collateralAmount,
-          leverage: this.config.defaultLeverage,
+          leverage: levPlan.leverage,
           config: this.config, log: this.log.bind(this), dryRun, txManager: this.txManager,
           paymentToken: ctx.paymentToken,
         });
@@ -2791,6 +3127,7 @@ export class AutoTrader {
         if (attempt) {
           openedMarket = candidate;
           openedCtx = ctx;
+          openedLeverage = levPlan.leverage;
           break;
         }
         this._recordDirectionFailure(candidate.symbol, side);
@@ -2805,6 +3142,31 @@ export class AutoTrader {
         // state — a dry run must leave every one of them byte-identical.
         this.log(`[DRY] Open would execute on ${marketUsed.symbol}`, "info");
         this.log(`[DRY] state untouched — lastSide/rotation/sessionStats unchanged`, "info");
+      } else if (openResult?.pending) {
+        // SUBMITTED/PENDING is NOT an open. The record is kept (so the cycle can
+        // never double-open) but sessionStats.opens is NOT incremented and no
+        // success is reported until a receipt proves the position exists.
+        this.state.activePosition = {
+          positionId: openResult.positionId ?? null,
+          side,
+          collateralToken: ctxUsed?.collateralToken || marketUsed.collateralToken,
+          collateralAmount: String(ctxUsed?.collateralAmount ?? ""),
+          paymentToken: ctxUsed?.paymentToken || marketUsed.paymentToken || null,
+          leverage: openedLeverage ?? this.config.defaultLeverage,
+          openedAt: Date.now(),
+          txHash: openResult.txHash,
+          marketSymbol: marketUsed.symbol,
+          managerAddr: marketUsed.managerAddr,
+          poolAddr: marketUsed.poolAddr,
+          pendingOpen: true,
+        };
+        saveState(this.state);
+
+        this.setState(STATES.MONITOR);
+        this.log(`[OPEN] PENDING tx=${openResult.txHash} — awaiting confirmation; sessionStats.opens NOT incremented`, "warn");
+
+        this.log(`[COOLDOWN] ${this.config.cooldownAfterOpenMs / 1000}s...`, "info");
+        await this.sleep(this.config.cooldownAfterOpenMs);
       } else if (openResult) {
         this._recordDirectionSuccess(marketUsed.symbol, side);
         this._rotMarketDone(marketUsed.symbol, side);
@@ -2815,7 +3177,7 @@ export class AutoTrader {
           collateralToken: ctxUsed?.collateralToken || marketUsed.collateralToken,
           collateralAmount: String(ctxUsed?.collateralAmount ?? ""),
           paymentToken: ctxUsed?.paymentToken || marketUsed.paymentToken || null,
-          leverage: this.config.defaultLeverage,
+          leverage: openedLeverage ?? this.config.defaultLeverage,
           openedAt: Date.now(),
           txHash: openResult.txHash,
           marketSymbol: marketUsed.symbol,
@@ -3417,7 +3779,10 @@ export class AutoTrader {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline && !this.stopRequested) {
       try {
-        const r = await provider.getTransactionReceipt(txHash);
+        // Multi-source: the primary RPC has been observed returning null for
+        // receipts that exist, which used to be read as "swap did not happen".
+        const r = (await resolveReceipt({ provider, hash: txHash }))?.receipt
+          || await provider.getTransactionReceipt(txHash);
         if (r) return r;
       } catch { /* RPC hiccup — keep polling */ }
       await this.sleep(3000);
@@ -3523,6 +3888,9 @@ export class AutoTrader {
    */
   async _attemptSwapDirection(dir, ctx) {
     const { cfg, provider, wallet, walletAddr, decimalsMap, dryRun, slippageBps, phase } = ctx;
+    // SINGLE-SWAP: an operator-pinned size replaces the random sizing, and an
+    // approval is never allowed (the mode is defined as exactly ONE transaction).
+    const pinned = ctx.pinned || null;
     const direction = `${dir.from}->${dir.to}`;
     const tag = phase ? `${phase} ` : "";
 
@@ -3562,10 +3930,35 @@ export class AutoTrader {
 
     const sized = computeSwapAmount({
       sym: dir.from, balanceRaw: balance, decimals: fromDec, cfg,
-      calcAmount: (avail) => calculateRandomSwapAmount(dir.from, avail, cfg, fromDec, this.log.bind(this)),
+      calcAmount: pinned
+        ? () => ({ amountFloat: Number(pinned.amount) })
+        : (avail) => calculateRandomSwapAmount(dir.from, avail, cfg, fromDec, this.log.bind(this)),
     });
     if (!sized.ok) return skip(sized.code, sized.reason);
     const amountRaw = sized.amountRaw;
+    if (pinned) {
+      // The operator's decimal string must survive the float bridge byte-exact;
+      // otherwise a different amount than the one reviewed would be sent.
+      let exact = 0n;
+      try { exact = ethers.parseUnits(String(pinned.amount), fromDec); } catch { exact = 0n; }
+      if (exact <= 0n || exact !== amountRaw) {
+        return skip("PINNED_AMOUNT", `requested ${pinned.amount} does not round-trip to ${amountRaw} at ${fromDec} decimals`);
+      }
+    }
+
+    // ETH GAS RESERVE — a GLOBAL precondition, checked once the route has a
+    // concrete size but BEFORE any quote/economic work. If the wallet cannot
+    // pay for gas there is no point spending RPC on reserves or quotes, and the
+    // failure must not be attributed to the route (a route is not at fault for
+    // an empty gas tank). Read-only: getBalance only, no signing.
+    {
+      const ethBal = await provider.getBalance(walletAddr).catch(() => 0n);
+      const gasReserve = ethers.parseEther(String(cfg.ethGuard?.MIN_ETH_GAS_RESERVE ?? 0.003));
+      if (ethBal < gasReserve) {
+        return fail("GAS_RESERVE",
+          `ETH balance ${ethers.formatEther(ethBal)} below the gas reserve ${ethers.formatEther(gasReserve)}`);
+      }
+    }
 
     // Gas ceiling — a global condition, so the pass stops without punishing a route.
     if (cfg.maxGasGwei > 0) {
@@ -3588,6 +3981,47 @@ export class AutoTrader {
     // 5. amountOutMin from the configured slippage — never 0, never hardcoded
     const amountOutMin = applySlippage(best.amountOut, slippageBps);
     if (!(amountOutMin > 0n)) return skip("ZERO_AMOUNT_OUT_MIN", `amountOutMin collapsed to 0 at slippageBps=${cfg.slippageBps}`);
+
+    // 5a. ECONOMIC GATES — a quotable route is not automatically a sane route.
+    // Every leg is re-priced against the pool's OWN reserves and fee (1% per leg,
+    // so a 2-hop pays it twice) and vetoed when the swap would move the pool by
+    // more than maxPoolShareBps / maxPriceImpactBps. Thresholds are configurable
+    // and are NEVER loosened automatically; a rejected route is skipped and the
+    // rest of the rotation keeps running. Read-only: eth_call/getReserves only.
+    const economyCfg = normalizeEconomyConfig(cfg.swapEconomy);
+    const econ = await probeRouteEconomics({
+      provider, factoryAddress: getFactoryAddress(), path: best.path,
+      amountIn: amountRaw, amountOut: best.amountOut, amountOutMin,
+      economy: economyCfg, log: this.log.bind(this),
+    });
+    if (!econ.ok) return skip("ECONOMY_REJECTED", `gates=${econ.gates.join(",")}`);
+
+    // 5a-bis. Cross-direction rate consistency. The reverse direction of this
+    // pair is priced by the SAME reserves, so the product of the two implied
+    // rates must sit near (1−fee)^(2×legs). A product of 148× or 3.15e5× means
+    // the pools contradict each other — do not trade that pair in either
+    // direction. Only checked for direct (single-leg) pairs where both
+    // directions are quoted in this pass.
+    if (best.path.length === 2) {
+      const rev = await quoteBestPath({
+        provider, routerAddress: getRouterAddress(), routes: this.routes,
+        fromAddr: dir.toAddr, toAddr: dir.fromAddr, amountIn: amountRaw,
+        log: () => {},
+      });
+      if (rev && rev.amountOut > 0n) {
+        const decInH = Number(ethers.formatUnits(amountRaw, fromDec));
+        const rateAB = Number(ethers.formatUnits(best.amountOut, toDec)) / decInH;
+        const rateBA = Number(ethers.formatUnits(rev.amountOut, fromDec)) / Number(ethers.formatUnits(amountRaw, toDec));
+        const feeFrac = (econ.legs?.[0]?.swapFeeBps ?? 100) / Number(BPS);
+        const rc = checkRateConsistency({
+          rateAB, rateBA, legs: 1, feeFrac,
+          maxDeviation: economyCfg.maxRateDeviation,
+        });
+        if (!rc.ok) {
+          return skip("ECONOMY_REJECTED", `RATE_DEVIATION product=${rc.product.toExponential(3)} expected=${rc.expected.toFixed(6)} deviation=${rc.deviation.toExponential(3)}× (pools contradict each other)`);
+        }
+      }
+    }
 
     const routerAddr = getRouterAddress();
     const rec = (this.routes || []).find(r => r.valid && Array.isArray(r.path) && r.path.length === best.path.length
@@ -3612,9 +4046,45 @@ export class AutoTrader {
       `reserve=${ethers.formatUnits(sized.reserve, fromDec)} available=${ethers.formatUnits(sized.availableRaw, fromDec)} ` +
       `hops=${best.type} preflight=PASS`, "warn");
 
+    // 5b-bis. SINGLE-SWAP PLAN — read-only gas + economics snapshot that the
+    // operator reviews before anything is signed. estimateGas is an eth_call.
+    let plan = null;
+    if (pinned) {
+      let gasEstimate = null, gasPrice = null;
+      try { gasEstimate = await provider.estimateGas({ from: walletAddr, to: routerAddr, data: calldata, value: 0n }); } catch { gasEstimate = null; }
+      try { gasPrice = (await provider.getFeeData())?.gasPrice ?? null; } catch { gasPrice = null; }
+      const leg0 = econ?.legs?.[0] || null;
+      const gasCostWei = (gasEstimate && gasPrice) ? gasEstimate * gasPrice : null;
+      plan = {
+        direction, from: dir.from, to: dir.to,
+        tokenIn: dir.fromAddr, tokenOut: dir.toAddr,
+        path: best.path, hops: best.type, pool, router: routerAddr,
+        amountIn: String(amountRaw), amountInHuman: ethers.formatUnits(amountRaw, fromDec),
+        quoteOut: String(best.amountOut), quoteOutHuman: ethers.formatUnits(best.amountOut, toDec),
+        amountOutMin: String(amountOutMin), amountOutMinHuman: ethers.formatUnits(amountOutMin, toDec),
+        slippageBps: Number(slippageBps),
+        poolSharePct: leg0?.poolShare != null ? Number(leg0.poolShare) * 100 : null,
+        priceImpactExFeePct: leg0?.priceImpactExFee != null ? Number(leg0.priceImpactExFee) * 100 : null,
+        spot: leg0?.spot ?? null, execRate: leg0?.execRate ?? null,
+        economyGates: econ?.gates || [],
+        gasEstimate: gasEstimate ? String(gasEstimate) : null,
+        gasPriceWei: gasPrice ? String(gasPrice) : null,
+        gasCostWei: gasCostWei ? String(gasCostWei) : null,
+        gasCostEth: gasCostWei ? ethers.formatEther(gasCostWei) : null,
+        deadline, preflight: "PASS", allowApprove: false, txCap: 1,
+      };
+      this.log(
+        `[SINGLE-SWAP] PLAN ${direction} in=${plan.amountInHuman} quoteOut=${plan.quoteOutHuman} ` +
+        `amountOutMin=${plan.amountOutMinHuman} (slip=${plan.slippageBps}bps) ` +
+        `poolShare=${plan.poolSharePct === null ? "-" : plan.poolSharePct.toFixed(4) + "%"} ` +
+        `priceImpactExFee=${plan.priceImpactExFeePct === null ? "-" : plan.priceImpactExFeePct.toFixed(4) + "%"} ` +
+        `gas=${plan.gasEstimate ?? "-"} (~${plan.gasCostEth ?? "?"} ETH @ ${plan.gasPriceWei ?? "?"} wei) ` +
+        `router=${routerAddr} pool=${pool} path=${best.path.join("→")}`, "warn");
+    }
+
     if (dryRun) {
       this.log(`[DRY] ${tag}would swap ${direction} ${ethers.formatUnits(amountRaw, fromDec)} → min ${ethers.formatUnits(amountOutMin, toDec)}`, "info");
-      return { status: "dry", code: "DRY_RUN", reason: "dry-run — no transaction sent", amountIn: String(amountRaw), amountOutMin: String(amountOutMin) };
+      return { status: "dry", code: "DRY_RUN", reason: pinned ? "plan only — no --confirm, nothing signed" : "dry-run — no transaction sent", amountIn: String(amountRaw), amountOutMin: String(amountOutMin), plan };
     }
 
     // 6 + 7. allowance (logged) → approve only when needed → send → wait receipt
@@ -3625,6 +4095,7 @@ export class AutoTrader {
       amount: amountRaw, amountOutMin,
       config: this.config, log: this.log.bind(this), txManager: this.txManager,
       path: best.path, report,
+      allowApprove: pinned ? pinned.allowApprove !== false : true,
     });
     if (!res || res.ok === false) return fail(report.code || "TX_REVERTED", report.reason || "swap execution failed");
 
@@ -3644,11 +4115,16 @@ export class AutoTrader {
     const outDelta = afterTo - beforeTo;
     const ok = inDelta > 0n && outDelta > 0n && outDelta >= amountOutMin;
     this.log(
-      `[SWAP SUCCESS] direction=${direction} tx=${res.txHash} block=${res.blockNumber ?? "-"} gas=${res.gasUsed ?? "-"} ` +
+      `[SWAP ${ok ? "CONFIRMED" : "MISMATCH"}] direction=${direction} tx=${res.txHash} block=${res.blockNumber ?? "-"} gas=${res.gasUsed ?? "-"} ` +
       `inDelta=${inDelta} outDelta=${outDelta} amountIn=${amountRaw} amountOutMin=${amountOutMin}`,
       ok ? "success" : "error");
-    if (!ok) return fail("VERIFY_FAILED", `inDelta=${inDelta} outDelta=${outDelta} amountOutMin=${amountOutMin}`);
-
+    if (!ok) {
+      // Receipt is CONFIRMED but the balance deltas contradict the expectation.
+      this.txManager?.journal?.transition(res.txHash, TX_STATE.CONFIRMED_STATE_MISMATCH, {
+        reason: `inDelta=${inDelta} outDelta=${outDelta} amountOutMin=${amountOutMin}`,
+      });
+      return fail("VERIFY_FAILED", `inDelta=${inDelta} outDelta=${outDelta} amountOutMin=${amountOutMin}`);
+    }
     // 10. record the successful pair — runSwapRotationQueue() then advances the
     // rotation queue, so the NEXT pass starts on a different direction.
     this._lastSwapTxAt = Date.now();
@@ -3662,6 +4138,7 @@ export class AutoTrader {
       inDelta: String(inDelta), outDelta: String(outDelta),
       path: best.path, hops: best.type, pool,
       allowance: report.allowance || null, preflight: report.preflight || "PASS",
+      plan,
     };
   }
 
@@ -3870,6 +4347,64 @@ export class AutoTrader {
   }
 
   /**
+   * SINGLE SWAP — exactly ONE explicitly-sized swap, then stop.
+   *
+   * Contract of this mode (hard requirements, not conventions):
+   *   • direction is PINNED by the operator (--from/--to) — rotation never picks it
+   *   • size is PINNED (--amount) — no random sizing, and the decimal string must
+   *     round-trip to the exact raw amount that is sent
+   *   • exactly ONE transaction: if the router allowance is short the operation is
+   *     REFUSED (APPROVAL_REQUIRED) instead of sending an approve first
+   *   • no OPEN / CLOSE: this path never reaches openPosition()/closePosition(),
+   *     so an active position (e.g. #75) cannot be mutated by it
+   *   • no loop, no rounds, no auto-advance: `_attemptSwapDirection` is called
+   *     exactly once and control returns immediately
+   *   • without --confirm it is a READ-ONLY plan (quote, amountOutMin, pool share,
+   *     price impact, gas, preflight eth_call) — nothing is signed
+   *
+   * @returns {{mode:string, confirm:boolean, sent:number, verified:number,
+   *            blocked:string|null, plan:object|null, result:object|null}}
+   */
+  async runSingleSwap({ confirm = false, from = null, to = null, amount = null } = {}) {
+    const out = { mode: "SINGLE-SWAP", confirm: !!confirm, sent: 0, verified: 0, blocked: null, plan: null, result: null };
+    const block = (code, why) => { out.blocked = code; this.log(`[SINGLE-SWAP] BLOCKED ${code}: ${why}`, "error"); return out; };
+
+    if (this.running || this._swapLoopRunning) return block("ENGINE_ALREADY_RUNNING", "the main loop / swap loop already owns the scheduler");
+    if (!from || !to) return block("MISSING_PARAMS", "--from= and --to= are required (rotation never picks a direction here)");
+    if (String(from).toUpperCase() === String(to).toUpperCase()) return block("SAME_TOKEN", "--from and --to must differ");
+    const amt = amount === null || amount === undefined ? "" : String(amount).trim();
+    if (!amt || !/^\d+(\.\d+)?$/.test(amt) || !(Number(amt) > 0)) {
+      return block("MISSING_AMOUNT", "--amount= must be a plain positive decimal string (no random sizing, no scientific notation)");
+    }
+
+    if (!confirm) this.log("[SINGLE-SWAP] no --confirm — READ-ONLY plan: quote / amountOutMin / pool share / price impact / gas / preflight, nothing signed", "warn");
+    await this.ensureMarkets();
+    const { directions, decimalsMap } = this._swapDirections({ from, to });
+    if (!directions.length) return block("NO_ROUTE", `no validated route ${from}→${to} (routes=${(this.routes || []).length})`);
+    const dir = directions[0];
+
+    const cfg = normalizeSwapConfig(this.config);
+    const { provider, wallet } = this.getRuntime();
+    const ctx = {
+      cfg, provider, wallet, walletAddr: wallet.address, decimalsMap,
+      dryRun: !confirm || !!this.config.dryRun,
+      slippageBps: BigInt(cfg.slippageBps),
+      phase: "SINGLE-SWAP ",
+      pinned: { amount: amt, allowApprove: false },
+    };
+
+    this.log(`[SINGLE-SWAP] ONE operation only: ${dir.from}→${dir.to} amount=${amt} confirm=${!!confirm} dryRun=${ctx.dryRun} — no loop, no OPEN/CLOSE, no auto-advance`, "warn");
+    const res = await this._attemptSwapDirection(dir, ctx);   // ← exactly one attempt
+    out.result = res || null;
+    out.plan = res?.plan || null;
+    if (res?.status === "ok") { out.sent = 1; out.verified = 1; }
+    if (res?.status === "dry") this.log("[SINGLE-SWAP] planned only — re-run with --confirm to send exactly this one transaction", "warn");
+    if (res?.status === "skip" || res?.status === "fail") this.log(`[SINGLE-SWAP] not executed (${res.code}) — no retry, no rotation to another pair`, "warn");
+    this.log(`[SINGLE-SWAP] done — attempted=${res ? 1 : 0} sent=${out.sent} verified=${out.verified} outcome=${res?.status || "none"} code=${res?.code || "-"}`, out.sent ? "success" : "warn");
+    return out;
+  }
+
+  /**
    * Resolve manager/pool/paymentToken for a stored position WITHOUT ever falling
    * back to a side-derived manager (P7: the fallback could target ANOTHER market's
    * manager, i.e. close the wrong contract).
@@ -4054,6 +4589,150 @@ export class AutoTrader {
   }
 
   /**
+   * Reconcile the local `activePosition` record with an authoritative on-chain
+   * snapshot. The CHAIN is the source of truth; the local record is only a cache.
+   *
+   * Why this exists: a partial close (or any externally-settled close) reduces
+   * on-chain collateral/debt but historically left the local record at its
+   * open-time values — on position #75 the local `collateralAmount` was
+   * 1721515506 while the chain reported 12007481 (~143× divergence). Any close
+   * size computed from the stale local number would be wrong, and the divergence
+   * is exactly what makes a bot "stick" on a position it cannot reason about.
+   *
+   * Rules:
+   *  • NEVER called with an unreadable/ambiguous snapshot (callers pass only a
+   *    snapshot they just successfully read).
+   *  • NEVER clears `activePosition` — only updates its numeric identity fields.
+   *    Clearing remains exclusive to `_clearActivePosition` (verified close or
+   *    zombie), so an on-chain-confirmed active position can never be forgotten.
+   *  • DRY-RUN: logs the divergence but writes nothing.
+   *
+   * @param {object} onChain  {collateralAmount, currentDebt, debtAmount, isLong, active}
+   * @param {object} [opts]   {managerAddr}
+   * @returns {{synced:boolean, changed:string[]}}
+   */
+  _syncActivePositionFromChain(onChain, { managerAddr = null } = {}) {
+    const pos = this.state.activePosition;
+    if (!pos || !onChain) return { synced: false, changed: [] };
+
+    // Compute the diff FIRST, apply it only if this instance may persist. A dry
+    // run must never mutate the live record even transiently.
+    const changes = [];
+    const plan = (field, next) => {
+      const prev = pos[field];
+      if (prev === undefined || prev === null) { changes.push([field, next, `∅→${next}`]); return; }
+      if (String(prev) !== String(next)) { changes.push([field, next, `${prev}→${next}`]); }
+    };
+
+    if (onChain.collateralAmount !== undefined && onChain.collateralAmount !== null) {
+      plan("collateralAmount", String(onChain.collateralAmount));
+    }
+    if (onChain.currentDebt !== undefined && onChain.currentDebt !== null) {
+      plan("debtAmount", String(onChain.currentDebt));
+    }
+    if (onChain.isLong !== undefined && onChain.isLong !== null) {
+      const side = onChain.isLong ? "LONG" : "SHORT";
+      if (pos.side !== side) changes.push(["side", side, `side→${side}`]);
+    }
+    if (managerAddr && (!pos.managerAddr || String(pos.managerAddr).toLowerCase() !== String(managerAddr).toLowerCase())) {
+      changes.push(["managerAddr", managerAddr, `managerAddr→${managerAddr}`]);
+    }
+
+    if (!changes.length) return { synced: false, changed: [] };
+    const changed = changes.map(c => c[2]);
+
+    if (this._isDry()) {
+      this.log(`[DRY] would sync position #${pos.positionId} from on-chain: ${changed.join(" ")} — state untouched`, "info");
+      return { synced: false, changed };
+    }
+    for (const [field, next] of changes) pos[field] = next;
+    this.log(`[SYNC] position #${pos.positionId} local record reconciled with on-chain: ${changed.join(" ")}`, "warn");
+    saveState(this.state);
+    return { synced: true, changed };
+  }
+
+  /**
+   * Settle a still-PENDING open transaction.
+   *
+   * An open only becomes an OPEN when a receipt proves it: `sessionStats.opens`,
+   * `lastSide`, the direction-success counters and `[OPEN] … SUCCESS` are all
+   * withheld until then. Before this method existed a timeout on the receipt
+   * read produced `{pending:true, positionId:null}`, which the cycle then
+   * recorded as a successful open — a success the chain (and nemesis.trade)
+   * never saw.
+   *
+   * @returns {Promise<{status:string, done:boolean}>}
+   *   `done` — the record no longer needs another settlement pass.
+   */
+  async _settlePendingOpen() {
+    const pos = this.state.activePosition;
+    if (!pos?.pendingOpen) return { status: "none", done: true };
+    if (this._isDry()) return { status: "none", done: true };
+
+    const hash = pos.txHash || null;
+    if (!hash) {
+      this.log(`[OPEN] pending open record has no txHash — clearing`, "warn");
+      this._clearActivePosition("pending open without txHash", false);
+      return { status: "cleared", done: true };
+    }
+
+    const { provider } = this.getRuntime();
+    const receipt = (await resolveReceipt({ provider, hash }))?.receipt || null;
+
+    if (!receipt) {
+      let txObj;
+      try { txObj = await provider.getTransaction(hash); } catch { txObj = undefined; }
+      const state = classifyTx({ receipt: null, tx: txObj });
+      if (state === TX_STATE.DROPPED_OR_REPLACED) {
+        this.log(`[OPEN] tx ${hash} DROPPED_OR_REPLACED — no receipt and no longer in the mempool`, "error");
+        this._clearActivePosition("pending open dropped/replaced", false);
+        return { status: state, done: true };
+      }
+      if (state === TX_STATE.UNKNOWN) {
+        this.log(`[OPEN] tx ${hash} UNKNOWN — mined in block ${txObj?.blockNumber} but no endpoint returned a receipt; status unresolved`, "error");
+        return { status: state, done: false };
+      }
+      this.log(`[OPEN] tx ${hash} still PENDING — not counting it as an open`, "warn");
+      return { status: TX_STATE.PENDING, done: false };
+    }
+
+    if (Number(receipt.status) !== 1) {
+      this.log(`[OPEN] tx ${hash} REVERTED (receipt.status=0) — not an open`, "error");
+      this._clearActivePosition("pending open reverted", false);
+      return { status: TX_STATE.REVERTED, done: true };
+    }
+
+    // CONFIRMED — but only a PositionCreated event identifies WHAT opened.
+    let positionId = null;
+    for (const logEntry of receipt.logs || []) {
+      if (logEntry.topics?.[0] === POSITION_CREATED_TOPIC
+        && (!pos.managerAddr || String(logEntry.address).toLowerCase() === String(pos.managerAddr).toLowerCase())) {
+        positionId = Number(BigInt(logEntry.topics[2]));
+        break;
+      }
+    }
+    if (positionId === null) {
+      this.log(`[OPEN] CONFIRMED_STATE_MISMATCH tx=${hash} block=${receipt.blockNumber} — receipt status 1 but no PositionCreated event; not counting it as an open`, "error");
+      pos.pendingOpen = false;
+      pos.mismatch = true;
+      saveState(this.state);
+      return { status: TX_STATE.CONFIRMED_STATE_MISMATCH, done: true };
+    }
+
+    pos.positionId = positionId;
+    pos.pendingOpen = false;
+    if (pos.marketSymbol && pos.side) {
+      this._recordDirectionSuccess(pos.marketSymbol, pos.side);
+      this._rotMarketDone(pos.marketSymbol, pos.side);
+    }
+    this.state.lastSide = pos.side;
+    this.state.sessionStats.opens++;
+    saveState(this.state);
+    this.log(`[OPEN] CONFIRMED tx=${hash} block=${receipt.blockNumber} — position #${positionId} (${pos.side} ${pos.marketSymbol || "?"}); sessionStats.opens=${this.state.sessionStats.opens}`, "success");
+    return { status: TX_STATE.CONFIRMED, done: true };
+  }
+
+  /**
    * Apply a closePositionFn() result to `state`.
    *
    * `activePosition` is cleared ONLY when the position is provably gone:
@@ -4132,6 +4811,16 @@ export class AutoTrader {
   async closeActivePosition() {
     const DONE = { ok: true, blocked: false, continueCycle: true, code: null };
     if (!this.state.activePosition) return { ...DONE, code: "NO_ACTIVE_POSITION" };
+    if (this.state.activePosition.pendingOpen) {
+      // A submitted-but-unconfirmed open must never be dropped as a
+      // "failed-open leftover" — that would let the next cycle double-open.
+      const settle = await this._settlePendingOpen();
+      if (!settle.done) {
+        this.log(`[CLOSE] open tx ${this.state.activePosition.txHash || "?"} still ${settle.status} — deferring close`, "warn");
+        return { ok: false, blocked: false, continueCycle: true, code: `OPEN_${String(settle.status).toUpperCase()}` };
+      }
+      if (!this.state.activePosition) return { ...DONE, code: "OPEN_NOT_CONFIRMED" };
+    }
     if (this.state.activePosition.positionId === null || this.state.activePosition.positionId === undefined) {
       this.log(`[CLOSE] stored record has no positionId (failed-open leftover) — clearing`, "warn");
       this._clearActivePosition("no positionId", false);
@@ -4195,6 +4884,13 @@ export class AutoTrader {
       return { ok: false, blocked: true, continueCycle: true, code: "POSITION_UNREADABLE" };
     }
     const sig = this._closeSig(onChain);
+
+    // LOCAL/ON-CHAIN DIVERGENCE GUARD — the chain is authoritative. A stale
+    // local record (e.g. collateralAmount left over from the open size after a
+    // partial close, as on #75: local 1721515506 vs chain 12007481) would make
+    // every locally-computed close size wrong. Reconcile BEFORE attempting so
+    // the attempt uses real numbers; never the other way round.
+    this._syncActivePositionFromChain(onChain, { managerAddr });
 
     // Identical attempt inside the backoff window → do not touch the chain,
     // let SWAP maintenance continue this cycle and come back later.
@@ -4619,15 +5315,46 @@ export class AutoTrader {
     return true;
   }
 
-  async prepareAndOpen(side) {
+  /**
+   * Contract-aware leverage resolution for ONE candidate (see resolveLeverageForOpen).
+   * Per-market override: config.marketLeverage["SYMBOL"] > config.defaultLeverage.
+   */
+  async _resolveOpenLeverage(candidate, side, ctx, provider, overrideLeverage = null) {
+    return resolveLeverageForOpen(provider, {
+      managerAddr: ctx.managerAddr,
+      marketSymbol: candidate?.symbol || null,
+      isLong: side === "LONG",
+      collateralToken: ctx.collateralToken ?? null,
+      collateralAmount: ctx.collateralAmount ?? null,
+      requestedLeverage: overrideLeverage
+        ?? this.config.marketLeverage?.[candidate?.symbol]
+        ?? this.config.defaultLeverage,
+      config: this.config,
+      log: this.log.bind(this),
+    });
+  }
+
+  async prepareAndOpen(side, opts = {}) {
     const { provider, wallet } = this.getRuntime();
     const walletAddr = wallet.address;
     const dryRun = this.config.dryRun;
 
     await this.ensureMarkets();
-    const marketCandidates = await this.planMarketsForSide(side, {
+    let marketCandidates = await this.planMarketsForSide(side, {
       max: Number(this.config.maxMarketAttemptsPerCycle || 3),
     });
+    if (opts.marketSymbol) {
+      const want = String(opts.marketSymbol).toLowerCase();
+      const only = marketCandidates.filter(
+        m => String(m.marketSymbol || m.symbol || "").toLowerCase() === want,
+      );
+      if (!only.length) {
+        const known = marketCandidates.map(m => m.marketSymbol || m.symbol).join(", ") || "none";
+        this.log(`[BLOCKED] requested market ${opts.marketSymbol} not available for ${side} (candidates: ${known})`, "error");
+        return false;
+      }
+      marketCandidates = only;
+    }
     if (!marketCandidates.length) {
       this.log(`[BLOCKED] No active market supports ${side}`, "error");
       return false;
@@ -4639,11 +5366,15 @@ export class AutoTrader {
     // loop below (_candidateContext / _ensureCollateralForCtx), each candidate gets its
     // own read-only quote precheck — a fallback candidate never inherits candidate[0]'s
     // token/decimals/amount/paymentToken.
-    this.log(`[AUTO] OPENING ${side} ${this.config.defaultLeverage}x`, "warn");
+    const shownLev = opts.leverage
+      ?? this.config.marketLeverage?.[market.marketSymbol || market.symbol]
+      ?? this.config.defaultLeverage;
+    this.log(`[AUTO] OPENING ${side} ${shownLev}x${opts.marketSymbol ? ` (pinned market ${opts.marketSymbol})` : ""}`, "warn");
     this.setState(STATES.OPEN);
     let openResult = null;
     let openedMarket = null;
     let openedCtx = null;
+    let openedLeverage = null;
     for (const candidate of marketCandidates) {
       this.log(`[OPEN] trying market ${candidate.symbol} manager=${short(candidate.managerAddr)}`, "info");
 
@@ -4662,13 +5393,22 @@ export class AutoTrader {
         continue;
       }
 
+      // LEVERAGE — contract bounds ∩ config ∩ per-market override, probed with
+      // previewOpenPosition (read-only). Unresolvable → next candidate.
+      const levPlan = await this._resolveOpenLeverage(candidate, side, ctx, provider, opts.leverage ?? null);
+      if (!levPlan.ok) {
+        this.log(`[SKIP] ${candidate.symbol} ${side}: leverage unresolved (${levPlan.code}: ${levPlan.reason}) — trying next candidate`, "warn");
+        this._rotMarketSkip(candidate.symbol, side);
+        continue;
+      }
+
       // READ-ONLY viability pre-check (view calls only, no transaction).
       // Minimum-size/dust candidates are SKIPPED with a reason, never counted
       // as a direction failure (see P4).
       const pre = await precheckMarketQuote(provider, {
         pool: ctx.poolAddr, manager: ctx.managerAddr,
         collateralToken: ctx.collateralToken, collateralAmount: ctx.collateralAmount,
-        leverageX10: BigInt(Math.round(Number(this.config.defaultLeverage) * 10)),
+        leverageX10: BigInt(levPlan.leverageX10),
         isLong: side === "LONG", log: this.log.bind(this),
       });
       if (!pre.ok) {
@@ -4689,7 +5429,7 @@ export class AutoTrader {
       const attempt = await openPosition({
         wallet, provider, managerAddr: ctx.managerAddr, poolAddr: ctx.poolAddr,
         side, collateralToken: ctx.collateralToken, collateralAmount: ctx.collateralAmount,
-        leverage: this.config.defaultLeverage,
+        leverage: levPlan.leverage,
         config: this.config, log: this.log.bind(this), dryRun, txManager: this.txManager,
         paymentToken: ctx.paymentToken,
       });
@@ -4697,6 +5437,7 @@ export class AutoTrader {
       if (attempt) {
         openedMarket = candidate;
         openedCtx = ctx;
+        openedLeverage = levPlan.leverage;
         break;
       }
       this._recordDirectionFailure(candidate.symbol, side);
@@ -4710,6 +5451,26 @@ export class AutoTrader {
       this.log(`[DRY] Open ${side} would execute on ${marketUsed.symbol}`, "info");
       this.log(`[DRY] state untouched — lastSide/rotation/sessionStats unchanged`, "info");
       return true;
+    } else if (openResult?.pending) {
+      // SUBMITTED/PENDING is NOT an open — kept only to block a second OPEN.
+      // sessionStats.opens stays untouched until _settlePendingOpen() proves it.
+      this.state.activePosition = {
+        positionId: openResult.positionId ?? null,
+        side,
+        collateralToken: ctxUsed?.collateralToken || marketUsed.collateralToken,
+        collateralAmount: String(ctxUsed?.collateralAmount ?? ""),
+        paymentToken: ctxUsed?.paymentToken || marketUsed.paymentToken || null,
+        leverage: openedLeverage ?? this.config.defaultLeverage,
+        openedAt: Date.now(),
+        txHash: openResult.txHash,
+        marketSymbol: marketUsed.symbol,
+        managerAddr: marketUsed.managerAddr,
+        poolAddr: marketUsed.poolAddr,
+        pendingOpen: true,
+      };
+      saveState(this.state);
+      this.log(`[OPEN] PENDING tx=${openResult.txHash} — awaiting confirmation; sessionStats.opens NOT incremented`, "warn");
+      return true;
     } else if (openResult) {
       this._recordDirectionSuccess(marketUsed.symbol, side);
       this._rotMarketDone(marketUsed.symbol, side);
@@ -4720,7 +5481,7 @@ export class AutoTrader {
         collateralToken: ctxUsed?.collateralToken || marketUsed.collateralToken,
         collateralAmount: String(ctxUsed?.collateralAmount ?? ""),
         paymentToken: ctxUsed?.paymentToken || marketUsed.paymentToken || null,
-        leverage: this.config.defaultLeverage,
+        leverage: openedLeverage ?? this.config.defaultLeverage,
         openedAt: Date.now(),
         txHash: openResult.txHash,
         marketSymbol: marketUsed.symbol,
@@ -4736,6 +5497,384 @@ export class AutoTrader {
       this.log(`[BLOCKED] Open failed on all candidate markets`, "error");
       return false;
     }
+  }
+
+  // ═════════════════════════════════════════════════════════════════════════
+  //  POSITION STATUS — on-chain truth (read-only, never sends a TX)
+  // ═════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Full status report for ONE position: getPositionRisk (17-field) + positions
+   * (+getHealthFactor) + a full-close preview — everything from view calls.
+   *
+   * @param positionId {string|number|bigint}
+   * @param managerAddr {string|null} explicit manager; falls back to the stored
+   *        position identity (resolveManagerForPosition) when the id matches it.
+   * @returns structured report (bigints as decimal strings) or {ok:false,code}
+   */
+  async describePosition(positionId, managerAddr = null) {
+    const { provider, wallet } = this.getRuntime();
+    const walletAddr = String(wallet?.address || "").toLowerCase();
+    const idStr = String(positionId);
+    let id;
+    try { id = BigInt(positionId); } catch { return { ok: false, code: "BAD_ID", positionId: idStr, reason: "positionId is not a number" }; }
+
+    let mgrAddr = managerAddr || null;
+    const stored = this.state.activePosition;
+    if (!mgrAddr && stored && String(stored.positionId ?? "") === idStr) {
+      mgrAddr = this.resolveManagerForPosition(stored)?.managerAddr || stored.managerAddr || null;
+    }
+    if (!mgrAddr && stored?.managerAddr && !managerAddr) mgrAddr = stored.managerAddr;
+    if (!mgrAddr) {
+      return {
+        ok: false, code: "NO_MANAGER", positionId: idStr,
+        reason: "no manager address known for this position — pass --manager=0x…",
+      };
+    }
+
+    const mgr = new ethers.Contract(mgrAddr, MANAGER_ABI, provider);
+    let risk = null; let riskErr = null;
+    let pos = null; let posErr = null;
+    let hf = null;
+    let closeFull = null;
+    let closeFullBps = null;
+
+    try { risk = await mgr.getPositionRisk(id); } catch (e) { riskErr = revertSelector(e) || String(e?.message || e).slice(0, 60); }
+    try { pos = await mgr.positions(id); } catch (e) { posErr = revertSelector(e) || String(e?.message || e).slice(0, 60); }
+    try { hf = await mgr.getHealthFactor(id); } catch { hf = null; }
+
+    const active = risk ? !!risk.isActive : (pos ? !!pos.active : null);
+    if (risk && active) {
+      try {
+        closeFull = await mgr.previewClosePosition(id, 10000n);
+        closeFullBps = 10000;
+      } catch (e1) {
+        try {
+          closeFull = await mgr.previewClosePosition(id, 9999n);
+          closeFullBps = 9999;
+        } catch (e2) { closeFull = { err: revertSelector(e2) || revertSelector(e1) || "revert" }; }
+      }
+    }
+
+    const found = !!(risk || pos);
+    if (!found && (riskErr === ERR_INVALID_POSITION || posErr === ERR_INVALID_POSITION)) {
+      return {
+        ok: true, found: false, active: false, positionId: idStr, managerAddr: mgrAddr,
+        status: "NOT_FOUND", reason: "MAM_InvalidPosition — the manager has no such position",
+      };
+    }
+
+    const isLong = risk ? !!risk.isLong : pos ? !!pos.isLong : null;
+    const collateralToken = risk ? risk.collateralToken : pos ? pos.collateralToken : null;
+    const debtAsset = risk?.debtAsset ?? null;
+    let collateralSym = null; let collateralDec = null;
+    let debtSym = null; let debtDec = null;
+    try {
+      if (collateralToken) {
+        const m = await tokenMetaOnChain(provider, collateralToken);
+        collateralSym = m.symbol; collateralDec = m.decimals;
+      }
+    } catch { /* keep null */ }
+    try {
+      if (debtAsset) {
+        const m = await tokenMetaOnChain(provider, debtAsset);
+        debtSym = m.symbol; debtDec = m.decimals;
+      }
+    } catch { /* keep null */ }
+
+    const equity = risk ? BigInt(risk.equityValue) : null;
+    const debtValueT1 = risk ? BigInt(risk.currentDebtValueToken1) : null;
+    const notional = risk ? BigInt(risk.notionalValue) : null;
+    let estimatedLeverageX10 = null;
+    if (equity !== null && debtValueT1 !== null && notional !== null) {
+      const collateralValueT1 = debtValueT1 + equity; // value = equity + debt, token1 units
+      if (collateralValueT1 > 0n && notional > 0n) {
+        const x10 = (notional * 10n) / collateralValueT1;
+        if (x10 >= 10n && x10 <= 1000n) estimatedLeverageX10 = Number(x10);
+      }
+    }
+
+    let status;
+    if (!found) status = "NOT_FOUND";
+    else if (active === false) status = "CLOSED";
+    else if (risk?.liquidatable) status = "LIQUIDATION_RISK";
+    else if (hf !== null && Number(hf) === 0) status = "AT_RISK";
+    else status = "ACTIVE";
+
+    const report = {
+      ok: true, found, active, positionId: idStr, managerAddr: mgrAddr, status,
+      isLong, side: isLong === null ? null : isLong ? "LONG" : "SHORT",
+      user: risk?.user || pos?.user || null,
+      ours: String(risk?.user || pos?.user || "").toLowerCase() === walletAddr && !!walletAddr,
+      collateralToken, collateralSym, collateralDecimals: collateralDec,
+      collateralAmount: String(risk?.collateralAmount ?? pos?.collateralAmount ?? 0n),
+      collateralAmountHuman: collateralDec !== null && risk
+        ? ethers.formatUnits(risk.collateralAmount, collateralDec) : null,
+      debtAsset, debtSym, debtDecimals: debtDec,
+      storedDebt: risk ? String(risk.storedDebt) : null,
+      currentDebt: risk ? String(risk.currentDebt) : null,
+      currentDebtHuman: debtDec !== null && risk ? ethers.formatUnits(risk.currentDebt, debtDec) : null,
+      currentDebtValueToken1: risk ? String(risk.currentDebtValueToken1) : null,
+      notionalValue: notional !== null ? String(notional) : null,
+      equityValue: equity !== null ? String(equity) : null, // PnL in token1 units (int, can be < 0)
+      equityValueHuman: debtDec !== null && equity !== null ? ethers.formatUnits(equity, debtDec) : null,
+      healthBps: risk ? Number(risk.healthBps) : null,
+      healthFactor: hf !== null ? String(hf) : null,
+      liquidationPrice: risk ? String(risk.liquidationPrice) : null,
+      liquidatable: risk ? !!risk.liquidatable : null,
+      oracleReady: risk ? !!risk.oracleReady : null,
+      estimatedLeverageX10, // heuristic: notional / (debt + equity), NULL when meaningless
+      leverageFromState: stored && String(stored.positionId ?? "") === idStr ? stored.leverage ?? null : null,
+      closeFull: active && closeFull && !closeFull.err
+        ? {
+            closeBps: closeFullBps,
+            repayAmount: String(closeFull.repayAmount),
+            collateralReturned: String(closeFull.collateralReturned),
+            realizedPnl: String(closeFull.realizedPnl),
+            realizedPnlHuman: debtDec !== null ? ethers.formatUnits(closeFull.realizedPnl, debtDec) : null,
+            closePrice: String(closeFull.closePrice),
+            projectedHealthBps: Number(closeFull.projectedHealthBps),
+          }
+        : active && closeFull?.err
+          ? { ok: false, err: closeFull.err }
+          : null,
+      readErrors: { risk: riskErr, positions: posErr },
+    };
+    return report;
+  }
+
+  _logPositionReport(rep) {
+    if (!rep || rep.ok === false) {
+      this.log(`[STATUS] FAILED ${rep?.code || "?"} — ${rep?.reason || "unknown"}`, "error");
+      return;
+    }
+    if (!rep.found) {
+      this.log(`[STATUS] #${rep.positionId}: ${rep.status} (${rep.reason || "manager has no such position"})`, "warn");
+      return;
+    }
+    if (rep.active === false) {
+      this.log(`[STATUS] #${rep.positionId}: CLOSED on-chain (last state: ${rep.side || "?"} ${rep.collateralSym || "?"})`, "success");
+      return;
+    }
+    const parts = [
+      `#${rep.positionId} ${rep.side} ${rep.ours ? "(ours)" : `(not ours: ${short(rep.user)})`}`,
+      `collateral=${rep.collateralAmountHuman ?? rep.collateralAmount} ${rep.collateralSym || "?"}`,
+      `debt=${rep.currentDebtHuman ?? rep.currentDebt ?? "?"} ${rep.debtSym || ""}`,
+      `healthBps=${rep.healthBps ?? "?"}`,
+      `equity(PnL)=${rep.equityValueHuman ?? rep.equityValue ?? "?"} ${rep.debtSym || ""}`,
+      `leverage≈${rep.estimatedLeverageX10 !== null ? rep.estimatedLeverageX10 / 10 + "x" : "?"}` +
+        (rep.leverageFromState !== null && rep.leverageFromState !== undefined ? ` (state ${rep.leverageFromState}x)` : ""),
+      `liqPrice=${rep.liquidationPrice ?? "?"}`,
+      `liquidatable=${rep.liquidatable}`,
+      `status=${rep.status}`,
+    ];
+    this.log(`[STATUS] ${parts.join(" | ")}`, rep.status === "LIQUIDATION_RISK" ? "error" : "info");
+    if (rep.closeFull && rep.closeFull.closeBps) {
+      this.log(`[STATUS] full-close preview: recv=${rep.closeFull.collateralReturned} repay=${rep.closeFull.repayAmount} pnl=${rep.closeFull.realizedPnlHuman ?? rep.closeFull.realizedPnl} closePrice=${rep.closeFull.closePrice} (closeBps=${rep.closeFull.closeBps})`, "info");
+    } else if (rep.closeFull?.ok === false) {
+      this.log(`[STATUS] full-close preview REVERTED ${rep.closeFull.err} — close would need partialClose ladder`, "warn");
+    }
+    if (rep.status === "LIQUIDATION_RISK") {
+      this.log(`[STATUS] #${rep.positionId} is LIQUIDATABLE on-chain — consider closing (see active writes later)`, "error");
+    }
+  }
+
+  /**
+   * Status listing: explicit id → that position; otherwise our active position
+   * plus a read-only getUserPositions() scan over known managers.
+   */
+  async runPositionStatus({ positionId = null, managerAddr = null } = {}) {
+    const { provider, wallet } = this.getRuntime();
+    if (positionId !== null && positionId !== undefined && `${positionId}` !== "") {
+      const rep = await this.describePosition(positionId, managerAddr);
+      this._logPositionReport(rep);
+      return { ok: rep.ok !== false, action: "status", reports: [rep] };
+    }
+
+    const mgrs = new Map();
+    const add = (a) => { if (a && typeof a === "string" && a.startsWith("0x")) mgrs.set(a.toLowerCase(), a); };
+    add(this.state.activePosition?.managerAddr);
+    if (this.state.activePosition) add(this.resolveManagerForPosition(this.state.activePosition)?.managerAddr);
+    for (const m of (this.markets || [])) add(m.managerAddr);
+    const list = [...mgrs.values()].slice(0, 12);
+
+    const reports = [];
+    for (const a of list) {
+      let ids = [];
+      try {
+        const c = new ethers.Contract(a, MANAGER_ABI, provider);
+        ids = (await c.getUserPositions(wallet.address)) || [];
+      } catch (e) {
+        this.log(`[STATUS] getUserPositions failed on ${short(a)}: ${revertSelector(e) || String(e?.message || e).slice(0, 50)}`, "warn");
+        continue;
+      }
+      for (const pid of ids) {
+        const rep = await this.describePosition(pid, a);
+        reports.push(rep);
+        this._logPositionReport(rep);
+      }
+    }
+    if (!reports.length) {
+      this.log(`[STATUS] no open positions for ${wallet.address} (scanned ${list.length} manager(s))`, "info");
+    }
+    return { ok: true, action: "status", reports };
+  }
+
+  // ═════════════════════════════════════════════════════════════════════════
+  //  SINGLE ACTION DISPATCH — open | close | partial | status | swap
+  // ═════════════════════════════════════════════════════════════════════════
+
+  /**
+   * ONE operator action. Dry-run is the default: TX writes require BOTH
+   * `confirm` and config.dryRun=false. Never loops, never rotates silently.
+   *
+   * @param opts.action {"open"|"close"|"partial"|"status"|"swap"}
+   * @param opts.confirm {boolean} allow the write path (still gated by config.dryRun)
+   * @param opts.side {"LONG"|"SHORT"}            (open)
+   * @param opts.marketSymbol {string|null}       (open) pin one market
+   * @param opts.leverage {number|null}           (open) per-position leverage override
+   * @param opts.positionId {number|string|null}  (close/partial/status)
+   * @param opts.pct {number|null}                (partial) 1..99 percent
+   * @param opts.manager {string|null}            explicit manager override
+   * @param opts.from/.to/.amount                 (swap, passed through to runSingleSwap)
+   */
+  async runSingleAction(opts = {}) {
+    const action = String(opts.action || "").toLowerCase();
+    const confirm = !!opts.confirm;
+    const dryRun = !confirm || !!this.config.dryRun;
+    const base = { ok: false, action, dryRun };
+
+    if (action === "status") {
+      return this.runPositionStatus({ positionId: opts.positionId ?? null, managerAddr: opts.manager ?? null });
+    }
+
+    if (action === "swap") {
+      const out = await this.runSingleSwap({
+        confirm, from: opts.from, to: opts.to, amount: opts.amount,
+      });
+      const ok = !!(out?.sent && out?.verified) || out?.result?.status === "dry";
+      const code = out?.blocked ? out.blocked
+        : out?.sent && out?.verified ? "SWAP_OK"
+        : out?.result?.status === "dry" ? "DRY"
+        : out?.result?.code || (out?.sent ? "UNCONFIRMED" : "NOT_SENT");
+      return { ...base, ...out, ok, code, dryRun: out?.sent ? false : dryRun };
+    }
+
+    if (action === "open") {
+      const side = String(opts.side || "").toUpperCase();
+      if (side !== "LONG" && side !== "SHORT") {
+        this.log(`[BLOCKED] --single=open requires --side=LONG or --side=SHORT (got "${opts.side || ""}")`, "error");
+        return { ...base, code: "BAD_SIDE" };
+      }
+      const lev = opts.leverage !== null && opts.leverage !== undefined && `${opts.leverage}` !== ""
+        ? Number(opts.leverage) : null;
+      if (lev !== null && (!Number.isInteger(lev) || lev < 1)) {
+        this.log(`[BLOCKED] --leverage must be an integer ≥1 (got ${opts.leverage})`, "error");
+        return { ...base, code: "BAD_LEVERAGE" };
+      }
+      this.log(`[SINGLE] OPEN ${side}${opts.marketSymbol ? ` on ${opts.marketSymbol}` : ""}${lev !== null ? ` @ ${lev}x` : ""} confirm=${confirm} dryRun=${dryRun}`, "warn");
+      const ok = await this.prepareAndOpen(side, { marketSymbol: opts.marketSymbol || null, leverage: lev });
+      const ap = this.state.activePosition;
+      return {
+        ...base, ok: !!ok, code: ok ? (dryRun ? "OPEN_PLANNED" : "OPENED") : "OPEN_BLOCKED", dryRun,
+        opened: ok ? ap : null,
+        // dry-run: the leverage/market plan was logged by _resolveOpenLeverage
+      };
+    }
+
+    if (action === "close" || action === "partial") {
+      const idRaw = opts.positionId ?? this.state.activePosition?.positionId ?? null;
+      if (idRaw === null || idRaw === undefined || `${idRaw}` === "") {
+        this.log(`[BLOCKED] --id=<positionId> required (no tracked active position to fall back to)`, "error");
+        return { ...base, code: "NO_POSITION_ID" };
+      }
+      const idStr = String(idRaw);
+
+      let mgrAddr = opts.manager || null;
+      const stored = this.state.activePosition;
+      if (!mgrAddr && stored && String(stored.positionId ?? "") === idStr) {
+        mgrAddr = this.resolveManagerForPosition(stored)?.managerAddr || stored.managerAddr || null;
+      }
+      if (!mgrAddr) {
+        this.log(`[BLOCKED] no manager for position #${idStr} — pass --manager=0x…`, "error");
+        return { ...base, code: "NO_MANAGER", positionId: idStr };
+      }
+
+      const { provider, wallet } = this.getRuntime();
+      const report = await this.describePosition(idStr, mgrAddr);
+      this._logPositionReport(report);
+      if (!report.found) return { ...base, code: "NOT_FOUND", report };
+      if (report.active === false) return { ok: true, ...base, code: "ALREADY_CLOSED", report };
+
+      if (action === "close") {
+        if (dryRun) {
+          this.log(`[DRY] would closePosition #${idStr} on ${short(mgrAddr)} — re-run with --confirm to send`, "warn");
+          if (report.closeFull?.closeBps) {
+            this.log(`[DRY] expected: recv ${report.closeFull.collateralReturned} collateral, repay ${report.closeFull.repayAmount}, pnl ${report.closeFull.realizedPnlHuman ?? report.closeFull.realizedPnl}`, "info");
+          } else if (report.closeFull?.ok === false) {
+            this.log(`[DRY] full close previews REVERT (${report.closeFull.err}) — live close would fall back to partialClose ladder`, "warn");
+          }
+          return { ...base, ok: true, code: "DRY", report };
+        }
+        const res = await closePositionFn({
+          wallet, provider, managerAddr: mgrAddr, positionId: BigInt(idStr),
+          config: this.config, log: this.log.bind(this), dryRun: false, txManager: this.txManager,
+        });
+        const after = await this.describePosition(idStr, mgrAddr);
+        this._logPositionReport(after);
+        const verifiedClosed = res?.ok && after.found && after.active === false;
+        if (verifiedClosed) this.log(`[VERIFY] close CONFIRMED on-chain: #${idStr} is closed`, "success");
+        else if (res && !res.ok && !res.failed) { /* dry or pending */ }
+        return { ...base, ok: !!verifiedClosed, result: res, report: after };
+      }
+
+      // partial
+      const pct = opts.pct !== null && opts.pct !== undefined && `${opts.pct}` !== ""
+        ? Number(opts.pct) : null;
+      if (pct === null || !(pct > 0) || pct >= 100) {
+        this.log(`[BLOCKED] --single=partial requires --pct in 1..99 (got ${opts.pct ?? "none"}); 100% is --single=close`, "error");
+        return { ...base, code: "BAD_PCT" };
+      }
+      const closeBps = BigInt(Math.round(pct * 100));
+      if (closeBps < 1n || closeBps > MAX_PARTIAL_CLOSE_BPS) {
+        this.log(`[BLOCKED] closeBps ${closeBps} outside 1..9999`, "error");
+        return { ...base, code: "BAD_PCT" };
+      }
+
+      const pv = await previewCloseAt(provider, mgrAddr, BigInt(idStr), closeBps);
+      if (pv.ok) {
+        this.log(`[PLAN] partial #${idStr} ${closeBps}bps (${pct}%): recv=${pv.quote.collateralReturned} repay=${pv.quote.repayAmount} pnl=${pv.quote.realizedPnl} fee=${pv.quote.protocolFee}`, "info");
+      } else {
+        this.log(`[BLOCKED] partial ${closeBps}bps preview REVERTED ${pv.err} — nothing will be sent`, "error");
+        return { ...base, code: `PARTIAL_PREVIEW_${pv.err || "REVERT"}`, report };
+      }
+
+      if (dryRun) {
+        this.log(`[DRY] would partialClose #${idStr} closeBps=${closeBps} — re-run with --confirm to send`, "warn");
+        return { ...base, ok: true, code: "DRY", closeBps: Number(closeBps), preview: pv.quote ? {
+          collateralReturned: String(pv.quote.collateralReturned),
+          repayAmount: String(pv.quote.repayAmount),
+          realizedPnl: String(pv.quote.realizedPnl),
+        } : null, report };
+      }
+
+      const res = await attemptPartialClose({
+        wallet, provider, managerAddr: mgrAddr, positionId: BigInt(idStr),
+        config: this.config, log: this.log.bind(this), txManager: this.txManager,
+        targetCloseBps: closeBps,
+      });
+      const after = await this.describePosition(idStr, mgrAddr);
+      this._logPositionReport(after);
+      if (res?.ok && after.found && after.active === false) {
+        this.log(`[VERIFY] partial #${idStr} drove the position to CLOSED on-chain`, "success");
+      } else if (res?.ok) {
+        this.log(`[VERIFY] partial #${idStr} confirmed on-chain (position still active, reduced)`, "success");
+      }
+      return { ...base, ok: !!res?.ok, result: res, report: after };
+    }
+
+    this.log(`[BLOCKED] unknown action "${opts.action}" — use open|close|partial|status|swap`, "error");
+    return { ...base, code: "UNKNOWN_ACTION" };
   }
 
   sleep(ms) {

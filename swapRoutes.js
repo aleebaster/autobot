@@ -30,6 +30,42 @@ export function probeAmountFor(decimals) {
   return 10n ** BigInt(d);
 }
 
+/** Discovery probe ladder, in whole tokens (see probeAmountsFor). */
+export const PROBE_LADDER_WHOLE = [1n, 10n, 100n, 1_000n, 10_000n, 100_000n, 1_000_000n, 10_000_000n, 100_000_000n];
+
+/**
+ * Ladder of probe amounts (in raw base units) for route discovery.
+ *
+ * A single "1 whole token" probe is NOT enough: on a heavily imbalanced pool the
+ * 1-token quote rounds down to 0, `getAmountsOut` reverts/returns 0, and a
+ * perfectly live pool gets dropped from the route set. That is exactly how the
+ * directed route set degraded while the pools still quoted fine at real sizes.
+ * The ladder keeps discovery size-tolerant (first rung that quotes wins, so
+ * healthy pools still cost a single call); execution still re-quotes at the REAL
+ * amount and skips when that quote is zero, so nothing with amountOut = 0 can
+ * ever be sent.
+ *
+ * Upper rungs (10M / 100M whole tokens) exist so that a live-but-badly-
+ * imbalanced pool is still REPORTED as a route instead of silently vanishing
+ * from the matrix. Executability at the real trade size is decided later, at
+ * execution time, by re-quoting the actual amount (zero quote → the pair is
+ * skipped, nothing is sent).
+ */
+export function probeAmountsFor(decimals, wholeTokens = PROBE_LADDER_WHOLE) {
+  const d = Number(decimals);
+  const scale = (!Number.isFinite(d) || d < 0 || d > 36) ? 0n : BigInt(d);
+  return wholeTokens.map(w => w * 10n ** scale);
+}
+
+/** First probe amount from the ladder that quotes a non-zero output (or null). */
+async function probeQuote(router, path, decimals) {
+  for (const probe of probeAmountsFor(decimals)) {
+    const q = await quote(router, probe, path);
+    if (q !== null) return { probe, out: q };
+  }
+  return null;
+}
+
 /**
  * Build the dynamic token inventory = deployment tokens ∪ every token seen in a market.
  * Deduplicated by address, meta always fetched on-chain.
@@ -135,9 +171,8 @@ export async function discoverSwapRoutes({
       const A = list[i], B = list[j];
       const pool = await getPool(A.address, B.address);
       if (!pool) continue;
-      const probe = probeAmountFor(A.decimals);
-      const q = await quote(router, probe, [A.address, B.address]);
-      if (q === null) {
+      const hit = await probeQuote(router, [A.address, B.address], A.decimals);
+      if (hit === null) {
         log(`[ROUTES] ${A.symbol}→${B.symbol} pool exists but quote FAILED — rejected`, "warn");
         continue;
       }
@@ -147,7 +182,7 @@ export async function discoverSwapRoutes({
         path: [A.address, B.address],
         type: "direct",
         pool,
-        quoteSample: q.toString(),
+        quoteSample: hit.out.toString(),
         valid: true,
       });
     }
@@ -170,9 +205,8 @@ export async function discoverSwapRoutes({
         const leg1 = await getPool(A.address, hubAddr);
         const leg2 = await getPool(hubAddr, B.address);
         if (!leg1 || !leg2) continue;
-        const probe = probeAmountFor(A.decimals);
-        const q = await quote(router, probe, [A.address, hubAddr, B.address]);
-        if (q === null) continue;
+        const hit = await probeQuote(router, [A.address, hubAddr, B.address], A.decimals);
+        if (hit === null) continue;
         const hub = list.find(t => String(t.address).toLowerCase() === String(hubAddr).toLowerCase());
         routes.push({
           fromSym: A.symbol, toSym: B.symbol,
@@ -182,7 +216,7 @@ export async function discoverSwapRoutes({
           hubSym: hub?.symbol || null,
           pool: leg1,
           pool2: leg2,
-          quoteSample: q.toString(),
+          quoteSample: hit.out.toString(),
           valid: true,
         });
         found = true;
@@ -254,10 +288,17 @@ export function candidatePaths(routes, fromAddr, toAddr, { maxPaths = 4, directP
  * 2-hop). Returns { path, amountOut, type } for the FIRST path with amountOut > 0,
  * or null when every candidate path quotes zero/reverts — the caller must SKIP and
  * must never send a swap with amountOut = 0.
+ *
+ * @param {object} o
+ * @param {boolean} [o.directProbe=true] allow the unvalidated A→B probe to be the
+ *        FIRST candidate when the pair has no validated direct record. Callers that
+ *        must exercise ONLY the validated multi-hop fallback (tests, diagnostics)
+ *        pass `false`; production never does, because a live 1-hop pool is cheaper
+ *        (one fee, one pool) than a 2-hop composition of the same two tokens.
  */
-export async function quoteBestPath({ provider, routerAddress, routes, fromAddr, toAddr, amountIn, log = () => {}, maxPaths = 4 }) {
+export async function quoteBestPath({ provider, routerAddress, routes, fromAddr, toAddr, amountIn, log = () => {}, maxPaths = 4, directProbe = true }) {
   if (!amountIn || amountIn <= 0n) return null;
-  const cands = candidatePaths(routes, fromAddr, toAddr, { maxPaths });
+  const cands = candidatePaths(routes, fromAddr, toAddr, { maxPaths, directProbe });
   if (!cands.length) {
     log(`[ROUTE] no validated path ${_l(fromAddr).slice(0, 10)}…→${_l(toAddr).slice(0, 10)}… — SKIP`, "warn");
     return null;
@@ -330,6 +371,7 @@ export default {
   routeCandidates,
   sourcesForTarget,
   probeAmountFor,
+  probeAmountsFor,
   formatRoutesTable,
   ROUTER_QUOTE_ABI,
 };

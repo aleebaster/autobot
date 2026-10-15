@@ -1,5 +1,5 @@
 {
-  "enableSwaps": false,
+  "enableSwaps": true,
   "activityRepetitions": 3,
   "ethRange": {
     "min": 0.00001,
@@ -187,7 +187,7 @@
   "targetReserveUSDT": "20",
   "targetReserveWETH": "0.004",
   "autoRSIEnabled": false,
-  "fullAutoEnabled": false,
+  "fullAutoEnabled": true,
   "lpEnabled": false,
   "lpPair": "ETH/DAI",
   "lpTokenA": "ETH",
@@ -221,5 +221,34 @@
     "maxSwapAmountUSDT": "100",
     "maxSwapAmountWETH": "0.01",
     "preferTokenToToken": true
+  },
+  "swap": {
+    "enabled": true,
+    "minIntervalMs": 8000,
+    "maxIntervalMs": 30000,
+    "maxSwapsPerCycle": 1,
+    "reserveByToken": {
+      "USDT": "1",
+      "USDC": "1",
+      "DAI": "1",
+      "NEMESIS": "1",
+      "UNI": "0.01",
+      "LINK": "0.01",
+      "WETH": "0.00005"
+    },
+    "defaultReserve": "0",
+    "slippageBps": 50,
+    "maxGasGwei": 500,
+    "maxConsecutiveFailures": 3,
+    "routeBackoffMs": 15000,
+    "routeBackoffMaxMs": 120000,
+    "rotatePairs": true,
+    "reverseDirections": true
+  },
+  "swapEconomy": {
+    "maxPoolShareBps": 100,
+    "maxPriceImpactBps": 200,
+    "maxRateDeviation": 0.05,
+    "maxLegs": 2
   }
 }

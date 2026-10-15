@@ -862,10 +862,19 @@ function selectRandomSwapPair(journal, balances, autoSwapConfig, tokenAddrs, log
         key: `${p.from}>${p.to}`,
       }));
 
+  // The amount gate must run HERE, not only in calculateRandomSwapAmount(): a
+  // pair whose source balance is below minSwapAmount{SYM} can never produce an
+  // amount, so selecting it makes the swapper `continue` without recording a
+  // rotation — and RotationMemory then re-picks the exact same pair forever
+  // (deterministic livelock, zero SWAPs). Filter those pairs out up front so the
+  // rotation only ever considers pairs that are actually executable.
+  const minAmountFor = (sym) => minSwapAmountFor(sym, autoSwapConfig);
+
   let candidates = baseCandidates.filter(pair => {
     if (!pair.fromAddr || !pair.toAddr) return false;
     const fromBal = balances[pair.from];
     if (!fromBal || fromBal.float <= 0) return false;
+    if (fromBal.float < minAmountFor(pair.from)) return false;
     if (preferTokenToToken && pair.from === "ETH") return false;
     if (journal && journal.wasRecentlySwapped(pair.from, pair.to, cooldownMs)) return false;
     if (journal && journal.wouldCreateCycle(pair.from, pair.to)) return false;
@@ -910,8 +919,24 @@ const SWAP_AMOUNT_BOUNDS = {
   DAI:    { min: "1",      max: "100" },
   UNI:    { min: "0.01",   max: "10" },
   LINK:   { min: "0.1",    max: "20" },
-  NEMESIS:{ min: "0.5",    max: "50" },
+  NEMESIS:{ min: "0.5",   max: "50" },
 };
+
+/**
+ * Smallest human-unit amount that may be swapped for `fromSym`.
+ *
+ * Single source of truth for the swap amount gate: `selectRandomSwapPair()`
+ * uses it to reject non-executable pairs BEFORE rotation picks them, and
+ * `calculateRandomSwapAmount()` uses it to clamp the size. Same key lookup as
+ * the amount calculator (`autoSwapConfig.minSwapAmount{SYM}` over the
+ * per-token bounds).
+ */
+function minSwapAmountFor(fromSym, autoSwapConfig = {}) {
+  const bounds = SWAP_AMOUNT_BOUNDS[String(fromSym).toUpperCase()] || { min: "0.001" };
+  const minAmountStr = autoSwapConfig[`minSwapAmount${fromSym}`] ?? bounds.min;
+  const minAmount = parseFloat(minAmountStr);
+  return Number.isFinite(minAmount) && minAmount > 0 ? minAmount : 0;
+}
 
 /**
  * Calculate a random swap amount for the selected pair.
@@ -931,16 +956,23 @@ function calculateRandomSwapAmount(fromSym, fromBalanceFloat, autoSwapConfig, de
   const maxPercent = autoSwapConfig.swapMaxPercent || 15;
 
   const bounds = SWAP_AMOUNT_BOUNDS[String(fromSym).toUpperCase()] || { min: "0.001", max: "100" };
-  const minAmountStr = autoSwapConfig[`minSwapAmount${fromSym}`] ?? bounds.min;
   const maxAmountStr = autoSwapConfig[`maxSwapAmount${fromSym}`] ?? bounds.max;
-  const minAmount = parseFloat(minAmountStr);
+  const minAmount = minSwapAmountFor(fromSym, autoSwapConfig);
   const maxAmount = parseFloat(maxAmountStr);
 
   if (!Number.isFinite(fromBalanceFloat) || fromBalanceFloat <= 0) return null;
 
+  // SIZING PRIORITY: the configured random percentage must actually influence the
+  // amount. It is applied to the usable base — available balance capped by the
+  // absolute per-token maximum — NOT to the raw balance. Before this fix the
+  // percent was computed first and then CLAMPED UP to maxSwapAmount whenever the
+  // balance was large, so [3..15]% was inert and every swap landed on the
+  // absolute ceiling. The ceiling is still respected; it just no longer wins.
+  const base = Math.min(fromBalanceFloat, maxAmount);
   const percent = randomInRange(minPercent, maxPercent);
-  let amountFloat = fromBalanceFloat * (percent / 100);
+  let amountFloat = base * (percent / 100);
 
+  // absolute ceiling + 90%-of-balance safety cap still hold
   if (amountFloat > maxAmount) amountFloat = maxAmount;
   if (amountFloat > fromBalanceFloat * 0.9) amountFloat = fromBalanceFloat * 0.9;
 
@@ -995,6 +1027,7 @@ export {
   calculateInventoryDeficit,
   selectRandomSwapPair,
   calculateRandomSwapAmount,
+  minSwapAmountFor,
   getTokenAddress,
   getSwapPairs,
   TOKEN_DECIMALS,

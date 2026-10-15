@@ -136,6 +136,46 @@ export class RotationMemory {
     this.swapPairCounts[k] = (this.swapPairCounts[k] || 0) + 1;
   }
 
+  /**
+   * Record that a SWAP pair was TRIED AND SKIPPED (zero balance, amount below
+   * the gate, no viable route or a zero quote) without counting it as a swap.
+   *
+   * Only recency is updated, so `_pick` moves on to the next candidate instead
+   * of re-selecting the same unusable pair forever, while the coverage counters
+   * stay honest (skips are not swaps).
+   */
+  recordSwapPairSkip(from, to, key = null) {
+    const k = key || `${from}>${to}`;
+    this.recentSwapPairs.push(k);
+    if (this.recentSwapPairs.length > this.historyLimit) this.recentSwapPairs = this.recentSwapPairs.slice(-this.historyLimit);
+  }
+
+  /**
+   * ORDERED rotation queue over swap directions: least-recently-tried first,
+   * then least-used, then stable key order.
+   *
+   * Used by the swap maintenance engine so consecutive passes start on a
+   * DIFFERENT direction — the pair that just ran sits at the END of the queue
+   * instead of the front, which is what prevents `markets[0]`-style livelock.
+   *
+   * @param {Array<{from:string,to:string,key?:string}>} candidates
+   * @returns {Array} new array, same shape, rotation-ordered
+   */
+  orderSwapPairs(candidates) {
+    const items = (candidates || []).map(c => ({ ...c, key: c.key || `${c.from}>${c.to}` }));
+    if (items.length <= 1) return items;
+    const recentIdx = new Map(this.recentSwapPairs.map((k, i) => [k, i]));
+    return [...items].sort((a, b) => {
+      const ra = recentIdx.has(a.key) ? recentIdx.get(a.key) : -1;
+      const rb = recentIdx.has(b.key) ? recentIdx.get(b.key) : -1;
+      if (ra !== rb) return ra - rb;                                  // least recent first
+      const ca = this.swapPairCounts[a.key] || 0;
+      const cb = this.swapPairCounts[b.key] || 0;
+      if (ca !== cb) return ca - cb;                                  // then least used
+      return a.key.localeCompare(b.key);                              // then stable
+    });
+  }
+
   // ─── stats / persistence ───
 
   coverage() {

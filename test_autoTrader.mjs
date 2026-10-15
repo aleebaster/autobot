@@ -6,6 +6,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 import { ethers } from "ethers";
+import { TEST_STATE_FILE, realStateHash } from "./_test_state_isolation.mjs";
 import fs from "fs";
 import { AutoTrader, STATES, DEFAULT_AUTO_CONFIG } from "./autoTrader.js";
 

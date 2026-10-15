@@ -4,7 +4,8 @@
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "start": "node index.js",
+    "start": "node auto.js",
+    "tui": "node index.js",
     "auto": "node auto.js",
     "auto:dry": "node auto.js --dry-run",
     "auto:once": "node auto.js --once",

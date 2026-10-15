@@ -15,6 +15,7 @@
 //       It forces a deficit, then lets AutoTrader.runCycle() handle the rest.
 // ═══════════════════════════════════════════════════════════════════════════
 
+import { TEST_STATE_FILE, realStateHash } from "./_test_state_isolation.mjs";
 import { ethers } from "ethers";
 import fs from "fs";
 import { AutoTrader } from "./autoTrader.js";

@@ -4,6 +4,7 @@
 //  Pure unit tests (no network) + optional on-chain discovery smoke test.
 // ═══════════════════════════════════════════════════════════════════════════
 
+import { TEST_STATE_FILE, realStateHash } from "./_test_state_isolation.mjs";
 import assert from "assert";
 import {
   normalizeSymbolKey,

@@ -12,6 +12,7 @@
 //  7. Error handling (loop continues after cycle error)
 // ═══════════════════════════════════════════════════════════════════════════
 
+import { TEST_STATE_FILE, realStateHash } from "./_test_state_isolation.mjs";
 import { ethers } from "ethers";
 import fs from "fs";
 import { AutoTrader } from "./autoTrader.js";

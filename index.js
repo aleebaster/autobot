@@ -3,7 +3,7 @@ import chalk from "chalk";
 import figlet from "figlet";
 import { ethers } from "ethers";
 import fs from "fs";
-import { AutoTrader, STATES } from "./autoTrader.js";
+import { AutoTrader, STATES, resolveLeverageForOpen } from "./autoTrader.js";
 import { getActiveDeployment, getConfirmedPools } from "./deployments/index.js";
 import { DEFAULT_ETH_GUARD } from "./tokenInventory.js";
 
@@ -14,6 +14,16 @@ import { DEFAULT_ETH_GUARD } from "./tokenInventory.js";
 const SEPOLIA_RPC_URL = "https://ethereum-sepolia-rpc.publicnode.com";
 const SEPOLIA_CHAIN_ID = 11155111;
 const CONFIG_FILE = "config.json";
+
+// Production manifest of nemesis.trade (site deployment) — NOT the bot deployment.
+const SITE_DEPLOYMENT = {
+  factory: "0x35f75f9218c640335d7166628319c4d95d1b0ae8",
+  router: "0x6c2844a5aFd10e22195d5f58227434b5b073b6d3",
+  source: "nemesis.trade client chunk (module 49514)",
+  startBlock: 11873268,
+};
+
+const DEPLOYMENT_BANNER_HEIGHT = 7;
 
 const WETH_ADDRESS = "0x7b79995e5f793A07Bc00c21412e50Ecae098E7f9";
 const USDT_ADDRESS = "0x5f2E83cCDEa73D60aF400e03F1Cd8Fb9eaB07b20";
@@ -77,7 +87,31 @@ let autoStatus = {
   swap: "N/A",
   positionId: "N/A",
   lastAction: "N/A",
+  onchain: null, // last read-only describePosition() report for the tracked position
 };
+
+// Throttled read-only on-chain status (getPositionRisk/positions/previewClose) —
+// NEVER sends a TX, refreshed at most once per minute.
+const ocStatusCache = { at: 0, inFlight: false, data: null };
+function refreshOnChainPositionStatus() {
+  if (ocStatusCache.inFlight) return;
+  if (Date.now() - ocStatusCache.at < 60_000) return;
+  const posState = autoTrader?.state?.activePosition;
+  const id = posState?.positionId;
+  if (!id) {
+    ocStatusCache.data = null;
+    ocStatusCache.at = Date.now();
+    return;
+  }
+  ocStatusCache.inFlight = true;
+  autoTrader.describePosition(id)
+    .then(rep => {
+      ocStatusCache.data = rep && rep.found ? rep : null;
+      autoStatus.onchain = ocStatusCache.data;
+    })
+    .catch(() => { /* keep the previous reading */ })
+    .finally(() => { ocStatusCache.inFlight = false; ocStatusCache.at = Date.now(); });
+}
 
 const borderBlinkColors = ["cyan", "blue", "magenta", "red", "yellow", "green"];
 let borderBlinkIndex = 0;
@@ -117,6 +151,19 @@ const statusBox = blessed.box({
   height: 3,
   top: 8,
   left: 0,
+});
+
+// Permanent warning: bot and site are on two different deployments.
+const mismatchBox = blessed.box({
+  label: " DEPLOYMENT WARNING ",
+  tags: true,
+  border: { type: "line" },
+  style: { fg: "red", border: { fg: "red" }, label: { fg: "yellow", bold: true } },
+  width: "100%",
+  height: DEPLOYMENT_BANNER_HEIGHT,
+  top: 11,
+  left: 0,
+  wrap: true,
 });
 
 const walletBox = blessed.list({
@@ -183,6 +230,7 @@ const autoStatusBox = blessed.box({
 
 screen.append(headerBox);
 screen.append(statusBox);
+screen.append(mismatchBox);
 screen.append(walletBox);
 screen.append(logBox);
 screen.append(menuBox);
@@ -196,6 +244,28 @@ function safeRender() {
   try { screen.render(); } catch {}
 }
 
+function shortEvm(addr) {
+  if (!addr || typeof addr !== "string") return "?";
+  return `${addr.slice(0, 10)}…${addr.slice(-5)}`;
+}
+
+function deploymentMismatchLines() {
+  let bot = {};
+  try { bot = getActiveDeployment() || {}; } catch { bot = {}; }
+  return [
+    `{bold}{red-fg}DEPLOYMENT MISMATCH:{/red-fg}{/bold} бот і сайт Nemesis використовують різні Factory/Router. Позиції бота можуть не відображатися на сайті.`,
+    `{bold}Bot:{/bold}  Factory ${shortEvm(bot.factory)} · Router ${shortEvm(bot.router)}`,
+    `{bold}Site:{/bold} Factory ${shortEvm(SITE_DEPLOYMENT.factory)} · Router ${shortEvm(SITE_DEPLOYMENT.router)}`,
+  ];
+}
+
+function updateDeploymentBanner() {
+  try {
+    mismatchBox.setContent(deploymentMismatchLines().join("\n"));
+    safeRender();
+  } catch {}
+}
+
 function adjustLayout() {
   const W = screen.width;
   const H = screen.height;
@@ -203,20 +273,24 @@ function adjustLayout() {
   statusBox.top = headerBox.height;
   statusBox.height = 3;
   statusBox.width = W;
-  walletBox.top = headerBox.height + statusBox.height;
+  mismatchBox.top = headerBox.height + statusBox.height;
+  mismatchBox.height = DEPLOYMENT_BANNER_HEIGHT;
+  mismatchBox.width = W;
+  const contentTop = headerBox.height + statusBox.height + DEPLOYMENT_BANNER_HEIGHT;
+  walletBox.top = contentTop;
   walletBox.width = Math.floor(W * 0.4);
   walletBox.height = Math.floor(H * 0.3);
   autoStatusBox.top = walletBox.top;
   autoStatusBox.left = walletBox.left;
   autoStatusBox.width = walletBox.width;
   autoStatusBox.height = walletBox.height;
-  logBox.top = headerBox.height + statusBox.height;
+  logBox.top = contentTop;
   logBox.left = Math.floor(W * 0.41);
   logBox.width = W - Math.floor(W * 0.41) - 2;
-  logBox.height = H - (headerBox.height + statusBox.height) - 2;
-  menuBox.top = headerBox.height + statusBox.height + walletBox.height + 1;
+  logBox.height = H - contentTop - 2;
+  menuBox.top = contentTop + walletBox.height + 1;
   menuBox.width = Math.floor(W * 0.4);
-  menuBox.height = H - (headerBox.height + statusBox.height + walletBox.height) - 2;
+  menuBox.height = H - contentTop - walletBox.height - 2;
   safeRender();
 }
 
@@ -282,6 +356,7 @@ function updateAutoStatus() {
 
   walletBox.hide();
   autoStatusBox.show();
+  refreshOnChainPositionStatus();
 
   const pos = autoTrader?.state?.activePosition;
   const stateColor = {
@@ -298,6 +373,21 @@ function updateAutoStatus() {
     `{bold}{yellow-fg}● SWAP: {white-fg}${autoStatus.swap}{/white-fg}{/yellow-fg}{/bold}`,
     `{bold}{yellow-fg}● LEVERAGE: {white-fg}${autoStatus.leverage}{/white-fg}{/yellow-fg}{/bold}`,
     `{bold}{yellow-fg}● POSITION ID: {white-fg}${autoStatus.positionId}{/white-fg}{/yellow-fg}{/bold}`,
+    ...(() => {
+      if (!pos) return [];
+      const oc = ocStatusCache.data;
+      if (!oc) return [`{bold}{yellow-fg}● ONCHAIN: {white-fg}refreshing… (read-only){/white-fg}{/yellow-fg}{/bold}`];
+      const color = oc.status === "LIQUIDATION_RISK" ? "red"
+        : oc.status === "ACTIVE" ? "green" : "yellow";
+      const bits = [`${oc.side || "?"} #${oc.positionId}`, `status=${oc.status}`];
+      if (oc.healthBps !== null && oc.healthBps !== undefined) bits.push(`health=${oc.healthBps}bps`);
+      if (oc.currentDebtHuman) bits.push(`debt=${oc.currentDebtHuman} ${oc.debtSym || ""}`);
+      if (oc.equityValueHuman !== null && oc.equityValueHuman !== undefined) bits.push(`PnL=${oc.equityValueHuman}`);
+      if (oc.estimatedLeverageX10 !== null && oc.estimatedLeverageX10 !== undefined) bits.push(`lev≈${oc.estimatedLeverageX10 / 10}x`);
+      if (oc.collateralAmountHuman) bits.push(`coll=${oc.collateralAmountHuman} ${oc.collateralSym || ""}`);
+      bits.push(`liq=${oc.liquidatable}`);
+      return [`{bold}{yellow-fg}● ONCHAIN: {${color}-fg}${bits.join(" | ")}{/${color}-fg}{/yellow-fg}{/bold}`];
+    })(),
     "",
     `{bold}{cyan-fg}CURRENT STATE: {${stateColor}-fg}${autoStatus.state}{/${stateColor}-fg}{/cyan-fg}{/bold}`,
     `{bold}{cyan-fg}NEXT ACTION: {white-fg}${autoStatus.lastAction}{/white-fg}{/cyan-fg}{/bold}`,
@@ -459,12 +549,44 @@ async function openManual(side) {
 
     addLog(`Opening ${side} — market=${market.symbol || "?"} collateral: ${targetStr} ${collSym} @ ${collateralToken.slice(0,8)}...`, "warn");
 
+    // Leverage: config override → default, then clamp/probe against the CONTRACT
+    // (MIN/MAX_LEVERAGE_X10 + previewOpenPosition) — read-only, no TX.
+    let lev = Number(config.marketLeverage?.[market.symbol] ?? config.leverage ?? 2);
+    try {
+      const plan = await resolveLeverageForOpen(provider, {
+        managerAddr: resolvedManager,
+        marketSymbol: market.symbol || null,
+        isLong: side === "LONG",
+        collateralToken,
+        collateralAmount,
+        requestedLeverage: lev,
+        config: {
+          defaultLeverage: lev,
+          leverageMin: Number(config.leverageMin ?? 1),
+          leverageMax: Number(config.leverageMax ?? config.maxLeverage ?? 5),
+          marketLeverage: (config.marketLeverage && typeof config.marketLeverage === "object") ? config.marketLeverage : {},
+          leverageAutoStep: config.leverageAutoStep !== false,
+        },
+        log: addLog,
+      });
+      if (plan.ok) {
+        if (plan.leverage !== lev) addLog(`Leverage adjusted ${lev}x → ${plan.leverage}x (${plan.code || "contract bounds"}: ${plan.reason || "ok"})`, "warn");
+        lev = plan.leverage;
+      } else {
+        addLog(`Leverage unresolved (${plan.code}: ${plan.reason}) — contract will reject this open`, "error");
+        return;
+      }
+    } catch (e) {
+      addLog(`Leverage probe failed (${e.message}) — not opening without a validated plan`, "error");
+      return;
+    }
+
     const result = await openPosition({
       wallet, provider, managerAddr: resolvedManager, poolAddr: resolvedPool, side, collateralToken, collateralAmount,
-      leverage: 2,
+      leverage: lev,
       paymentToken: market?.paymentToken,
       config: {
-        maxLeverage: 5,
+        maxLeverage: Number(config.maxLeverage ?? 5),
         deadlineSeconds: 1200,
         ethGuard: { ...DEFAULT_ETH_GUARD },
         dryRun: false,
@@ -564,7 +686,12 @@ async function startAutoTrading() {
 
   const autoConfig = {
     defaultLeverage: config.leverage || 2,
-    maxLeverage: 5,
+    maxLeverage: Number(config.maxLeverage ?? 5),
+    leverageMin: Number(config.leverageMin ?? 1),
+    leverageMax: Number(config.leverageMax ?? config.maxLeverage ?? 5),
+    marketLeverage: (config.marketLeverage && typeof config.marketLeverage === "object")
+      ? config.marketLeverage : {},
+    leverageAutoStep: config.leverageAutoStep !== false,
     autoLoopIntervalMs: 5_000,
     ethGuard: { ...DEFAULT_ETH_GUARD },
     dryRun: false,
@@ -579,6 +706,10 @@ async function startAutoTrading() {
     cooldownAfterOpenMs: 3_000,
     cooldownAfterCloseMs: 3_000,
     autoSwap: config.autoSwap,
+    swap: config.swap,
+    enableLong: config.enableLong !== false,
+    enableShort: config.enableShort !== false,
+    enableClose: config.enableClose !== false,
     availableMarkets: config.availableMarkets || [],
     preferredMarket: config.preferredMarket || null,
   };
@@ -626,7 +757,16 @@ async function startAutoTrading() {
     } else if (msg.includes("[QUOTE]")) {
       autoStatus.state = "QUOTE";
       autoStatus.lastAction = "Computing quote...";
-    } else if (msg.includes("OPEN") && msg.includes("Position ID:")) {
+    } else if (msg.includes("[OPEN]") && /\bPENDING\b/.test(msg)) {
+      // A submitted open is NOT an open: show it as unconfirmed, never as success.
+      autoStatus.position = "PENDING";
+      autoStatus.positionId = "?";
+      autoStatus.lastAction = "Open TX unconfirmed — not counted";
+    } else if (msg.includes("[OPEN]") && msg.includes("CONFIRMED")) {
+      const m = msg.match(/position #(\d+)/);
+      if (m) { autoStatus.positionId = m[1]; autoStatus.position = "OPEN"; autoStatus.lastAction = `Position #${m[1]} confirmed on-chain`; }
+      else { autoStatus.position = "OPEN"; autoStatus.lastAction = "Open confirmed on-chain"; }
+    } else if (msg.includes("[OPEN]") && msg.includes("Position ID:")) {
       const m = msg.match(/Position ID:\s*(\d+)/);
       if (m) { autoStatus.positionId = m[1]; autoStatus.position = "OPEN"; autoStatus.lastAction = `Position #${m[1]} opened`; }
     } else if (msg.includes("[OPEN]") && msg.match(/\b\d+x\.\.\./)) {
@@ -792,6 +932,7 @@ async function initialize() {
 
     updateHeader();
     adjustLayout();
+    updateDeploymentBanner();
     updateMenu();
     updateStatus();
 

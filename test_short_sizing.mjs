@@ -13,6 +13,7 @@
 //  executes it from a scratch directory so the repo state file stays byte-exact.
 // ═══════════════════════════════════════════════════════════════════════════
 
+import { TEST_STATE_FILE, realStateHash } from "./_test_state_isolation.mjs";
 import fs from "fs";
 import { ethers } from "ethers";
 import { AutoTrader, DEFAULT_AUTO_CONFIG, resolveShortCollateralAmount, precheckMarketQuote, encodeOpenPositionCalldata } from "./autoTrader.js";
