@@ -99,6 +99,8 @@ async function main() {
     node auto.js --dry-run                 one read-only cycle
     node auto.js --once                    one cycle (live iff config allows)
     node auto.js [--max-cycles=N]          continuous loop, exit after N cycles (default: unlimited)
+    node auto.js [--max-trading-cycles=N]  stop after N completed OPEN→SWAPs→CLOSE cycles
+    node auto.js --reset-halt              clear a continuous-trading safe-stop (state.continuousHalt)
     node auto.js --swap-matrix             read-only route check
     node auto.js --swap-once [--confirm]   one rotation swap
     node auto.js --single-swap --from=X --to=Y --amount=N [--confirm]
@@ -303,6 +305,15 @@ async function main() {
     // LONG/SHORT selection ratio (never picks a disabled side)
     longPercent: Number(config.longPercent ?? 50),
     shortPercent: Number(config.shortPercent ?? 50),
+    // CONTINUOUS TRADING CYCLE — OPEN → swapsPerPosition verified SWAPs → CLOSE
+    // → next cycle. Sequential (effective maxOpen=1); attempt cap bounds an
+    // unavailable market; minExitReserveWhole gates thin pools before OPEN.
+    continuousTradingEnabled: config.continuousTradingEnabled === true,
+    swapsPerPosition: Number(config.swapsPerPosition ?? 10),
+    maxSwapAttemptsPerCycle: Number(config.maxSwapAttemptsPerCycle ?? 40),
+    // Only forwarded when set — an explicit undefined would clobber the
+    // per-symbol default map in DEFAULT_AUTO_CONFIG via the config spread.
+    ...(config.minExitReserveWhole !== undefined ? { minExitReserveWhole: config.minExitReserveWhole } : {}),
   };
 
   const deps = {
@@ -476,7 +487,18 @@ async function main() {
   if (maxCyclesArg !== null && maxCycles === null) {
     console.log(`  ⚠️ --max-cycles=${maxCyclesArg} is not a positive number — ignored (unlimited loop).`);
   }
-  await trader.start({ maxCycles });
+  // CONTINUOUS-BOUNDED RUN — `--max-trading-cycles=N` stops after N completed
+  // OPEN→SWAPs→CLOSE cycles (for controlled LIVE verification).
+  const maxTradingArg = argValue("--max-trading-cycles");
+  const maxTradingNum = Number(maxTradingArg);
+  const maxTradingCycles = maxTradingArg !== null && maxTradingArg !== ""
+    && Number.isFinite(maxTradingNum) && maxTradingNum > 0 ? Math.floor(maxTradingNum) : null;
+  if (maxTradingArg !== null && maxTradingCycles === null) {
+    console.log(`  ⚠️ --max-trading-cycles=${maxTradingArg} is not a positive number — ignored.`);
+  }
+  // OPERATOR HALT CLEAR — `--reset-halt` lifts state.continuousHalt.
+  const resetHalt = process.argv.includes("--reset-halt");
+  await trader.start({ maxCycles, maxTradingCycles, resetHalt });
 }
 
 main().catch((e) => {

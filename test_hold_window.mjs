@@ -669,7 +669,7 @@ section("15. start({ maxCycles }) — run bound + clean stop");
   check("cycle marker #1 present, #2 never reached",
     logs.includes("[CYCLE] #1") && !logs.includes("[CYCLE] #2"));
   check("STEP 3 refused (both sides disabled → no OPEN)",
-    logs.includes("[BLOCKED] no side enabled"));
+    logs.includes("OPEN_SKIPPED reason=SIDE_DISABLED phase=STEP3"));
   check("loop stopped message present", logs.includes("Trading loop stopped."));
 
   const t2 = makeTrader({ maxTradesPerRun: 1 });
@@ -734,7 +734,7 @@ section("16. production source invariants");
   check("auto.js documents --max-cycles in help",
     js.includes("node auto.js [--max-cycles=N]"));
   check("auto.js parses and forwards maxCycles to start()",
-    js.includes('argValue("--max-cycles")') && js.includes("await trader.start({ maxCycles });")
+    js.includes('argValue("--max-cycles")') && js.includes("await trader.start({ maxCycles, maxTradingCycles, resetHalt });")
     && js.includes("Number.isFinite(maxCyclesNum) && maxCyclesNum > 0"));
 
   const idx = fs.readFileSync(new URL("./index.js", import.meta.url), "utf8");

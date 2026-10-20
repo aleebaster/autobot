@@ -1069,6 +1069,24 @@ const DEFAULT_AUTO_CONFIG = {
   // LONG/SHORT selection ratio (never picks a disabled side).
   longPercent: 50,
   shortPercent: 50,
+  // ─── CONTINUOUS TRADING CYCLE: OPEN → N confirmed SWAPs → CLOSE → repeat ──
+  // When enabled, start() runs ONE position at a time (effective
+  // maxOpenPositions=1), executes exactly `swapsPerPosition` balance-verified
+  // SWAPs, then lets the normal CLOSE machinery close it, then starts the next
+  // cycle. Legacy close-blocked positions keep being retried for close but do
+  // not occupy an open slot. Cycle state persists in state.continuousCycle and
+  // resumes after a restart (recorded swap txs re-verified on-chain).
+  continuousTradingEnabled: false,
+  swapsPerPosition: 10,
+  // Attempt budget per cycle (sent swaps: confirmed OR failed). Hitting it
+  // without reaching the quota closes the position instead of looping forever
+  // on an unavailable market. (Cycle-level halt threshold reuses
+  // swap.maxConsecutiveFailures — no duplicate config key.)
+  maxSwapAttemptsPerCycle: 40,
+  // Pre-OPEN exit-viability probe — BOTH pool legs must hold at least this
+  // many whole token units (per symbol; number = same floor for every token).
+  // A market whose pool cannot absorb a future close is SKIPPED, never opened.
+  minExitReserveWhole: { USDT: 200, USDC: 200, DAI: 200, WETH: 0.05, ETH: 0.05, LINK: 50, UNI: 50, NEMESIS: 50 },
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2790,8 +2808,18 @@ export class AutoTrader {
     this._swapLoopRunning = false;
     this._cycleNo = 0;
     // Confirmed OPENs in THIS process — maxTradesPerRun cap (never a restart-
-    // persistent counter: the cap is per run by definition).
+    // persistent counter: the cap is per run by definition). A verified CLOSE
+    // of a record THIS process opened returns its slot (see _clearPosition),
+    // so a continuous run keeps trading after each round-trip instead of
+    // going OPEN-dead after the first open.
     this._opensThisRun = 0;
+    // Records that consumed a trade slot in THIS process (WeakSet — identity
+    // only, never persisted). Only clearing one of THESE frees a slot.
+    this._capConsumers = new WeakSet();
+    // CONTINUOUS CYCLE — completed OPEN→swaps→CLOSE round-trips in THIS run
+    // (bounded by start({maxTradingCycles}); cycle STATE itself persists in
+    // state.continuousCycle and survives restarts).
+    this._tradingCyclesDone = 0;
     // Throttled emergency-risk probe cache for the hold window (see _emergencyCloseDue).
     this._holdProbe = null;
     // Record created by the most recent successful/pending OPEN (result extraction).
@@ -2862,12 +2890,25 @@ export class AutoTrader {
    * @returns {{ok:boolean, code?:string, max?:number, count?:number}}
    */
   _canOpenNew({ market = null, effectiveCount = null, log = true } = {}) {
+    // CONTINUOUS HALT — consecutive cycle failures trip a sticky safe-stop:
+    // no new OPEN until an operator reviews and restarts with --reset-halt.
+    const continuous = this._continuousEnabled?.() === true;
+    const halt = continuous ? this._haltInfo?.() : null;
+    if (halt) {
+      if (log) this.log(`[LIMIT] continuous trading HALTED (reason=${halt.reason}) — OPEN skipped; review the log then restart with --reset-halt`, "error");
+      return { ok: false, code: "TRADING_HALTED", count: this._activeCount() };
+    }
     if (this._tradeCapReached()) {
       if (log) this.log(`[LIMIT] maxTradesPerRun=${Number(this.config.maxTradesPerRun || 0)} reached (opens this run=${this._opensThisRun}) — OPEN skipped`, "warn");
       return { ok: false, code: "TRADE_CAP", count: this._activeCount() };
     }
-    const count = Number.isFinite(effectiveCount) ? effectiveCount : this._activeCount();
-    const max = Math.max(1, Number(this.config.maxOpenPositions) || 1);
+    // CONTINUOUS MODE — sequential by definition: one open slot, and legacy
+    // close-blocked positions (pool cannot absorb any safe exit) are retried
+    // for close every cycle but no longer occupy that slot.
+    const count = Number.isFinite(effectiveCount) ? effectiveCount
+      : continuous ? this._positions().filter(p => !p?.closeBlocked).length
+      : this._activeCount();
+    const max = continuous ? 1 : Math.max(1, Number(this.config.maxOpenPositions) || 1);
     if (count >= max) {
       if (log) this.log(`[LIMIT] maxOpenPositions=${max} reached (tracked=${this._activeCount()}${count !== this._activeCount() ? ` effective=${count}` : ""}) — OPEN skipped`, "warn");
       return { ok: false, code: "MAX_OPEN_POSITIONS", max, count: this._activeCount() };
@@ -2882,6 +2923,13 @@ export class AutoTrader {
       return { ok: false, code: "MARKET_BUSY", count: this._activeCount() };
     }
     return { ok: true, count };
+  }
+
+  /** Effective global open-slot cap (continuous mode is sequential = 1). */
+  _effectiveMaxOpen() {
+    return this._continuousEnabled?.() === true
+      ? 1
+      : Math.max(1, Number(this.config.maxOpenPositions) || 1);
   }
 
   /**
@@ -2917,6 +2965,8 @@ export class AutoTrader {
         this.state.lastSide = rec.side;
         this.state.sessionStats.opens++;
         this._opensThisRun++;
+        this._capConsumers?.add(rec);
+        this._onPositionOpened?.(rec); // continuous cycle binds here (no-op when off)
       }
     }
     saveState(this.state);
@@ -3445,13 +3495,14 @@ export class AutoTrader {
         effectiveCount: dryRun ? this._activeCount() - dryWouldClose : null,
       });
       if (!gate.ok) {
+        const maxOpen = Math.max(1, Number(this.config.maxOpenPositions) || 1);
         if (gate.code === "TRADE_CAP") {
-          this.log(`[LIMIT] maxTradesPerRun=${Number(this.config.maxTradesPerRun || 0)} reached (opens this run=${this._opensThisRun}) — OPEN phase skipped for this run`, "warn");
+          this.log(`[AUTO] OPEN_SKIPPED reason=TRADE_CAP phase=PHASE-1.5b tracked=${this._activeCount()}/${maxOpen} opensThisRun=${this._opensThisRun}/${Number(this.config.maxTradesPerRun || 0)} — next: wait for a verified close of a position opened this run (returns its trade slot)`, "warn");
           this.lastCycleAction = "idle";
           this.log("[CYCLE] ═══ CYCLE END ═══", "info");
           return;
         }
-        this.log(`[CYCLE] OPEN skipped (code=${gate.code}) — SWAP engine continues independently`, "warn");
+        this.log(`[AUTO] OPEN_SKIPPED reason=${gate.code} phase=PHASE-1.5b tracked=${this._activeCount()}/${maxOpen} — next: SWAP engine continues independently`, "warn");
         this.log("[CYCLE] ═══ CYCLE END ═══", "info");
         return;
       }
@@ -3477,7 +3528,7 @@ export class AutoTrader {
       const planned = await this.nextMarketSide();
       const side = this._pickOpenSide(preferredSideFromSignal, planned?.side || null);
       if (!side) {
-        this.log(`[BLOCKED] no side enabled (enableLong/enableShort both false) — OPEN phase skipped`, "error");
+        this.log(`[AUTO] OPEN_SKIPPED reason=SIDE_DISABLED phase=PHASE-2 enableLong=${this.config.enableLong !== false} enableShort=${this.config.enableShort !== false} — next: enable a side in config`, "error");
         this.lastCycleAction = "idle";
         this.log("[CYCLE] ═══ CYCLE END ═══", "info");
         return;
@@ -3734,6 +3785,12 @@ export class AutoTrader {
     }
     const maxCyclesRaw = Number(opts.maxCycles);
     const maxCycles = Number.isFinite(maxCyclesRaw) && maxCyclesRaw > 0 ? Math.floor(maxCyclesRaw) : null;
+    // CONTINUOUS-BOUNDED RUN — `--max-trading-cycles=N` bounds COMPLETED
+    // OPEN→SWAPs→CLOSE cycles (unlike --max-cycles which bounds loop passes).
+    const maxTradingRaw = Number(opts.maxTradingCycles);
+    const maxTradingCycles = Number.isFinite(maxTradingRaw) && maxTradingRaw > 0 ? Math.floor(maxTradingRaw) : null;
+    // OPERATOR HALT CLEAR — `--reset-halt` (must happen before any cycle logic).
+    if (opts.resetHalt) this._clearContinuousHalt();
     this.running = true;
     this.stopRequested = false;
 
@@ -3768,9 +3825,24 @@ export class AutoTrader {
       // above by the RECOVERY pass) — informational only, sends nothing.
       await this._logSwapRoutes();
 
+      // CONTINUOUS CYCLE — resume the persisted cycle (state + on-chain truth)
+      // and announce the operating parameters.
+      if (this._continuousEnabled()) {
+        try { await this._recoverContinuousCycle(); } catch (e) {
+          this.log(`[CONTINUOUS] cycle recovery failed: ${e.message?.slice(0, 60)}`, "error");
+        }
+        const halt = this._haltInfo();
+        this.log(`[CONTINUOUS] cycle mode ON — swapsPerPosition=${this._cycleQuota()} attemptCap=${this._cycleAttemptCap()} effectiveMaxOpen=1 haltThreshold=${this._cycleHaltThreshold()}${halt ? ` HALTED(${halt.reason})` : ""}`, "warn");
+      }
+
       // CONTINUOUS RUNNER — never stops on its own; `maxCycles` (when given)
-      // bounds the number of iterations via the shared `this._cycleNo` counter.
-      while (!this.stopRequested && (maxCycles === null || this._cycleNo < maxCycles)) {
+      // bounds the number of iterations via the shared `this._cycleNo` counter;
+      // `maxTradingCycles` bounds COMPLETED trading cycles, and a bounded run
+      // also exits once the halt safe-stop engages (an unbounded operator run
+      // keeps retrying closes and waits for --reset-halt).
+      while (!this.stopRequested && (maxCycles === null || this._cycleNo < maxCycles)
+             && (maxTradingCycles === null || this._tradingCyclesDone < maxTradingCycles)
+             && !(maxTradingCycles !== null && this._haltInfo())) {
         try {
           // Cycle marker — the log then follows PHASE 1 → 1.5 → 2 → 3.
           this.log(`[CYCLE] #${++this._cycleNo}`, "warn");
@@ -3779,12 +3851,20 @@ export class AutoTrader {
           // blocked close logs and keeps THAT record — it never returns out of
           // the loop, so sibling positions and the swap rotation always get
           // their turn.
+          if (this._continuousEnabled()) this._checkCycleStall();
           const loopPositions = [...this._positions()];
           if (loopPositions.length && !this.stopRequested) {
             this.log(`[AUTO] NEXT ACTION: CLOSE position(s) #${loopPositions.map(p => p.positionId ?? "?").join(", #")}`, "info");
             for (const rec of loopPositions) {
               if (!this._positions().includes(rec)) continue;
               if (this.stopRequested) break;
+              // CONTINUOUS QUOTA GUARD — a HOLDING cycle position is closed
+              // only after its swap quota (or the emergency override fires).
+              if (await this._continuousBlocksClose(rec)) {
+                const c = this._getCycle();
+                this.log(`[CYCLE] #${c.cycleId} close of #${rec.positionId ?? "?"} deferred — swap quota ${(c.confirmedSwaps || []).length}/${c.swapsTarget} not met yet`, "info");
+                continue;
+              }
               const closeOutcome = await this.closeActivePosition(rec);
               if (closeOutcome && !closeOutcome.ok) {
                 this.log(`[CLOSE] #${rec.positionId ?? "?"} ${closeOutcome.blocked ? "blocked" : "deferred"} (code=${closeOutcome.code || "?"}) — position kept; other positions and swap engine continue`, "warn");
@@ -3793,17 +3873,23 @@ export class AutoTrader {
           }
 
           // STEP 2: SWAP MAINTENANCE — independent rotation over every validated
-          // direction (A→B and B→A are separate queue entries).
+          // direction (A→B and B→A are separate queue entries). In continuous
+          // mode the pass is quota-limited to the cycle's remaining SWAPs and
+          // its results are ingested (only balance-verified swaps count).
           if (!this.stopRequested) {
-            this.setState(STATES.AUTO_SWAP);
-            await this.runSwapMaintenanceCycle({ phase: "LOOP" });
+            const swapOpts = this._swapRunOpts("LOOP");
+            if (swapOpts) {
+              this.setState(STATES.AUTO_SWAP);
+              const sumLoop = await this.runSwapMaintenanceCycle(swapOpts);
+              this._ingestSwapSummary(sumLoop);
+            }
           }
 
           // STEP 3: OPEN — allowed whenever the global cap has room (per-market
           // slots are checked per candidate inside prepareAndOpen). A stuck
           // position on one market never blocks OPEN on the others.
           if (!this.stopRequested) {
-            const gate = this._canOpenNew();
+            const gate = this._canOpenNew({ log: false });
             if (!gate.ok) {
               if (gate.code === "TRADE_CAP" && this._activeCount() === 0) {
                 // Cap reached with NO open position → stop the run cleanly. A
@@ -3811,17 +3897,30 @@ export class AutoTrader {
                 this.log(`[LIMIT] maxTradesPerRun=${Number(this.config.maxTradesPerRun || 0)} reached (opens this run=${this._opensThisRun}) and no position is open — stopping the run`, "warn");
                 this.stopRequested = true;
               } else {
-                this.log(`[LIMIT] OPEN skipped (code=${gate.code}, tracked=${this._activeCount()}/${Math.max(1, Number(this.config.maxOpenPositions) || 1)}) — waiting for a free slot`, "warn");
+                const maxOpen = this._effectiveMaxOpen();
+                const nextAction = gate.code === "TRADE_CAP"
+                  ? `wait for a verified close of a position opened this run (returns its trade slot)`
+                  : gate.code === "TRADING_HALTED"
+                    ? `safe-stop active — closes keep retrying; operator must restart with --reset-halt`
+                    : gate.code === "MAX_OPEN_POSITIONS" || gate.code === "OPEN_PENDING" || gate.code === "MARKET_BUSY"
+                      ? `wait for a slot to free`
+                      : `swap engine continues independently`;
+                this.log(`[AUTO] OPEN_SKIPPED reason=${gate.code} phase=STEP3 tracked=${this._activeCount()}/${maxOpen} opensThisRun=${this._opensThisRun}/${Number(this.config.maxTradesPerRun || 0)} — next: ${nextAction}`, "warn");
               }
             } else {
               const planned = await this.nextMarketSide();
               const side = this._pickOpenSide(null, planned?.side || null);
               if (!side) {
-                this.log(`[BLOCKED] no side enabled (enableLong/enableShort both false) — OPEN skipped`, "error");
+                this.log(`[AUTO] OPEN_SKIPPED reason=SIDE_DISABLED phase=STEP3 enableLong=${this.config.enableLong !== false} enableShort=${this.config.enableShort !== false} — next: enable a side in config`, "error");
               } else {
-                this.log(`[AUTO] NEXT ACTION: OPEN ${side}${planned ? ` on ${planned.marketSymbol || planned.symbol}` : ""} (${this._activeCount()}/${Math.max(1, Number(this.config.maxOpenPositions) || 1)} slots used)`, "info");
+                this.log(`[AUTO] NEXT ACTION: OPEN ${side}${planned ? ` on ${planned.marketSymbol || planned.symbol}` : ""} (${this._activeCount()}/${this._effectiveMaxOpen()} slots used)`, "info");
                 this.setState(STATES.OPEN);
-                await this.prepareAndOpen(side);
+                const opened = await this.prepareAndOpen(side);
+                // CONTINUOUS FAILURE ACCOUNTING — a cycle that cannot OPEN is a
+                // failed cycle (halt threshold counts consecutive ones).
+                if (this._continuousEnabled() && opened === false) {
+                  this._noteCycleFailure("OPEN_FAILED", `side=${side}`);
+                }
               }
             }
           }
@@ -3829,8 +3928,12 @@ export class AutoTrader {
           // STEP 4: SWAP MAINTENANCE continues regardless of the OPEN outcome
           // (usually gated by minIntervalMs right after a settlement).
           if (!this.stopRequested) {
-            this.setState(STATES.AUTO_SWAP);
-            await this.runSwapMaintenanceCycle({ phase: "LOOP-2" });
+            const swapOpts2 = this._swapRunOpts("LOOP-2");
+            if (swapOpts2) {
+              this.setState(STATES.AUTO_SWAP);
+              const sumLoop2 = await this.runSwapMaintenanceCycle(swapOpts2);
+              this._ingestSwapSummary(sumLoop2);
+            }
           }
 
           // STEP 5: Brief wait between iterations
@@ -5439,11 +5542,328 @@ export class AutoTrader {
 
   /**
    * maxTradesPerRun gate — true when THIS run may not open any new position.
-   * Counts confirmed OPENs only (pending/dry/adoption never increment it).
+   * Counts confirmed OPENs of THIS process whose records are still tracked
+   * (pending/dry/adoption never increment; a verified close of a record this
+   * process opened returns its slot — see _clearPosition). The cap therefore
+   * bounds opens running AHEAD of closes; a continuous loop keeps working
+   * after each open→close round-trip instead of going OPEN-dead forever.
    */
   _tradeCapReached() {
     const max = Number(this.config.maxTradesPerRun || 0);
     return max > 0 && this._opensThisRun >= max;
+  }
+
+  // ═════════════════════════════════════════════════════════════════════════
+  //  CONTINUOUS TRADING CYCLE — OPEN → swapsPerPosition SWAPs → CLOSE → next
+  //
+  //  State machine (persisted in state.continuousCycle, resumes on restart):
+  //    HOLDING            position open, counting balance-verified SWAPs
+  //    READY_TO_CLOSE     quota met — close on the next hold-gate pass
+  //    SWAP_QUOTA_EXHAUSTED attempt/stall budget spent under quota — close anyway
+  //    DONE               verified close — the next STEP 3 OPEN starts a new cycle
+  //  Only CONFIRMED swaps whose ERC20 balance deltas passed verification count
+  //  (status=1 alone never does — they arrive from runSwapMaintenanceCycle
+  //  results with status:"ok"). state.continuousHalt is the sticky safe-stop
+  //  tripped after swap.maxConsecutiveFailures consecutive failed cycles.
+  // ═════════════════════════════════════════════════════════════════════════
+
+  _continuousEnabled() { return this.config.continuousTradingEnabled === true; }
+  _cycleQuota() { return Math.max(1, Number(this.config.swapsPerPosition) || 10); }
+  _cycleAttemptCap() { return Math.max(1, Number(this.config.maxSwapAttemptsPerCycle) || 40); }
+  /** Consecutive-failure halt threshold — the ALREADY-AGREED swap.maxConsecutiveFailures (no duplicate key). */
+  _cycleHaltThreshold() {
+    try { return normalizeSwapConfig(this.config).maxConsecutiveFailures; } catch { return 3; }
+  }
+  _getCycle() { return this.state.continuousCycle || null; }
+  _putCycle(c) { this.state.continuousCycle = c; this._save(); }
+  _haltInfo() { return this.state.continuousHalt || null; }
+
+  _newCycle(rec) {
+    const seq = Number(this.state.continuousSeq || 0) + 1;
+    this.state.continuousSeq = seq;
+    return {
+      cycleId: seq,
+      startedAt: Date.now(),
+      lastProgressAt: Date.now(),
+      positionId: rec?.positionId ?? null,
+      openTxHash: rec?.txHash || null,
+      side: rec?.side || null,
+      marketSymbol: rec?.marketSymbol || null,
+      managerAddr: rec?.managerAddr || null,
+      poolAddr: rec?.poolAddr || null,
+      swapsTarget: this._cycleQuota(),
+      confirmedSwaps: [],
+      attempts: 0,
+      status: "HOLDING",
+      errors: [],
+    };
+  }
+
+  /** A confirmed OPEN bound a fresh cycle (continuous mode only). */
+  _onPositionOpened(rec) {
+    if (!this._continuousEnabled() || this._isDry()) return;
+    if (this._haltInfo()) return;
+    const cyc = this._getCycle();
+    if (cyc && cyc.status !== "DONE" && cyc.positionId != null) {
+      if (String(cyc.positionId) === String(rec?.positionId ?? "")) return; // already bound
+      this.log(`[CONTINUOUS] cycle #${cyc.cycleId} already bound to #${cyc.positionId} — position #${rec?.positionId ?? "?"} not re-bound`, "warn");
+      return;
+    }
+    const c = this._newCycle(rec);
+    this._putCycle(c);
+    this.log(`[CONTINUOUS] cycle #${c.cycleId} START — ${c.side} ${c.marketSymbol} position #${c.positionId} — target ${c.swapsTarget} verified SWAPs, then CLOSE`, "warn");
+  }
+
+  /**
+   * A tracked record was removed — the matching cycle completes. Runs for BOTH
+   * verified closes (countClose=true → completion counted, failures reset when
+   * the quota was met) and recovery/zombie clears (countClose=false → the cycle
+   * is closed out but never counted, so a restart cannot fake a success).
+   */
+  _onPositionClosed(rec, countClose = true) {
+    const cyc = this._getCycle();
+    if (!cyc || cyc.status === "DONE") return;
+    if (rec && cyc.positionId != null && String(cyc.positionId) !== String(rec?.positionId)) return;
+    const confirmed = (cyc.confirmedSwaps || []).length;
+    const met = confirmed >= cyc.swapsTarget;
+    cyc.status = "DONE";
+    cyc.closedAt = Date.now();
+    if (countClose) this._tradingCyclesDone++;
+    if (countClose && met) {
+      this.state.continuousFailures = 0;
+      this.log(`[CONTINUOUS] cycle #${cyc.cycleId} COMPLETE — ${confirmed}/${cyc.swapsTarget} verified SWAPs, position #${cyc.positionId} closed, cyclesDone=${this._tradingCyclesDone} — next OPEN starts a new cycle`, "success");
+    } else if (countClose) {
+      this.log(`[CONTINUOUS] cycle #${cyc.cycleId} ENDED under quota — ${confirmed}/${cyc.swapsTarget} verified SWAPs before close, cyclesDone=${this._tradingCyclesDone}`, "warn");
+      this._noteCycleFailure("CLOSED_UNDER_QUOTA", `confirmed=${confirmed}/${cyc.swapsTarget}`);
+    } else {
+      this.log(`[CONTINUOUS] cycle #${cyc.cycleId} closed out without a verified close (record removed: ${rec?.positionId ?? "?"}) — restart resumes from a fresh OPEN`, "warn");
+    }
+    this._save();
+  }
+
+  _noteCycleFailure(kind, detail = "") {
+    this.state.continuousFailures = Number(this.state.continuousFailures || 0) + 1;
+    const thr = this._cycleHaltThreshold();
+    this.log(`[CONTINUOUS] cycle failure ${this.state.continuousFailures}/${thr} (${kind}${detail ? `: ${detail}` : ""})`, "warn");
+    if (this.state.continuousFailures >= thr && !this._haltInfo()) {
+      this.state.continuousHalt = {
+        reason: kind, failures: this.state.continuousFailures,
+        since: Date.now(), detail: String(detail).slice(0, 200),
+      };
+      this.log(`[CONTINUOUS] TRADING HALTED after ${this.state.continuousFailures} consecutive cycle failures (${kind}) — no new OPEN; position closes keep being retried; restart with --reset-halt after review`, "error");
+    }
+    this._save();
+  }
+
+  _clearContinuousHalt() {
+    if (!this.state.continuousHalt) return false;
+    const was = this.state.continuousHalt;
+    delete this.state.continuousHalt;
+    this.state.continuousFailures = 0;
+    this._save();
+    this.log(`[CONTINUOUS] halt cleared by operator (was: ${was.reason} @ ${new Date(was.since || Date.now()).toISOString()}) — OPEN allowed again`, "warn");
+    return true;
+  }
+
+  /** Verified SWAPs still missing from the current cycle's quota. */
+  _cycleSwapRemaining() {
+    const c = this._getCycle();
+    if (!c || c.status !== "HOLDING") return 0;
+    return Math.max(0, (c.swapsTarget || this._cycleQuota()) - (c.confirmedSwaps || []).length);
+  }
+
+  /**
+   * Ingest ONE runSwapMaintenanceCycle summary into the active cycle.
+   * Counts ONLY `status:"ok"` results (balance-delta-verified swaps) toward the
+   * quota — `fail` results count as ATTEMPTS (budget), skips count as neither.
+   * Duplicate tx hashes are never counted twice (restart + re-ingest safe).
+   */
+  _ingestSwapSummary(summary) {
+    if (!this._continuousEnabled() || !summary) return;
+    const cyc = this._getCycle();
+    if (!cyc || cyc.status === "DONE") return;
+    for (const r of (summary.results || [])) {
+      if (r?.status === "ok" && r.txHash) {
+        cyc.attempts = Number(cyc.attempts || 0) + 1;
+        cyc.lastProgressAt = Date.now();
+        const h = String(r.txHash).toLowerCase();
+        cyc.confirmedSwaps = cyc.confirmedSwaps || [];
+        if (!cyc.confirmedSwaps.some(s => String(s.txHash).toLowerCase() === h)) {
+          cyc.confirmedSwaps.push({
+            txHash: r.txHash, direction: r.direction || null,
+            inDelta: r.inDelta ?? null, outDelta: r.outDelta ?? null,
+            blockNumber: r.blockNumber ?? null, ts: Date.now(),
+          });
+          this.log(`[CYCLE] #${cyc.cycleId} SWAP ${cyc.confirmedSwaps.length}/${cyc.swapsTarget} verified — tx=${r.txHash} ${r.direction || ""}`, "success");
+        }
+      } else if (r?.status === "fail") {
+        cyc.attempts = Number(cyc.attempts || 0) + 1;
+        cyc.lastProgressAt = Date.now();
+        cyc.errors = cyc.errors || [];
+        cyc.errors.push({ code: r.code || "FAIL", direction: r.direction || null, ts: Date.now() });
+        if (cyc.errors.length > 20) cyc.errors.splice(0, cyc.errors.length - 20);
+      }
+    }
+    if (cyc.status === "HOLDING") {
+      if ((cyc.confirmedSwaps || []).length >= cyc.swapsTarget) {
+        cyc.status = "READY_TO_CLOSE";
+        this.log(`[CYCLE] #${cyc.cycleId} swap quota met (${cyc.confirmedSwaps.length}/${cyc.swapsTarget}) — position #${cyc.positionId} will close on the next hold-gate pass`, "warn");
+      } else if (Number(cyc.attempts || 0) >= this._cycleAttemptCap()) {
+        cyc.status = "SWAP_QUOTA_EXHAUSTED";
+        this.log(`[CYCLE] #${cyc.cycleId} attempt cap reached (${cyc.attempts}/${this._cycleAttemptCap()}) with only ${cyc.confirmedSwaps?.length || 0}/${cyc.swapsTarget} verified — closing position; no new OPEN until it is closed`, "error");
+        this._noteCycleFailure("SWAP_QUOTA_EXHAUSTED", `attempts=${cyc.attempts} verified=${cyc.confirmedSwaps?.length || 0}`);
+      }
+    }
+    this._save();
+  }
+
+  /** No swap progress for too long under quota → close instead of holding forever. */
+  _checkCycleStall() {
+    if (!this._continuousEnabled()) return;
+    const c = this._getCycle();
+    if (!c || c.status !== "HOLDING") return;
+    const last = c.lastProgressAt || c.startedAt || 0;
+    const stallMs = Math.max(600_000, this._cycleAttemptCap() * 15_000);
+    if (Date.now() - last > stallMs) {
+      c.status = "SWAP_QUOTA_EXHAUSTED";
+      this.log(`[CYCLE] #${c.cycleId} STALLED — no verified SWAP progress for ${Math.round((Date.now() - last) / 60000)}m (${c.confirmedSwaps?.length || 0}/${c.swapsTarget}) — closing position`, "error");
+      this._noteCycleFailure("CYCLE_STALLED", `verified=${c.confirmedSwaps?.length || 0}/${c.swapsTarget}`);
+      this._save();
+    }
+  }
+
+  /**
+   * Swap-phase options for start(): quota-limited while the cycle counts
+   * SWAPs, fully skipped once the quota is met (never overshoot), plain
+   * maintenance when no cycle is live or the mode is off.
+   */
+  _swapRunOpts(phase) {
+    if (!this._continuousEnabled()) return { phase };
+    const c = this._getCycle();
+    if (!c || c.status === "DONE") return { phase }; // between cycles: inventory maintenance as usual
+    if (c.status !== "HOLDING") return null;         // READY_TO_CLOSE / EXHAUSTED — swaps are over
+    const rem = this._cycleSwapRemaining();
+    return rem > 0 ? { phase, maxSwaps: rem } : null;
+  }
+
+  /**
+   * start() STEP 1 guard: in continuous mode a HOLDING cycle position is never
+   * closed before its swap quota is met — UNLESS the on-chain emergency probe
+   * says risk is imminent (the hold machinery's own override, preserved).
+   */
+  async _continuousBlocksClose(rec) {
+    if (!this._continuousEnabled() || !rec) return false;
+    const c = this._getCycle();
+    if (!c || c.status !== "HOLDING" || c.positionId == null) return false;
+    if (String(c.positionId) !== String(rec?.positionId)) return false;
+    if ((c.confirmedSwaps || []).length >= c.swapsTarget) return false;
+    try {
+      const { provider } = this.getRuntime();
+      if (await this._emergencyCloseDue({ provider, managerAddr: rec.managerAddr, positionId: rec.positionId })) return false;
+    } catch { return false; } // probe failure → keep the quota guard (hold-like semantics)
+    return true;
+  }
+
+  /**
+   * Restart recovery — resume the persisted cycle from state + chain.
+   * Recorded swap txs must still exist with receipt.status=1 or they are
+   * dropped from the quota (never re-run, never double-counted).
+   */
+  async _recoverContinuousCycle() {
+    const cyc = this._getCycle();
+    if (!cyc || cyc.status === "DONE") return;
+    const rec = this._findPosition(cyc.positionId);
+    if (!rec) {
+      cyc.status = "DONE";
+      cyc.note = "position not tracked after on-chain recovery";
+      this.log(`[CONTINUOUS] cycle #${cyc.cycleId}: position #${cyc.positionId} is not active after on-chain recovery — cycle closed; next OPEN starts fresh`, "warn");
+      this._save();
+      return;
+    }
+    const { provider } = this.getRuntime();
+    const kept = [];
+    for (const s of (cyc.confirmedSwaps || [])) {
+      let okSwap = false;
+      try {
+        const rc = await provider.getTransactionReceipt(s.txHash);
+        okSwap = !!(rc && Number(rc.status) === 1);
+      } catch { okSwap = false; }
+      if (okSwap) kept.push(s);
+      else this.log(`[CONTINUOUS] cycle #${cyc.cycleId}: recorded SWAP ${s.txHash} not verified on restart — dropped from the quota (never re-sent)`, "warn");
+    }
+    cyc.confirmedSwaps = kept;
+    if (cyc.status === "HOLDING" && kept.length >= cyc.swapsTarget) cyc.status = "READY_TO_CLOSE";
+    this.log(`[CONTINUOUS] cycle #${cyc.cycleId} RESUMED — ${cyc.side} ${cyc.marketSymbol} position #${cyc.positionId}, verified SWAPs ${kept.length}/${cyc.swapsTarget}, status=${cyc.status}`, "warn");
+    this._save();
+  }
+
+  /** Per-symbol whole-token floor for the pre-OPEN exit-viability probe. */
+  _exitReserveNeedWhole(sym) {
+    const cfgMap = this.config.minExitReserveWhole;
+    if (typeof cfgMap === "number" && Number.isFinite(cfgMap)) return cfgMap;
+    if (cfgMap && typeof cfgMap === "object" && Number.isFinite(Number(cfgMap[sym]))) return Number(cfgMap[sym]);
+    const def = { USDT: 200, USDC: 200, DAI: 200, WETH: 0.05, ETH: 0.05, LINK: 50, UNI: 50, NEMESIS: 50 };
+    return def[sym] ?? 50;
+  }
+
+  /**
+   * Pre-OPEN exit-viability probe (read-only): BOTH pool legs must hold at
+   * least their whole-token floor, so a position is never opened where the
+   * pool cannot absorb a future close (the NEMESIS thin-pool trap). Pure
+   * evaluation is split out for tests.
+   */
+  _evaluateExitReserves({ reserve0, reserve1, token0, token1, collateralToken, paymentToken, dec0, dec1, collSym, paySym }) {
+    const need0 = this._exitReserveNeedWhole(collSym);
+    const need1 = this._exitReserveNeedWhole(paySym);
+    const whole0 = Number(ethers.formatUnits(BigInt(reserve0), Number(dec0)));
+    const whole1 = Number(ethers.formatUnits(BigInt(reserve1), Number(dec1)));
+    const legs = [
+      { token: token0, whole: whole0, need: need0, sym: collSym },
+      { token: token1, whole: whole1, need: need1, sym: paySym },
+    ];
+    for (const leg of legs) {
+      if (!(leg.whole >= leg.need)) {
+        return { ok: false, code: "EXIT_NOT_FEASIBLE", reason: `pool ${leg.sym} reserve ${leg.whole} < required ${leg.need} whole units — a close could not be absorbed` };
+      }
+    }
+    return { ok: true, whole0, whole1 };
+  }
+
+  async _probeMarketExitFeasible(market, ctx) {
+    try {
+      const pool = ctx?.poolAddr || market?.poolAddr || null;
+      if (!pool) return { ok: false, code: "EXIT_PROBE_FAILED", reason: "no pool address for exit probe" };
+      const { provider } = this.getRuntime();
+      const pc = new ethers.Contract(pool, POOL_ABI, provider);
+      const [reserves, t0] = await Promise.all([pc.getReserves(), pc.token0()]);
+      const token0 = String(t0);
+      const ctxLegs = [ctx?.token0, ctx?.token1].filter(Boolean).map(a => String(a));
+      const token1 = ctxLegs.find(a => a.toLowerCase() !== token0.toLowerCase()) || null;
+      if (!token1) return { ok: false, code: "EXIT_PROBE_FAILED", reason: "cannot resolve pool token1 for exit probe" };
+      const meta = (addr) => {
+        const hit = (this.tokenList || []).find(t => String(t.address).toLowerCase() === String(addr).toLowerCase());
+        return hit || null;
+      };
+      const collAddr = String(ctx?.collateralToken || market?.collateralToken || "");
+      const payAddr = String(ctx?.paymentToken || market?.paymentToken || "");
+      const isColl0 = token0.toLowerCase() === collAddr.toLowerCase();
+      const dec0 = ctx?.collateralDecimals ?? meta(token0)?.decimals ?? null;
+      const dec1 = meta(token1)?.decimals ?? null;
+      if (dec0 === null || dec1 === null || dec0 === undefined || dec1 === undefined) {
+        return { ok: false, code: "EXIT_PROBE_FAILED", reason: "token decimals unreadable for exit probe" };
+      }
+      const collSym = ctx?.collateralSym || meta(collAddr)?.symbol || "?";
+      const paySym = meta(payAddr)?.symbol || "?";
+      const reserve0 = BigInt(reserves[0]);
+      const reserve1 = BigInt(reserves[1]);
+      // Map so legs[0] is always the COLLATERAL token side.
+      const ev = isColl0
+        ? this._evaluateExitReserves({ reserve0, reserve1, token0, token1, collateralToken: collAddr, paymentToken: payAddr, dec0, dec1, collSym, paySym })
+        : this._evaluateExitReserves({ reserve0: reserve1, reserve1: reserve0, token0: token1, token1: token0, collateralToken: collAddr, paymentToken: payAddr, dec0: dec1, dec1: dec0, collSym, paySym });
+      return ev;
+    } catch (e) {
+      return { ok: false, code: "EXIT_PROBE_FAILED", reason: `exit probe failed: ${String(e?.message || e).slice(0, 60)}` };
+    }
   }
 
   /**
@@ -5539,6 +5959,17 @@ export class AutoTrader {
       if (byId >= 0) arr.splice(byId, 1);
     }
     if (countClose) this.state.sessionStats.closes++;
+    // TRADE-CAP SLOT RETURN — a confirmed open by THIS process consumed one
+    // maxTradesPerRun slot; when its record is finally removed (verified close
+    // or zombie) that slot is returned, so a continuous run may open again
+    // after the round-trip. Records that never consumed a slot (adopted
+    // from chain, pending/reverted opens, positions from a previous process)
+    // are not in the WeakSet and never free one — the cap still bounds how
+    // many opens may run AHEAD of closes. Floor at 0 across restarts.
+    if (countClose && this._capConsumers?.delete(pos)) {
+      this._opensThisRun = Math.max(0, this._opensThisRun - 1);
+    }
+    this._onPositionClosed?.(pos, countClose); // continuous cycle completes here (no-op when off)
     this._resetCloseRetry(pos);
     saveState(this.state);
     return true;
@@ -5696,6 +6127,8 @@ export class AutoTrader {
     this.state.lastSide = pos.side;
     this.state.sessionStats.opens++;
     this._opensThisRun++;
+    this._capConsumers?.add(pos);
+    this._onPositionOpened?.(pos); // continuous cycle binds here (no-op when off)
     saveState(this.state);
     this.log(`[OPEN] CONFIRMED tx=${hash} block=${receipt.blockNumber} — position #${positionId} (${pos.side} ${pos.marketSymbol || "?"}); sessionStats.opens=${this.state.sessionStats.opens}`, "success");
     return { status: TX_STATE.CONFIRMED, done: true };
@@ -5749,6 +6182,21 @@ export class AutoTrader {
     if (closeResult.failed) {
       if (closeResult.clearState === false) {
         const d = this._noteCloseFailure(pos, sig, closeResult.code || "FAILED");
+        // CLOSE-EXIT BLOCKED — the pool cannot absorb any safe exit slice. The
+        // position stays tracked and retried every cycle; in continuous mode it
+        // no longer occupies the (sequential) open slot, so one thin pool can
+        // never freeze the whole trading cycle. A different failure code means
+        // the exit path progressed past the bps search → unmark.
+        const INFEASIBLE = ["CLOSE_NO_FEASIBLE_WINDOW", "CLOSE_BPS_NOT_FOUND", "CLOSE_AMOUNT_TOO_SMALL"];
+        if (pos && INFEASIBLE.includes(closeResult.code)) {
+          if (!pos.closeBlocked) {
+            pos.closeBlocked = true;
+            this.log(`[CLOSE] #${id} marked closeBlocked (exit window infeasible — pool cannot absorb a safe slice) — kept tracked, retried each cycle`, "warn");
+          }
+        } else if (pos?.closeBlocked) {
+          pos.closeBlocked = false;
+          this.log(`[CLOSE] #${id} closeBlocked cleared (failure mode changed: ${closeResult.code || "?"})`, "info");
+        }
         this.log(`[CLOSE] #${id} blocked (${closeResult.code || closeResult.reason || "?"}) — position KEPT, retry in ${Math.ceil(d / 1000)}s`, "warn");
         return { ok: false, blocked: true, continueCycle: CONTINUE, code: closeResult.code || "FAILED" };
       }
@@ -6405,6 +6853,17 @@ export class AutoTrader {
       // a global one: other markets stay fully tradable.
       if (this._marketHasPosition(candidate)) {
         this.log(`[SKIP] ${candidate.symbol} ${side}: market already has a tracked position — trying next candidate`, "warn");
+        this._rotMarketSkip(candidate.symbol, side);
+        continue;
+      }
+
+      // EXIT VIABILITY — never open where the pool cannot absorb a future
+      // close (read-only reserve floor on both legs). A thin pool is SKIPPED
+      // with a reason; the bot moves to the next candidate instead of opening
+      // a position it could never safely exit.
+      const exitProbe = await this._probeMarketExitFeasible(candidate, ctx);
+      if (!exitProbe.ok) {
+        this.log(`[SKIP] ${candidate.symbol} ${side}: exit not viable (${exitProbe.code}: ${exitProbe.reason}) — trying next candidate`, "warn");
         this._rotMarketSkip(candidate.symbol, side);
         continue;
       }

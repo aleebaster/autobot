@@ -11,6 +11,9 @@
 //        close clears only its own record, a blocked sibling is kept untouched
 //    M5  PHASE-1 style auto-close loop (closeActivePosition) processes each
 //        record independently on a multi-manager provider (dry — no TX)
+//    M7  maxTradesPerRun round-trip: a verified close of a record THIS
+//        process opened RETURNS its trade slot (continuous-loop regression:
+//        cap=1 used to go OPEN-dead forever after the first open)
 //
 //  NO TRANSACTIONS: state isolation + TX guard come from the first import;
 //  close/open impls are stubbed where a send would otherwise be required.
@@ -488,6 +491,95 @@ section("M5: closeActivePosition loops EACH record independently (multi-manager,
     t.state.activePositions.length === 2 && a.closeRetry == null && b.closeRetry == null
     && t.state.sessionStats.closes === closesBefore,
     `tracked=${JSON.stringify(t.state.activePositions.map(x => x.positionId))} closes=${t.state.sessionStats.closes}`);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// M7 — maxTradesPerRun round-trip: verified close RETURNS the trade slot
+// ═══════════════════════════════════════════════════════════════════════════
+section("M7: maxTradesPerRun — verified close RETURNS the slot (continuous-loop fix)");
+
+{
+  // Regression for the OPEN-dead bug: with maxTradesPerRun=1 the FIRST
+  // confirmed open spent the only slot FOREVER (_opensThisRun never reset),
+  // so a continuous start() loop skipped every later OPEN — journal evidence:
+  // OPEN-LONG 11:07:17 confirmed, then 80+ min of SWAP-only cycles.
+  const t = makeTrader({ maxTradesPerRun: 1, maxOpenPositions: 5 });
+  check("M7: fresh run, cap=1 → gate ok", t._canOpenNew({ log: false }).ok === true);
+
+  // 1) confirmed open consumes the slot (production tracking path)
+  const r1 = t._trackOpenedPosition({
+    positionId: 501, side: "SHORT", collateralToken: USDT, collateralAmount: "1000000",
+    paymentToken: USDT, leverage: 2, openedAt: Date.now(), txHash: "0x" + "aa".repeat(32),
+    marketSymbol: "USDC/USDT", managerAddr: MGR_B, poolAddr: POOL_B,
+  });
+  const gate1 = t._canOpenNew({ log: false });
+  check("M7: after confirmed open → TRADE_CAP blocks the next OPEN",
+    gate1.ok === false && gate1.code === "TRADE_CAP",
+    `code=${gate1.code} opensThisRun=${t._opensThisRun}`);
+
+  // 2) verified close of THAT record returns the slot
+  t._clearPosition(r1, "verified close", true);
+  const gate2 = t._canOpenNew({ log: false });
+  check("M7: verified close of the opened record RETURNS the slot → gate ok again",
+    gate2.ok === true && t._opensThisRun === 0,
+    `opensThisRun=${t._opensThisRun} closes=${t.state.sessionStats.closes}`);
+
+  // 3) adopted records never consumed a slot → clearing one frees nothing
+  const t2 = makeTrader({ maxTradesPerRun: 1, maxOpenPositions: 5 });
+  t2._trackOpenedPosition({
+    positionId: 502, side: "LONG", collateralToken: USDT, collateralAmount: "1000000",
+    paymentToken: USDT, leverage: 2, openedAt: Date.now(), txHash: "0x" + "bb".repeat(32),
+    marketSymbol: "ETH/USDT", managerAddr: MGR_A, poolAddr: POOL_A,
+  });
+  const adopted = t2._trackOpenedPosition({
+    positionId: 503, side: "LONG", collateralToken: USDT, collateralAmount: "1000000",
+    paymentToken: USDT, leverage: 2, openedAt: Date.now(), txHash: "0x" + "cc".repeat(32),
+    marketSymbol: "NEMESIS/USDT", managerAddr: MGR_N, poolAddr: POOL_N,
+  }, { adopted: true });
+  check("M7: adopted open does NOT increment the cap counter",
+    t2._opensThisRun === 1, `opensThisRun=${t2._opensThisRun}`);
+  t2._clearPosition(adopted, "adopted closed", true);
+  check("M7: clearing an ADOPTED record frees NO slot (still TRADE_CAP)",
+    t2._opensThisRun === 1 && t2._canOpenNew({ log: false }).code === "TRADE_CAP",
+    `opensThisRun=${t2._opensThisRun}`);
+
+  // 4) pending records (never confirmed) never consume a slot; clearing
+  //    them (countClose=false) must not free one either
+  const t3 = makeTrader({ maxTradesPerRun: 1, maxOpenPositions: 5 });
+  const pend = t3._trackOpenedPosition({
+    positionId: null, side: "LONG", collateralToken: USDT, collateralAmount: "1000000",
+    paymentToken: USDT, leverage: 2, openedAt: Date.now(), txHash: "0x" + "dd".repeat(32),
+    marketSymbol: "ETH/USDT", managerAddr: MGR_A, poolAddr: POOL_A,
+  }, { pending: true });
+  check("M7: pending open consumes NO slot (blocked by OPEN_PENDING, not TRADE_CAP)",
+    t3._opensThisRun === 0 && t3._canOpenNew({ log: false }).code === "OPEN_PENDING",
+    `opensThisRun=${t3._opensThisRun} code=${t3._canOpenNew({ log: false }).code}`);
+  t3._clearPosition(pend, "pending open reverted", false);
+  check("M7: clearing a PENDING record frees no slot (counter stays 0)",
+    t3._opensThisRun === 0 && t3._canOpenNew({ log: false }).ok === true);
+
+  // 5) floor — a never-counted record creates no free slot
+  const t4 = makeTrader({ maxTradesPerRun: 1, maxOpenPositions: 5 });
+  t4._clearPosition(rec(999, "LONG", MGR_A, POOL_A, "ETH/USDT"), "stale record", true);
+  check("M7: closing a NEVER-COUNTED record leaves the counter at 0 (no slot created)",
+    t4._opensThisRun === 0, `opensThisRun=${t4._opensThisRun}`);
+
+  // 6) three full round-trips under cap=1 — the continuous loop never OPEN-dead
+  const t5 = makeTrader({ maxTradesPerRun: 1, maxOpenPositions: 5 });
+  let okCycle = true;
+  for (let i = 1; i <= 3; i++) {
+    if (!t5._canOpenNew({ log: false }).ok) { okCycle = false; break; }
+    const r = t5._trackOpenedPosition({
+      positionId: 600 + i, side: "LONG", collateralToken: USDT, collateralAmount: "1",
+      paymentToken: USDT, leverage: 2, openedAt: Date.now(), txHash: null,
+      marketSymbol: "ETH/USDT", managerAddr: MGR_A, poolAddr: POOL_A,
+    });
+    if (t5._canOpenNew({ log: false }).code !== "TRADE_CAP") { okCycle = false; break; }
+    t5._clearPosition(r, "round-trip close", true);
+  }
+  check("M7: three open→close round-trips under cap=1 all pass (never OPEN-dead)",
+    okCycle && t5._opensThisRun === 0,
+    `opensThisRun=${t5._opensThisRun} closes=${t5.state.sessionStats.closes}`);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
