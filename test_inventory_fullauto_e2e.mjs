@@ -22,6 +22,15 @@ import { AutoTrader } from "./autoTrader.js";
 import { getConfirmedPools } from "./deployments/index.js";
 import { DEFAULT_ETH_GUARD } from "./tokenInventory.js";
 
+// ═══ LIVE-TEST GATE (default: SKIP) ═══════════════════════════════════════
+// This suite can sign real transactions. Normal runs must never do that:
+// it is only reachable with the explicit opt-in phrase below (the global
+// signer guard in _test_state_isolation.mjs enforces the same + chainId).
+if (process.env.NEMESIS_ALLOW_LIVE_TX !== "SEND LIVE TRANSACTIONS") {
+  console.log('SKIP — live-test opt-in missing. Re-run only with: NEMESIS_ALLOW_LIVE_TX="SEND LIVE TRANSACTIONS" (NEMESIS_LIVE_CHAIN_ID defaults to 11155111).');
+  process.exit(0);
+}
+
 const RPC_URL = "https://ethereum-sepolia-rpc.publicnode.com";
 const CHAIN_ID = 11155111;
 const WETH  = "0x7b79995e5f793A07Bc00c21412e50Ecae098E7f9";
@@ -214,13 +223,15 @@ async function main() {
 
   // Create a fresh AutoTrader with the right state
   // Set lastSide=SHORT so next cycle goes LONG
-  const stateFile = "auto-trader-state.json";
+  // Isolated scratch copy — never the real repo state (hardcoded path was
+  // a state-wipe vector when a run was killed mid-test).
+  const stateFile = TEST_STATE_FILE;
   const prevState = JSON.parse(fs.readFileSync(stateFile, "utf8"));
   const savedState = { ...prevState }; // save for restore
 
   // Clear active position to start fresh
   const clearState = {
-    activePosition: null,
+    activePositions: [],
     sessionStats: prevState.sessionStats,
     lastCycleTime: 0,
     lastSide: "SHORT", // Force next cycle to LONG
@@ -279,12 +290,12 @@ async function main() {
   printBalances("BALANCES AFTER CYCLE", balAfter);
 
   // ════════ STEP 4: Close position if open ════════
-  if (stateAfter.activePosition) {
+  if (stateAfter.activePositions?.[0]) {
     console.log("\n═══════════ CLOSING POSITION ═══════════");
     // Run another cycle — this should close the active position
     const closeState = {
       ...clearState,
-      activePosition: stateAfter.activePosition,
+      activePositions: stateAfter.activePositions || [],
     };
     fs.writeFileSync(stateFile, JSON.stringify(closeState, null, 2));
 

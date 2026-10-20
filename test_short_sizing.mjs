@@ -274,13 +274,28 @@ async function run() {
     // collateralToken. Normalise so the resolver gets a real token address.
     const c = found ? { ...found, collateralToken: found.collateralToken || found.collateralShort } : null;
     if (!c) { test("D0. WETH/DAI fixture found in discovered markets", false, "missing"); }
-    const res = c ? await resolveShortCollateralAmount(provider, {
+    // Probe the live pool minimum first (huge cap → sizing succeeds and reports poolMin),
+    // then set the cap just BELOW that minimum so the gate fires deterministically
+    // regardless of deployment (v2 vs v5) or reserve drift.
+    const probeCap = ethers.parseUnits("1000000", dec);
+    const probe = c ? await resolveShortCollateralAmount(provider, {
       pool: c.poolAddr, manager: c.managerAddr, collateralToken: c.collateralToken,
-      configuredRaw, capRaw: tinyCap, leverageX10: LEVERAGE_X10,
-    }) : { ok: false, code: "FIXTURE_MISSING" };
-    test("D1. poolMin > cap → POOL_MIN_EXCEEDS_CAP, no inflation",
-      res.ok === false && res.code === "POOL_MIN_EXCEEDS_CAP",
-      `got ${res.code} market=${c?.symbol || c?.marketSymbol || "?"}`);
+      configuredRaw, capRaw: probeCap, leverageX10: LEVERAGE_X10,
+    }) : null;
+    const poolMin = probe?.ok ? probe.poolMin : (probe?.poolMin ?? null);
+    if (!c || poolMin === null || poolMin === undefined || poolMin < 2n) {
+      test("D1. poolMin > cap → POOL_MIN_EXCEEDS_CAP, no inflation", "SKIP",
+        !c ? "no WETH/DAI fixture" : `cannot build cap < poolMin (probe code=${probe?.code} poolMin=${poolMin})`);
+    } else {
+      const tinyCap = poolMin - 1n; // guaranteed: poolMin > capRaw
+      const res = await resolveShortCollateralAmount(provider, {
+        pool: c.poolAddr, manager: c.managerAddr, collateralToken: c.collateralToken,
+        configuredRaw, capRaw: tinyCap, leverageX10: LEVERAGE_X10,
+      });
+      test("D1. poolMin > cap → POOL_MIN_EXCEEDS_CAP, no inflation",
+        res.ok === false && res.code === "POOL_MIN_EXCEEDS_CAP",
+        `got ${res.code} market=${c?.symbol || c?.marketSymbol || "?"} poolMin=${poolMin} cap=${tinyCap}`);
+    }
     test("D2. fallback path never inflates (POOL_STATE_READ_ERROR → keep configured)",
       (() => {
         const r = { ok: false, code: "POOL_STATE_READ_ERROR", fallbackToConfigured: true };

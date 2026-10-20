@@ -23,16 +23,174 @@ export const SWAP_FAILURE_CODES = Object.freeze([
   "ZERO_AMOUNT_OUT_MIN",
   "INSUFFICIENT_BALANCE",
   "INSUFFICIENT_ALLOWANCE",
+  "ALLOWANCE_MISSING",
+  "APPROVAL_REQUIRED",
   "PREFLIGHT_REVERT",
   "LIQUIDITY_LOW",
   "ROUTE_UNAVAILABLE",
+  "GAS_RESERVE",
   "GAS_TOO_HIGH",
   "TOKEN_DISABLED",
+  "PINNED_AMOUNT",
+  "ECONOMY_REJECTED",
+  "RATE_DEVIATION",
+  "RATE_DEVIATION_UNVERIFIED",
+  "WAITING_FOR_ALLOWANCE",
+  "WAITING_FOR_INVENTORY",
+  "WAITING_FOR_LIQUIDITY",
+  "WAITING_FOR_PRICE",
   // engine-specific extras (still per-route, still non-fatal)
   "TX_REVERTED",
   "VERIFY_FAILED",
   "EXCEPTION",
 ]);
+
+/**
+ * Per-direction states. A direction re-enters the queue on the next pass only
+ * as cheaply re-checkable: WAITING_* states re-evaluate their precondition
+ * every pass (balance / allowance / quote), FAILED routes go through the
+ * per-route backoff. No state ever blocks the rest of the queue.
+ */
+export const SWAP_DIRECTION_STATES = Object.freeze({
+  READY: "READY",
+  WAITING_FOR_ALLOWANCE: "WAITING_FOR_ALLOWANCE",
+  WAITING_FOR_INVENTORY: "WAITING_FOR_INVENTORY",
+  WAITING_FOR_LIQUIDITY: "WAITING_FOR_LIQUIDITY",
+  WAITING_FOR_PRICE: "WAITING_FOR_PRICE",
+  EXECUTABLE: "EXECUTABLE",
+  CONFIRMED: "CONFIRMED",
+  FAILED: "FAILED",
+});
+
+/**
+ * reasonCode → { state, recoverable, recommendedAction }.
+ * Every skip/fail path classifies through this map — no anonymous SKIPs.
+ */
+export const SWAP_REASON_META = Object.freeze({
+  INSUFFICIENT_BALANCE: {
+    state: SWAP_DIRECTION_STATES.WAITING_FOR_INVENTORY, recoverable: true,
+    recommendedAction: "top up the source token or wait until balance exceeds reserve + minimum",
+  },
+  WAITING_FOR_INVENTORY: {
+    state: SWAP_DIRECTION_STATES.WAITING_FOR_INVENTORY, recoverable: true,
+    recommendedAction: "resume automatically when the balance is sufficient",
+  },
+  TOKEN_DISABLED: {
+    state: SWAP_DIRECTION_STATES.FAILED, recoverable: false,
+    recommendedAction: "token decimals unreadable — check RPC/token address",
+  },
+  PINNED_AMOUNT: {
+    state: SWAP_DIRECTION_STATES.FAILED, recoverable: false,
+    recommendedAction: "operator amount does not round-trip at token decimals",
+  },
+  WAITING_FOR_ALLOWANCE: {
+    state: SWAP_DIRECTION_STATES.WAITING_FOR_ALLOWANCE, recoverable: true,
+    recommendedAction: "auto mode approves the v5 Router once, re-checks allowance, then swaps",
+  },
+  ALLOWANCE_MISSING: {
+    state: SWAP_DIRECTION_STATES.WAITING_FOR_ALLOWANCE, recoverable: true,
+    recommendedAction: "approve the v5 Router for the source token (auto mode does this once)",
+  },
+  APPROVAL_REQUIRED: {
+    state: SWAP_DIRECTION_STATES.WAITING_FOR_ALLOWANCE, recoverable: false,
+    recommendedAction: "single-swap mode refuses approvals — approve manually or use the maintenance cycle",
+  },
+  INSUFFICIENT_ALLOWANCE: {
+    state: SWAP_DIRECTION_STATES.FAILED, recoverable: false,
+    recommendedAction: "approve tx reverted — inspect the token contract",
+  },
+  ROUTE_UNAVAILABLE: {
+    state: SWAP_DIRECTION_STATES.WAITING_FOR_LIQUIDITY, recoverable: true,
+    recommendedAction: "no v5 route quotes at this size — retry when liquidity appears",
+  },
+  QUOTE_ZERO: {
+    state: SWAP_DIRECTION_STATES.WAITING_FOR_LIQUIDITY, recoverable: true,
+    recommendedAction: "router returned 0 — retry when liquidity appears",
+  },
+  WAITING_FOR_LIQUIDITY: {
+    state: SWAP_DIRECTION_STATES.WAITING_FOR_LIQUIDITY, recoverable: true,
+    recommendedAction: "retry automatically when pool quotes become non-zero",
+  },
+  ZERO_AMOUNT_OUT_MIN: {
+    state: SWAP_DIRECTION_STATES.WAITING_FOR_PRICE, recoverable: true,
+    recommendedAction: "output too small for the slippage floor — needs a larger input or deeper liquidity",
+  },
+  ECONOMY_REJECTED: {
+    state: SWAP_DIRECTION_STATES.WAITING_FOR_PRICE, recoverable: true,
+    recommendedAction: "economic gate — wait for a deeper book; a smaller safe size is tried automatically when the gates are size-driven",
+  },
+  WAITING_FOR_PRICE: {
+    state: SWAP_DIRECTION_STATES.WAITING_FOR_PRICE, recoverable: true,
+    recommendedAction: "retry automatically when pool share / price impact fall within the configured gates",
+  },
+  RATE_DEVIATION: {
+    state: SWAP_DIRECTION_STATES.WAITING_FOR_PRICE, recoverable: false,
+    recommendedAction: "round-trip quotes inconsistent — swap BLOCKED until quotes agree",
+  },
+  RATE_DEVIATION_UNVERIFIED: {
+    state: SWAP_DIRECTION_STATES.WAITING_FOR_PRICE, recoverable: false,
+    recommendedAction: "no symmetric round-trip quote — swap BLOCKED until the reverse quote is available",
+  },
+  PREFLIGHT_REVERT: {
+    state: SWAP_DIRECTION_STATES.FAILED, recoverable: false,
+    recommendedAction: "router eth_call reverted — inspect the revert text",
+  },
+  GAS_RESERVE: {
+    state: SWAP_DIRECTION_STATES.FAILED, recoverable: true,
+    recommendedAction: "fund ETH for gas",
+  },
+  GAS_TOO_HIGH: {
+    state: SWAP_DIRECTION_STATES.FAILED, recoverable: true,
+    recommendedAction: "network gas above the ceiling — wait",
+  },
+  TX_REVERTED: {
+    state: SWAP_DIRECTION_STATES.FAILED, recoverable: false,
+    recommendedAction: "transaction reverted — per-route backoff applies",
+  },
+  VERIFY_FAILED: {
+    state: SWAP_DIRECTION_STATES.FAILED, recoverable: false,
+    recommendedAction: "balance deltas contradict the quote — inspect the tx",
+  },
+  EXCEPTION: {
+    state: SWAP_DIRECTION_STATES.FAILED, recoverable: false,
+    recommendedAction: "unexpected error — inspect logs",
+  },
+  NO_RESULT: {
+    state: SWAP_DIRECTION_STATES.FAILED, recoverable: false,
+    recommendedAction: "attempt returned nothing",
+  },
+  UNKNOWN: {
+    state: SWAP_DIRECTION_STATES.FAILED, recoverable: false,
+    recommendedAction: "unknown failure — inspect logs",
+  },
+});
+
+/** reasonCode → state/recoverable/action (unclassified codes degrade safely). */
+export function swapReasonMeta(code) {
+  return SWAP_REASON_META[code]
+    || { state: SWAP_DIRECTION_STATES.FAILED, recoverable: false, recommendedAction: "unclassified — inspect logs" };
+}
+
+/**
+ * Classify a router preflight revert. The two texts this deployment actually
+ * produces must never hide behind a generic PREFLIGHT_REVERT:
+ *   • TransferHelper: TRANSFER_FROM_FAILED  → allowance to the v5 Router
+ *   • OMMLibrary: INSUFFICIENT_INPUT_AMOUNT → input below the pool minimum
+ * @returns {{code:string, detail:string}|null} null = unclassified
+ */
+export function classifySwapRevert(text) {
+  const t = String(text || "");
+  if (/TRANSFER_FROM_FAILED/i.test(t)) {
+    return { code: "ALLOWANCE_MISSING", detail: 'TransferHelper: TRANSFER_FROM_FAILED (allowance to the v5 Router missing or too low)' };
+  }
+  if (/INSUFFICIENT_INPUT_AMOUNT/i.test(t)) {
+    return { code: "WAITING_FOR_LIQUIDITY", detail: "OMMLibrary: INSUFFICIENT_INPUT_AMOUNT (input below the pool minimum for this path)" };
+  }
+  if (/INSUFFICIENT_OUTPUT_AMOUNT/i.test(t)) {
+    return { code: "QUOTE_ZERO", detail: "router: INSUFFICIENT_OUTPUT_AMOUNT (pool cannot pay this output)" };
+  }
+  return null;
+}
 
 /**
  * Reserve that is NEVER swapped away, per token symbol (human units).

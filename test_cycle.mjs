@@ -1,6 +1,15 @@
 import { ethers } from "ethers";
 import fs from "fs";
 
+// ═══ LIVE-TEST GATE (default: SKIP) ═══════════════════════════════════════
+// This suite can sign real transactions. Normal runs must never do that:
+// it is only reachable with the explicit opt-in phrase below (the global
+// signer guard in _test_state_isolation.mjs enforces the same + chainId).
+if (process.env.NEMESIS_ALLOW_LIVE_TX !== "SEND LIVE TRANSACTIONS") {
+  console.log('SKIP — live-test opt-in missing. Re-run only with: NEMESIS_ALLOW_LIVE_TX="SEND LIVE TRANSACTIONS" (NEMESIS_LIVE_CHAIN_ID defaults to 11155111).');
+  process.exit(0);
+}
+
 const RPC = "https://ethereum-sepolia-rpc.publicnode.com/557d07a988c4164482ef0c56a10f98ee0e3073440fd72fbe89cd7f6fef809388";
 const MGR = "0x53bb0fFBdA04E5982fa08D846aA265Ff6cFE068e";
 const QADAI = "0xe99655E262eF4C20eBeC4805B3963dad52a1538e";

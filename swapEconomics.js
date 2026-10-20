@@ -249,6 +249,64 @@ export function evaluateRouteEconomics({ legs = [], economy = {} } = {}) {
   };
 }
 
+/**
+ * Largest amountIn (raw) whose pool share of `reserveIn` stays within
+ * `maxPoolShareBps` — exact bigint math: amount ≤ reserve × bps / 10000.
+ * Returns 0n when the pool is empty or the cap is unusable.
+ */
+export function poolShareCapAmountIn({ reserveIn, maxPoolShareBps }) {
+  const r = BigInt(reserveIn ?? 0n);
+  const bps = BigInt(Math.max(0, Math.round(Number(maxPoolShareBps ?? 0))));
+  if (r <= 0n || bps <= 0n) return 0n;
+  return (r * bps) / BPS;
+}
+
+/**
+ * Shrink-and-retry a size-rejected amount through an INJECTED probe (the same
+ * shape as `probeRouteEconomics`: async → { ok, gates, legs }). Thresholds are
+ * never loosened — only the input amount is halved, and only while the failure
+ * is size-driven (POOL_SHARE_HIGH / PRICE_IMPACT_HIGH). Non-size gates
+ * (ZERO_RESERVE, RATE_DEVIATION, …) and amounts below `minAmountIn` stop the
+ * search immediately: a smaller size cannot repair them.
+ *
+ * Pure aside from the probe callback — unit-testable with a mock probe.
+ *
+ * @param {object} o
+ * @param {bigint} o.amountIn     starting (raw) amount
+ * @param {bigint} [o.minAmountIn] smallest raw amount still worth swapping
+ * @param {number} [o.maxHalvings] how many times to halve (default 4)
+ * @param {(amountIn: bigint) => Promise<{ok:boolean, gates?:string[], legs?:Array}>} o.probe
+ * @returns {{ok:boolean, amountIn:bigint, probe:object|null, halvings:number, history:Array, reason:string}}
+ */
+export async function shrinkToFitEconomy({ amountIn, minAmountIn = 1n, maxHalvings = 4, probe }) {
+  let amt = BigInt(amountIn ?? 0n);
+  const min = BigInt(minAmountIn ?? 1n);
+  const history = [];
+  const sizeGates = new Set([ECONOMY_GATES.POOL_SHARE_HIGH, ECONOMY_GATES.PRICE_IMPACT_HIGH]);
+
+  for (let i = 0; i <= maxHalvings; i++) {
+    const res = await probe(amt);
+    const gates = Array.isArray(res?.gates) ? res.gates : [];
+    history.push({ amountIn: String(amt), ok: !!res?.ok, gates: gates.slice() });
+    if (res?.ok) {
+      return { ok: true, amountIn: amt, probe: res, halvings: i, history, reason: "passes at this size" };
+    }
+    const shrinkable = gates.some(g => sizeGates.has(g));
+    if (!shrinkable) {
+      return { ok: false, amountIn: amt, probe: res, halvings: i, history, reason: `not size-driven (gates=${gates.join(",") || "none"})` };
+    }
+    if (amt <= min) {
+      return { ok: false, amountIn: amt, probe: res, halvings: i, history, reason: `min amount reached (${min})` };
+    }
+    const next = amt / 2n;
+    if (next === 0n || next < min) {
+      return { ok: false, amountIn: amt, probe: res, halvings: i, history, reason: `next halving below min (${min})` };
+    }
+    amt = next;
+  }
+  return { ok: false, amountIn: amt, probe: null, halvings: maxHalvings, history, reason: "max halvings exhausted" };
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  READ-ONLY ON-CHAIN PROBE
 // ─────────────────────────────────────────────────────────────────────────────

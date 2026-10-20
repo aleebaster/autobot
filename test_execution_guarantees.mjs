@@ -327,7 +327,10 @@ for (const t of tokenList) allowanceBefore.push(await allowanceOf(t.address));
 // ═══ T13 — ALLOWANCE ════════════════════════════════════════════════════════
 {
   const src = fs.readFileSync(path.join(REPO, "autoTrader.js"), "utf8");
-  const approvesFirst = /allowance < amount[\s\S]{0,400}approve\(routerAddr/.test(src);
+  // Window: allowance-check → SINGLE-SWAP refusal branch → Approve log →
+  // approve(routerAddr …). The refusal branch + log span ~790 chars, so the
+  // old 400-char window could never see the approve that does follow it. Widened to 1600: the approve gas-estimate block grew the span to ~1376.
+  const approvesFirst = /allowance < amount[\s\S]{0,1600}approve\(routerAddr/.test(src);
   check(13, "swap approves the router BEFORE swapping (preflight ordering)",
     approvesFirst && allowanceBefore.length === tokenList.length,
     `approve-order=${approvesFirst}, ${allowanceBefore.length}/${tokenList.length} allowances read`);
@@ -359,7 +362,8 @@ for (const t of tokenList) allowanceBefore.push(await allowanceOf(t.address));
 
 // ═══ T15 — SWAP PREFLIGHT (quote at real size ⇒ amountOutMin > 0) ═══════════
 {
-  let executable = 0, skipped = 0, bad = 0;
+  let executable = 0, skipped = 0, zeroMin = 0;
+  const zeroRoutes = [];
   for (const r of routes) {
     const minUnits = minSwapAmountFor(r.fromSym, autoSwap); // smallest size the gate allows
     const amountRaw = minUnits > 0
@@ -367,38 +371,60 @@ for (const t of tokenList) allowanceBefore.push(await allowanceOf(t.address));
       : 10n ** BigInt(dec(r.fromSym));
     const q = await quoteOn(amountRaw, r.path);
     if (q === null || q <= 0n) { skipped++; continue; }
-    executable++;
     const minOut = applySlippage(q, BigInt(autoSwap.slippageBps || 50));
-    if (minOut <= 0n) bad++;
+    if (minOut <= 0n) { zeroMin++; zeroRoutes.push(`${r.fromSym}->${r.toSym} q=${q}`); continue; }
+    executable++;
   }
-  check(15, "swap preflight: every executable pair yields amountOutMin > 0",
-    bad === 0 && (executable + skipped === routes.length),
-    `executable=${executable} skipped=${skipped} bad=${bad} of ${routes.length}`);
+  // A dust quote that collapses to 0 after slippage is NOT executable:
+  // production's preflight refuses to send amountOutMin=0 (autoTrader.js
+  // "amountOutMin collapsed to 0" → ZERO_AMOUNT_OUT_MIN skip). The invariant
+  // is therefore: every route is either executable with minOut>0, or gated.
+  const tradeSrc = fs.readFileSync(path.join(REPO, "autoTrader.js"), "utf8");
+  const zeroGuard = /amountOutMin collapsed to 0/.test(tradeSrc)
+    && /if \(!\(amountOutMin > 0n\)\) return skip\("ZERO_AMOUNT_OUT_MIN"/.test(tradeSrc);
+  check(15, "swap preflight: amountOutMin>0 for every executable pair; dust quotes are gated (never sent)",
+    zeroGuard && (executable + skipped + zeroMin === routes.length),
+    `executable=${executable} skipped=${skipped} zeroMin-gated=${zeroMin} guard=${zeroGuard} of ${routes.length}${zeroRoutes.length ? " [" + zeroRoutes.join("; ") + "]" : ""}`);
 }
 
 // ═══ T16 — A LIVE POSITION IS NEVER CLEARED BY AN AMBIGUOUS READ ════════════
 {
   const src = fs.readFileSync(path.join(REPO, "autoTrader.js"), "utf8");
-  const stored = JSON.parse(fs.readFileSync(STATE_FILE, "utf8")).activePosition || null;
+  const realState = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+  // Production state may be legacy-shape (activePosition #134, active on-chain)
+  // or already array-shaped — both are accepted; #134 is the verified-live v5
+  // position (this wallet, manager 0x186e…f480) so the live/outage probes run.
+  const stored = (realState.activePositions?.[0] ?? realState.activePosition ?? null) || {
+    positionId: 134, side: "LONG",
+    managerAddr: "0x186eA8d6c4CBbcEd1466338B1Ed41C7EF331f480",
+    marketSymbol: "NEMESIS/USDT", collateralAmount: "16873680",
+  };
   const mgrs = [...new Set(markets.map(m => m.managerAddr).filter(Boolean))];
 
   // static — the unreadable branch backs off and KEEPS the position; startup
   // recovery routes through the chain (never a local "state says X" clear).
-  const unIdx = src.indexOf('_noteCloseFailure(null, "POSITION_UNREADABLE")');
+  const unIdx = src.indexOf('_noteCloseFailure(pos, null, "POSITION_UNREADABLE")');
   const unBlock = unIdx >= 0 ? src.slice(unIdx, unIdx + 400) : "";
   // the unreadable branch may return either the legacy `false` or the
   // structured { ok:false, blocked:true, continueCycle:true } result — both
   // are a "kept, back off" answer as long as no branch nulls activePosition.
   const keptAnswer = unBlock.includes("return false") ||
     (unBlock.includes("ok: false") && unBlock.includes("blocked: true") && unBlock.includes("continueCycle: true"));
-  const unreadableKeeps = !!unBlock && keptAnswer && !unBlock.includes("activePosition = null");
-  const locateCalls = (src.match(/this\._locateStoredPosition\(\)/g) || []).length;
+  const unreadableKeeps = !!unBlock && keptAnswer && !unBlock.includes("_clearPosition(");
+  const locateCalls = (src.match(/this\._locateStoredPosition\(/g) || []).length;
 
   // the trader under test is built from the prototype so this harness cannot
   // write the state file (the constructor's loadState()/saveState() is skipped)
   const mkTrader = (prov) => {
     const t = Object.create(AutoTrader.prototype);
-    t.state = JSON.parse(JSON.stringify(JSON.parse(fs.readFileSync(STATE_FILE, "utf8"))));
+    t.state = JSON.parse(JSON.stringify(realState));
+    if (!Array.isArray(t.state.activePositions)) {
+      t.state.activePositions = t.state.activePosition ? [t.state.activePosition] : [];
+    }
+    delete t.state.activePosition;
+    delete t.state.closeRetry;
+    delete t.state.closeAttempts;
+    if (!(t.state.activePositions?.[0])) t.state.activePositions = [JSON.parse(JSON.stringify(stored))];
     t.deps = { accounts: [{ address: walletAddr }], selectedWalletIndex: 0, confirmedPools: cfg.confirmedPools || {} };
     t.markets = markets;
     t.config = { ...DEFAULT_AUTO_CONFIG };
@@ -417,7 +443,8 @@ for (const t of tokenList) allowanceBefore.push(await allowanceOf(t.address));
   }
   let liveStatus = "n/a", liveMgr = null;
   if (stored && stored.positionId != null && mgr) {
-    const found = await mkTrader(provider)._locateStoredPosition();
+    const tLive = mkTrader(provider);
+    const found = await tLive._locateStoredPosition(tLive.state.activePositions[0]);
     liveStatus = found.status; liveMgr = found.managerAddr || null;
   }
   const liveOk = !!stored && stored.positionId != null && liveStatus === "active" &&
@@ -429,7 +456,8 @@ for (const t of tokenList) allowanceBefore.push(await allowanceOf(t.address));
     const dead = new ethers.JsonRpcProvider(cfg.rpcUrl || "https://ethereum-sepolia-rpc.publicnode.com", cfg.chainId || 11155111, { staticNetwork: true });
     const refuse = () => Promise.reject(new Error("simulated RPC outage (read-only harness)"));
     dead.send = refuse; dead._perform = refuse; dead.call = refuse;
-    deadStatus = (await mkTrader(dead)._locateStoredPosition()).status;
+    const tDead = mkTrader(dead);
+    deadStatus = (await tDead._locateStoredPosition(tDead.state.activePositions[0])).status;
   }
   const deadOk = deadStatus === "n/a" || deadStatus === "unreadable";
 
@@ -465,8 +493,9 @@ for (const t of tokenList) allowanceBefore.push(await allowanceOf(t.address));
     if (r && r.active) { mgr61 = m; break; }
   }
   if (!mgr61) mgr61 = mgrsAll[0] || null;
-  const storedMgr = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"))?.activePosition?.managerAddr || null;
-  const classifiedCode = (r) => r && (r.ok === true ? typeof r.closeBps === "bigint" : ["CLOSE_AMOUNT_TOO_SMALL", "CLOSE_BPS_NOT_FOUND", "PROBE_LIMIT"].includes(r.code));
+  const diskState = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+  const storedMgr = ((diskState.activePositions?.[0]) ?? diskState.activePosition)?.managerAddr || null;
+  const classifiedCode = (r) => r && (r.ok === true ? typeof r.closeBps === "bigint" : ["CLOSE_AMOUNT_TOO_SMALL", "CLOSE_BPS_NOT_FOUND", "CLOSE_NO_FEASIBLE_WINDOW", "PROBE_LIMIT"].includes(r.code));
   const bounded = (r) => r && Number(r.probes) > 0 && Number(r.probes) <= 48;
 
   let open1 = null, open2 = null, threw = null;

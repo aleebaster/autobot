@@ -3,6 +3,7 @@
 //
 //   node test_close_partial.mjs
 
+import "./_test_state_isolation.mjs"; // state redirect + default-deny live-TX guard
 import fs from "fs";
 import crypto from "crypto";
 import { ethers } from "ethers";
@@ -98,7 +99,7 @@ async function main() {
   // exists the search must find it, and when the pool quotes none (too-small
   // directly into illiquid, no integer bps in between) it must say so instead
   // of inventing a closeBps. Both outcomes are valid; a silent guess is not.
-  const noWindow61 = ["CLOSE_AMOUNT_TOO_SMALL", "CLOSE_BPS_NOT_FOUND"].includes(found61.code);
+  const noWindow61 = ["CLOSE_AMOUNT_TOO_SMALL", "CLOSE_BPS_NOT_FOUND", "CLOSE_NO_FEASIBLE_WINDOW"].includes(found61.code);
   check("#61 finds a viable closeBps (or reports NONE honestly)",
     found61.ok === true || noWindow61,
     found61.ok ? `closeBps=${found61.closeBps} probes=${found61.probes}` : `code=${found61.code} probes=${found61.probes}`);

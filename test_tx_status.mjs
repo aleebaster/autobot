@@ -13,6 +13,7 @@
 //  Never touches the real auto-trader-state.json (NEMESIS_STATE_FILE scratch).
 // ═══════════════════════════════════════════════════════════════════════════
 
+import "./_test_state_isolation.mjs"; // state redirect + default-deny live-TX guard
 import fs from "fs";
 import path from "path";
 import os from "os";
@@ -242,32 +243,45 @@ function fakeAuto(state, provider) {
     state,
     logs: [],
     flagged: 0,
+    _opensThisRun: 0,
+    // Hold window NOT under test here (covered by test_hold_window) — disabled,
+    // but the real helpers must still be reachable from this plain fixture.
+    config: { minHoldSeconds: 0, maxHoldSeconds: 0 },
     _isDry: () => false,
     getRuntime: () => ({ provider, wallet: { address: WALLET } }),
     log(m) { this.logs.push(String(m)); },
-    _clearActivePosition(reason, countClose = true) {
-      this.state.activePosition = null;
+    _positions() {
+      if (!Array.isArray(this.state.activePositions)) this.state.activePositions = [];
+      return this.state.activePositions;
+    },
+    _clearPosition(rec, reason, countClose = true) {
+      const arr = this._positions();
+      const i = arr.indexOf(rec);
+      if (i >= 0) arr.splice(i, 1);
       if (countClose) this.state.sessionStats.closes++;
       return true;
     },
     _recordDirectionSuccess() { this.flagged++; },
     _rotMarketDone() { this.flagged++; },
   };
-  f._settlePendingOpen = () => AutoTrader.prototype._settlePendingOpen.call(f);
+  f._settlePendingOpen = (pos) => AutoTrader.prototype._settlePendingOpen.call(f, pos);
+  f._holdWindowMs = () => AutoTrader.prototype._holdWindowMs.call(f);
+  f._isPlausibleOpenedAt = (ts, now) => AutoTrader.prototype._isPlausibleOpenedAt.call(f, ts, now);
+  f._ensureHoldScheduled = (pos) => AutoTrader.prototype._ensureHoldScheduled.call(f, pos);
   return f;
 }
 const pendingState = () => ({
-  activePosition: {
+  activePositions: [{
     positionId: null, side: "SHORT", marketSymbol: "ETH/USDT", managerAddr: MANAGER,
     txHash: "0xfeed", pendingOpen: true, openedAt: 1,
-  },
+  }],
   sessionStats: { opens: 3, closes: 1 },
 });
 
 {
   // 6.1 no pending record → no-op
-  const f = fakeAuto({ activePosition: null, sessionStats: { opens: 0, closes: 0 } }, {});
-  const r = await AutoTrader.prototype._settlePendingOpen.call(f);
+  const f = fakeAuto({ activePositions: [], sessionStats: { opens: 0, closes: 0 } }, {});
+  const r = await AutoTrader.prototype._settlePendingOpen.call(f, undefined);
   check("6.1 nothing pending → none/done", r.status === "none" && r.done === true);
 
   // 6.2 still unmined → stays pending, opens untouched
@@ -275,18 +289,18 @@ const pendingState = () => ({
     getTransactionReceipt: async () => null,
     getTransaction: async () => ({ blockNumber: null }),
   });
-  const r2 = await AutoTrader.prototype._settlePendingOpen.call(f2);
+  const r2 = await AutoTrader.prototype._settlePendingOpen.call(f2, f2.state.activePositions[0]);
   check("6.2 unmined → PENDING, not done, opens unchanged",
     r2.status === TX_STATE.PENDING && r2.done === false && f2.state.sessionStats.opens === 3,
     `opens=${f2.state.sessionStats.opens}`);
-  check("6.3 record still flagged pendingOpen", f2.state.activePosition.pendingOpen === true);
+  check("6.3 record still flagged pendingOpen", f2.state.activePositions[0].pendingOpen === true);
 
   // 6.3 mined but receiptless → UNKNOWN, opens untouched, still not done
   const f3 = fakeAuto(pendingState(), {
     getTransactionReceipt: async () => null,
     getTransaction: async () => ({ blockNumber: 11911390 }),
   });
-  const r3 = await AutoTrader.prototype._settlePendingOpen.call(f3);
+  const r3 = await AutoTrader.prototype._settlePendingOpen.call(f3, f3.state.activePositions[0]);
   check("6.4 mined, no receipt → UNKNOWN, opens unchanged",
     r3.status === TX_STATE.UNKNOWN && r3.done === false && f3.state.sessionStats.opens === 3
     && f3.logs.some(m => m.includes("UNKNOWN")));
@@ -296,35 +310,37 @@ const pendingState = () => ({
     getTransactionReceipt: async () => null,
     getTransaction: async () => null,
   });
-  const r4 = await AutoTrader.prototype._settlePendingOpen.call(f4);
+  const r4 = await AutoTrader.prototype._settlePendingOpen.call(f4, f4.state.activePositions[0]);
   check("6.5 dropped → DROPPED_OR_REPLACED, cleared, opens unchanged",
     r4.status === TX_STATE.DROPPED_OR_REPLACED && r4.done === true
-    && f4.state.activePosition === null && f4.state.sessionStats.opens === 3);
+    && !(f4.state.activePositions?.length) && f4.state.sessionStats.opens === 3);
 
   // 6.5 reverted → cleared, opens untouched, closes NOT counted (countClose=false)
   const f5 = fakeAuto(pendingState(), {
     getTransactionReceipt: async () => ({ status: 0, blockNumber: 11911391, logs: [] }),
     getTransaction: async () => ({ blockNumber: 11911391 }),
   });
-  const r5 = await AutoTrader.prototype._settlePendingOpen.call(f5);
+  const r5 = await AutoTrader.prototype._settlePendingOpen.call(f5, f5.state.activePositions[0]);
   check("6.6 reverted → cleared without counting a close",
-    r5.status === TX_STATE.REVERTED && f5.state.activePosition === null
+    r5.status === TX_STATE.REVERTED && !(f5.state.activePositions?.length)
     && f5.state.sessionStats.opens === 3 && f5.state.sessionStats.closes === 1);
 
   // 6.6 confirmed WITH PositionCreated → the ONLY place opens is incremented
   const f6 = fakeAuto(pendingState(), {
     getTransactionReceipt: async () => ({
       status: 1, blockNumber: 11911392,
-      logs: [{ address: MANAGER, topics: [POSITION_CREATED_TOPIC, topicId(9), topicId(77)] }],
+      // MAM_MarginFeeAssessed has THREE indexed args (manager, positionId,
+      // action) — a real receipt always carries topics[3]; action 0 = OPEN.
+      logs: [{ address: MANAGER, topics: [POSITION_CREATED_TOPIC, topicId(9), topicId(77), topicId(0)] }],
     }),
     getTransaction: async () => ({ blockNumber: 11911392 }),
   });
-  const r6 = await AutoTrader.prototype._settlePendingOpen.call(f6);
+  const r6 = await AutoTrader.prototype._settlePendingOpen.call(f6, f6.state.activePositions[0]);
   check("6.7 confirmed → exactly one open counted", r6.status === TX_STATE.CONFIRMED && f6.state.sessionStats.opens === 4,
     `opens=${f6.state.sessionStats.opens}`);
-  check("6.8 positionId resolved from the event", f6.state.activePosition.positionId === 77);
+  check("6.8 positionId resolved from the event", f6.state.activePositions[0].positionId === 77);
   check("6.9 pendingOpen cleared, direction success recorded",
-    f6.state.activePosition.pendingOpen === false && f6.flagged === 2, `flagged=${f6.flagged}`);
+    f6.state.activePositions[0].pendingOpen === false && f6.flagged === 2, `flagged=${f6.flagged}`);
   check("6.10 log reports CONFIRMED with the position id",
     f6.logs.some(m => m.includes("CONFIRMED") && m.includes("#77")));
 
@@ -333,17 +349,17 @@ const pendingState = () => ({
     getTransactionReceipt: async () => ({ status: 1, blockNumber: 11911393, logs: [] }),
     getTransaction: async () => ({ blockNumber: 11911393 }),
   });
-  const r7 = await AutoTrader.prototype._settlePendingOpen.call(f7);
+  const r7 = await AutoTrader.prototype._settlePendingOpen.call(f7, f7.state.activePositions[0]);
   check("6.11 receipt OK but no event → CONFIRMED_STATE_MISMATCH",
     r7.status === TX_STATE.CONFIRMED_STATE_MISMATCH && f7.state.sessionStats.opens === 3,
     `status=${r7.status}`);
-  check("6.12 mismatch recorded on the record", f7.state.activePosition.mismatch === true);
+  check("6.12 mismatch recorded on the record", f7.state.activePositions[0].mismatch === true);
   check("6.13 mismatch is a settled state", isSettledState(TX_STATE.CONFIRMED_STATE_MISMATCH));
 
   // 6.8 dry run never mutates
   const f8 = fakeAuto(pendingState(), {});
   f8._isDry = () => true;
-  const r8 = await AutoTrader.prototype._settlePendingOpen.call(f8);
+  const r8 = await AutoTrader.prototype._settlePendingOpen.call(f8, f8.state.activePositions[0]);
   check("6.14 dry-run leaves everything alone", r8.status === "none" && f8.state.sessionStats.opens === 3);
 }
 
@@ -356,9 +372,9 @@ section("7. a pending open is never dropped as a failed-open leftover");
     getTransaction: async () => ({ blockNumber: null }),
   });
   f.lastCloseTxHash = null;
-  const r = await AutoTrader.prototype.closeActivePosition.call(f);
+  const r = await AutoTrader.prototype.closeActivePosition.call(f, f.state.activePositions[0]);
   check("7.1 close deferred while the open is unconfirmed",
-    r.ok === false && r.code === "OPEN_PENDING" && f.state.activePosition !== null,
+    r.ok === false && r.code === "OPEN_PENDING" && !!(f.state.activePositions?.length),
     `code=${r.code}`);
   check("7.2 no close was counted", f.state.sessionStats.closes === 1);
 }
@@ -374,16 +390,16 @@ section("8. static guards — success text and counters");
   check("8.2 swap verify failure uses a MISMATCH label", src.includes("[SWAP ${ok ? \"CONFIRMED\" : \"MISMATCH\"}]"));
 
   const opens = (src.match(/sessionStats\.opens\+\+/g) || []).length;
-  check("8.3 exactly 4 opens++ sites (2 confirmed branches, recovery, settle)", opens === 4, `found ${opens}`);
+  check("8.3 opens++ centralized to 2 sites (_trackOpenedPosition + settle)", opens === 2, `found ${opens}`);
   check("8.4b one of them lives in _settlePendingOpen",
-    /async _settlePendingOpen\(\) \{[\s\S]{0,9000}?sessionStats\.opens\+\+/.test(src));
+    /async _settlePendingOpen\([^)]*\) \{[\s\S]{0,9000}?sessionStats\.opens\+\+/.test(src));
 
   const pendingBranches = src.split("openResult?.pending").slice(1);
   check("8.4 pending-open branches never increment opens",
     pendingBranches.length === 2 && pendingBranches.every(b => b.split("else if")[0].indexOf("sessionStats.opens++") === -1),
     `branches=${pendingBranches.length}`);
-  check("8.5 pending-open branches set pendingOpen",
-    pendingBranches.every(b => b.split("else if")[0].includes("pendingOpen: true")));
+  check("8.5 pending-open branches create a pendingOpen record via _trackOpenedPosition",
+    pendingBranches.length === 2 && pendingBranches.every(b => b.split("else if")[0].includes("pending: true")));
 
   check("8.6 TUI shows PENDING instead of success for an unconfirmed open",
     idx.includes("[OPEN]") && idx.includes('"PENDING"') && idx.includes("not counted"));

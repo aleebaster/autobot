@@ -33,7 +33,7 @@ ethers.JsonRpcProvider.prototype.send = function (method, params) {
 
 // ── HARD STATE-FILE BLOCK ────────────────────────────────────────────────────
 // This suite exercises LIVE-mode code paths (_noteCloseFailure,
-// _clearActivePosition), which call the module-level saveState() and would
+// _clearPosition), which call the module-level saveState() and would
 // otherwise rewrite the repo's real auto-trader-state.json. Block it outright:
 // any attempt to write the state file throws instead of silently corrupting
 // position #75's record. This is the test's equivalent of markStateReadOnly.
@@ -86,25 +86,27 @@ function makeTrader({ dryRun = false, activePosition = null, closeRetry = null }
     dryRun, slippageBps: 50, deadlineSeconds: 1200,
     maxPartialCloseAttempts: 3, closeRetryBaseMs: 20000, closeRetryMaxMs: 600000,
   };
+  const rec = activePosition ? { ...activePosition } : null;
+  if (rec && closeRetry) rec.closeRetry = closeRetry;
   trader.state = {
-    activePosition,
-    closeRetry,
-    closeAttempts: 0,
+    activePositions: rec ? [rec] : [],
     sessionStats: { closes: 0, opens: 0, swaps: 0 },
   };
   trader.log = (m, lvl) => logs.push({ m, lvl });
   trader._isDry = () => trader.config.dryRun === true;
   trader.setState = () => {};
   trader.txManager = { send: async () => { throw new Error("TX_BLOCKED"); } };
-  // Intercept persistence: record the write, never touch disk.
+  // saveState is module-level; it writes to the (blocked) state file. Block it
+  // so these offline tests never attempt a disk write.
   trader._save = (s) => writes.push(JSON.parse(JSON.stringify(s)));
   trader._writes = writes;
   trader._logs = logs;
+  trader._pos = () => trader.state.activePositions?.[0] ?? null;
   return trader;
 }
 
 // Re-implement persistence interception by patching the module-level saveState
-// via the public methods that call it. `_noteCloseFailure` / `_clearActivePosition`
+// via the public methods that call it. `_noteCloseFailure` / `_clearPosition`
 // call the module `saveState`, so we verify by reading trader.state afterwards.
 
 const POS75 = {
@@ -150,41 +152,43 @@ console.log("\n═══ 2. CLOSE SIGNATURE — identical attempts are backed of
 
 console.log("\n═══ 3. BACKOFF ACCUMULATION AND SIGNATURE RESET ═══");
 {
-  // NOTE: dry-run deliberately NEVER writes closeRetry (it only reports the
-  // delay it would schedule), so accumulation is verified on a LIVE-mode
-  // trader with persistence intercepted.
+  // NOTE: dry-run deliberately NEVER writes the per-record closeRetry (it only
+  // reports the delay it would schedule), so accumulation is verified on a
+  // LIVE-mode trader with the module saveState writing to the scratch file.
   const t = makeTrader({ dryRun: false, activePosition: POS75 });
+  const pos = t._pos();
   const sig = t._closeSig({ active: true, collateralAmount: 12007481n, currentDebt: 1n });
-  t.state.closeRetry = null;
+  pos.closeRetry = null;
 
-  const d1 = t._noteCloseFailure(sig, "CLOSE_BPS_NOT_FOUND");
-  const d2 = t._noteCloseFailure(sig, "CLOSE_BPS_NOT_FOUND");
-  const d3 = t._noteCloseFailure(sig, "CLOSE_BPS_NOT_FOUND");
+  const d1 = t._noteCloseFailure(pos, sig, "CLOSE_BPS_NOT_FOUND");
+  const d2 = t._noteCloseFailure(pos, sig, "CLOSE_BPS_NOT_FOUND");
+  const d3 = t._noteCloseFailure(pos, sig, "CLOSE_BPS_NOT_FOUND");
   check("same signature escalates 20s → 40s → 80s", d1 === 20000 && d2 === 40000 && d3 === 80000, `${d1},${d2},${d3}`);
-  check("attempts counter tracks 1,2,3", t.state.closeRetry.attempts === 3, `attempts=${t.state.closeRetry?.attempts}`);
-  check("closeRetry.code carries the last failure code", t.state.closeRetry.code === "CLOSE_BPS_NOT_FOUND");
-  check("closeAttempts lifetime counter incremented", t.state.closeAttempts === 3);
-  check("backoff is scheduled in the future", t.state.closeRetry.nextAt > Date.now());
+  check("attempts counter tracks 1,2,3", pos.closeRetry.attempts === 3, `attempts=${pos.closeRetry?.attempts}`);
+  check("closeRetry.code carries the last failure code", pos.closeRetry.code === "CLOSE_BPS_NOT_FOUND");
+  check("closeAttempts lifetime counter incremented", pos.closeAttempts === 3);
+  check("backoff is scheduled in the future", pos.closeRetry.nextAt > Date.now());
 
   // A DIFFERENT signature (state actually moved) must reset to attempt 1.
   const movedSig = t._closeSig({ active: true, collateralAmount: 5000000n, currentDebt: 1n });
-  const d4 = t._noteCloseFailure(movedSig, "CLOSE_BPS_NOT_FOUND");
+  const d4 = t._noteCloseFailure(pos, movedSig, "CLOSE_BPS_NOT_FOUND");
   check("state moved → backoff RESETS to 20s", d4 === 20000, `d4=${d4}`);
-  check("attempts reset to 1", t.state.closeRetry.attempts === 1);
+  check("attempts reset to 1", pos.closeRetry.attempts === 1);
 
-  t._resetCloseRetry();
-  check("_resetCloseRetry clears both fields", t.state.closeRetry === null && t.state.closeAttempts === 0);
+  t._resetCloseRetry(pos);
+  check("_resetCloseRetry clears both fields", pos.closeRetry === null && pos.closeAttempts === 0);
 }
 
 console.log("\n═══ 3b. DRY-RUN BACKOFF IS REPORTED, NEVER WRITTEN ═══");
 {
   const t = makeTrader({ dryRun: true, activePosition: POS75 });
+  const pos = t._pos();
   const sig = t._closeSig({ active: true, collateralAmount: 12007481n, currentDebt: 1n });
-  const d = t._noteCloseFailure(sig, "CLOSE_BPS_NOT_FOUND");
+  const d = t._noteCloseFailure(pos, sig, "CLOSE_BPS_NOT_FOUND");
   check("dry run still REPORTS the delay it would schedule", d === 20000, `d=${d}`);
-  check("dry run does NOT write closeRetry", t.state.closeRetry === null);
-  check("dry run does NOT bump closeAttempts", t.state.closeAttempts === 0);
-  const d2 = t._noteCloseFailure(sig, "CLOSE_BPS_NOT_FOUND");
+  check("dry run does NOT write closeRetry", pos.closeRetry == null);
+  check("dry run does NOT bump closeAttempts", !pos.closeAttempts);
+  const d2 = t._noteCloseFailure(pos, sig, "CLOSE_BPS_NOT_FOUND");
   check("dry run delay does not escalate (nothing persisted)", d2 === 20000, `d2=${d2}`);
 }
 
@@ -193,22 +197,24 @@ console.log("\n═══ 4. STALE LOCAL STATE IS RECONCILED WITH ON-CHAIN (never
   // #75 exactly: local 1721515506 vs chain 12007481.
   const t = makeTrader({ activePosition: JSON.parse(JSON.stringify(POS75)) });
   check("precondition: local collateral is STALE (143× on-chain)",
-    t.state.activePosition.collateralAmount === "1721515506");
+    t.state.activePositions[0].collateralAmount === "1721515506");
 
   const r = t._syncActivePositionFromChain(
+    t._pos(),
     { collateralAmount: 12007481n, currentDebt: 1001520786214896827n, isLong: false, active: true },
     { managerAddr: POS75.managerAddr },
   );
   check("sync reports a change", r.synced === true);
   check("local collateral now equals ON-CHAIN 12007481",
-    t.state.activePosition.collateralAmount === "12007481",
-    `got ${t.state.activePosition.collateralAmount}`);
+    t.state.activePositions[0].collateralAmount === "12007481",
+    `got ${t.state.activePositions[0].collateralAmount}`);
   check("local debt now equals on-chain currentDebt",
-    t.state.activePosition.debtAmount === "1001520786214896827");
-  check("SHORT preserved from isLong=false", t.state.activePosition.side === "SHORT");
-  check("position #75 is NOT cleared by a sync", t.state.activePosition !== null && t.state.activePosition.positionId === 75);
+    t.state.activePositions[0].debtAmount === "1001520786214896827");
+  check("SHORT preserved from isLong=false", t.state.activePositions[0].side === "SHORT");
+  check("position #75 is NOT cleared by a sync", !!(t.state.activePositions?.length) && t.state.activePositions[0].positionId === 75);
 
   const again = t._syncActivePositionFromChain(
+    t._pos(),
     { collateralAmount: 12007481n, currentDebt: 1001520786214896827n, isLong: false, active: true }, {});
   check("idempotent: a second identical sync is a no-op", again.synced === false);
 }
@@ -216,127 +222,133 @@ console.log("\n═══ 4. STALE LOCAL STATE IS RECONCILED WITH ON-CHAIN (never
 console.log("\n═══ 5. DRY-RUN SYNC NEVER WRITES ═══");
 {
   const t = makeTrader({ dryRun: true, activePosition: JSON.parse(JSON.stringify(POS75)) });
-  const r = t._syncActivePositionFromChain({ collateralAmount: 12007481n, currentDebt: 1n, isLong: false });
+  const r = t._syncActivePositionFromChain(
+    t._pos(), { collateralAmount: 12007481n, currentDebt: 1n, isLong: false });
   check("dry sync reports no write", r.synced === false);
   check("dry sync leaves the stale local value untouched",
-    t.state.activePosition.collateralAmount === "1721515506");
+    t.state.activePositions[0].collateralAmount === "1721515506");
   check("dry sync still REPORTS what it would change", r.changed.length > 0);
 }
 
-console.log("\n═══ 6. _clearActivePosition IS DRY-RUN SAFE ═══");
+console.log("\n═══ 6. _clearPosition IS DRY-RUN SAFE ═══");
 {
   const t = makeTrader({ dryRun: true, activePosition: JSON.parse(JSON.stringify(POS75)) });
-  const c = t._clearActivePosition("test");
+  const c = t._clearPosition(t._pos(), "test");
   check("dry clear returns false (refuses)", c === false);
-  check("dry clear KEEPS the position", t.state.activePosition !== null);
+  check("dry clear KEEPS the position", !!(t.state.activePositions?.length));
   check("dry clear does not bump sessionStats.closes", t.state.sessionStats.closes === 0);
 
   const live = makeTrader({ dryRun: false, activePosition: JSON.parse(JSON.stringify(POS75)) });
-  // Guard saveState from touching disk in this offline test.
-  const c2 = live._clearActivePosition("verified on-chain close");
-  check("live clear of a VERIFIED close removes the record", c2 === true && live.state.activePosition === null);
+  // Guard saveState from touching the real repo file (scratch file is fine).
+  const c2 = live._clearPosition(live._pos(), "verified on-chain close");
+  check("live clear of a VERIFIED close removes the record", c2 === true && !(live.state.activePositions?.length));
   check("live clear increments sessionStats.closes", live.state.sessionStats.closes === 1);
-  check("live clear resets close retry bookkeeping", live.state.closeRetry === null && live.state.closeAttempts === 0);
+  check("live clear resets close retry bookkeeping", live._pos() == null);
 }
 
 console.log("\n═══ 7. _applyCloseResult DECISION TABLE ═══");
 {
   // (a) null result → blocked, kept, backoff, code CLOSE_NO_RESULT
   const t1 = makeTrader({ activePosition: POS75 });
-  const r1 = t1._applyCloseResult(null, "SIG1");
+  const p1 = t1._pos();
+  const r1 = t1._applyCloseResult(p1, null, "SIG1");
   check("null close result → blocked + keep + CLOSE_NO_RESULT",
     r1.ok === false && r1.blocked === true && r1.continueCycle === true && r1.code === "CLOSE_NO_RESULT");
-  check("null result does NOT clear the position", t1.state.activePosition !== null);
+  check("null result does NOT clear the position", !!(t1.state.activePositions?.length));
 
   // (b) dryRun → ok:true but record KEPT, no backoff written
   const t2 = makeTrader({ activePosition: POS75 });
-  const r2 = t2._applyCloseResult({ dryRun: true }, "SIG2");
+  const p2 = t2._pos();
+  const r2 = t2._applyCloseResult(p2, { dryRun: true }, "SIG2");
   check("dry close → ok:true, record KEPT (never cleared)",
-    r2.ok === true && r2.dryRun === true && t2.state.activePosition !== null);
-  check("dry close writes no backoff", t2.state.closeRetry === null);
+    r2.ok === true && r2.dryRun === true && !!(t2.state.activePositions?.length));
+  check("dry close writes no backoff", p2.closeRetry == null);
 
   // (c) pending → not blocked, kept, backoff TX_PENDING
   const t3 = makeTrader({ activePosition: POS75 });
-  const r3 = t3._applyCloseResult({ pending: true, txHash: "0xabc" }, "SIG3");
+  const p3 = t3._pos();
+  const r3 = t3._applyCloseResult(p3, { pending: true, txHash: "0xabc" }, "SIG3");
   check("pending TX → kept, code TX_PENDING, continueCycle",
-    r3.ok === false && r3.code === "TX_PENDING" && t3.state.activePosition !== null && r3.continueCycle === true);
+    r3.ok === false && r3.code === "TX_PENDING" && !!(t3.state.activePositions?.length) && r3.continueCycle === true);
 
   // (d) failed + clearState:false (the WAIT path) → kept + backoff + code
   const t4 = makeTrader({ activePosition: POS75 });
-  const r4 = t4._applyCloseResult(
+  const p4 = t4._pos();
+  const r4 = t4._applyCloseResult(p4,
     { failed: true, clearState: false, code: "CLOSE_BPS_NOT_FOUND", wait: true,
       reason: "no bps in 1..9999 passes previewClosePosition" }, "SIG4");
   check("CLOSE_BPS_NOT_FOUND → blocked, KEPT, code preserved, continueCycle",
     r4.ok === false && r4.blocked === true && r4.code === "CLOSE_BPS_NOT_FOUND"
-    && r4.continueCycle === true && t4.state.activePosition !== null);
-  check("WAIT schedules a backoff", t4.state.closeRetry !== null && t4.state.closeRetry.code === "CLOSE_BPS_NOT_FOUND");
+    && r4.continueCycle === true && !!(t4.state.activePositions?.length));
+  check("WAIT schedules a backoff", p4.closeRetry != null && p4.closeRetry.code === "CLOSE_BPS_NOT_FOUND");
   check("WAIT does not count a close", t4.state.sessionStats.closes === 0);
 
   // (e) failed + clearState true (zombie) → CLEARED
   const t5 = makeTrader({ activePosition: POS75 });
-  const r5 = t5._applyCloseResult({ failed: true, clearState: true, reason: "MAM_InvalidPosition" }, "SIG5");
+  const r5 = t5._applyCloseResult(t5._pos(), { failed: true, clearState: true, reason: "MAM_InvalidPosition" }, "SIG5");
   check("zombie (clearState:true) → cleared + counted + ok",
-    r5.ok === true && t5.state.activePosition === null && t5.state.sessionStats.closes === 1);
+    r5.ok === true && !(t5.state.activePositions?.length) && t5.state.sessionStats.closes === 1);
 
   // (f) closed:false → kept
   const t6 = makeTrader({ activePosition: POS75 });
-  const r6 = t6._applyCloseResult({ closed: false, code: "STILL_ACTIVE" }, "SIG6");
-  check("closed:false → blocked + kept", r6.ok === false && t6.state.activePosition !== null);
+  const r6 = t6._applyCloseResult(t6._pos(), { closed: false, code: "STILL_ACTIVE" }, "SIG6");
+  check("closed:false → blocked + kept", r6.ok === false && !!(t6.state.activePositions?.length));
 
   // (g) verified close → cleared + counted
   const t7 = makeTrader({ activePosition: POS75 });
-  const r7 = t7._applyCloseResult({ ok: true, closed: true, txHash: "0xdef" }, "SIG7");
-  check("verified on-chain close → cleared + counted", r7.ok === true && t7.state.activePosition === null && t7.state.sessionStats.closes === 1);
-  check("verified close resets the backoff", t7.state.closeRetry === null && t7.state.closeAttempts === 0);
+  const p7 = t7._pos();
+  const r7 = t7._applyCloseResult(p7, { ok: true, closed: true, txHash: "0xdef" }, "SIG7");
+  check("verified on-chain close → cleared + counted", r7.ok === true && !(t7.state.activePositions?.length) && t7.state.sessionStats.closes === 1);
+  check("verified close resets the backoff", p7.closeRetry == null && !p7.closeAttempts);
 }
 
 console.log("\n═══ 8. EVERY KNOWN CONTRACT ERROR → RIGHT OUTCOME ═══");
 {
   // Zombie → clear.
   const tZ = makeTrader({ activePosition: POS75 });
-  const rZ = tZ._applyCloseResult({ failed: true, clearState: true, reason: "MAM_InvalidPosition" }, "S");
-  check("MAM_InvalidPosition → CLEAR (position is gone)", rZ.ok === true && tZ.state.activePosition === null);
+  const rZ = tZ._applyCloseResult(tZ._pos(), { failed: true, clearState: true, reason: "MAM_InvalidPosition" }, "S");
+  check("MAM_InvalidPosition → CLEAR (position is gone)", rZ.ok === true && !(tZ.state.activePositions?.length));
 
   // Liquidity-blocked → partialClose fallback offered, position KEPT.
   const tL = makeTrader({ activePosition: POS75 });
-  const rL = tL._applyCloseResult(
+  const rL = tL._applyCloseResult(tL._pos(),
     { failed: true, clearState: false, code: "MAM_InsufficientLiquidity" }, "S");
   check("MAM_InsufficientLiquidity → KEEP (partialClose fallback exists)",
-    rL.ok === false && rL.blocked === true && tL.state.activePosition !== null);
+    rL.ok === false && rL.blocked === true && !!(tL.state.activePositions?.length));
 
   // Amount too small → KEEP (dust, not gone).
   const tS = makeTrader({ activePosition: POS75 });
-  const rS = tS._applyCloseResult({ failed: true, clearState: false, code: "CLOSE_AMOUNT_TOO_SMALL" }, "S");
+  const rS = tS._applyCloseResult(tS._pos(), { failed: true, clearState: false, code: "CLOSE_AMOUNT_TOO_SMALL" }, "S");
   check("MAM_CloseAmountTooSmall → KEEP (dust is still an open position)",
-    rS.ok === false && tS.state.activePosition !== null);
+    rS.ok === false && !!(tS.state.activePositions?.length));
 
   // Zero quote on the partial path → KEEP.
   const tQ = makeTrader({ activePosition: POS75 });
-  const rQ = tQ._applyCloseResult({ failed: true, clearState: false, code: "ZERO_AMOUNT_OUT_MIN" }, "S");
-  check("ZERO_AMOUNT_OUT_MIN → KEEP", rQ.ok === false && tQ.state.activePosition !== null);
+  const rQ = tQ._applyCloseResult(tQ._pos(), { failed: true, clearState: false, code: "ZERO_AMOUNT_OUT_MIN" }, "S");
+  check("ZERO_AMOUNT_OUT_MIN → KEEP", rQ.ok === false && !!(tQ.state.activePositions?.length));
 
   // Bad partial selector → KEEP (refuse to send).
   const tB = makeTrader({ activePosition: POS75 });
-  const rB = tB._applyCloseResult({ failed: true, clearState: false, code: "BAD_PARTIAL_SELECTOR" }, "S");
+  const rB = tB._applyCloseResult(tB._pos(), { failed: true, clearState: false, code: "BAD_PARTIAL_SELECTOR" }, "S");
   check("BAD_PARTIAL_SELECTOR → KEEP (never send a bad selector)",
-    rB.ok === false && tB.state.activePosition !== null);
+    rB.ok === false && !!(tB.state.activePositions?.length));
 
   // Every non-clearing outcome must share one property: the position SURVIVES.
   const survivors = [rL, rS, rQ, rB].every(r => r.ok === false);
   check("all non-clearing outcomes keep the position tracked", survivors);
   check("no outcome in this block closed a position",
-    [tZ, tL, tS, tQ, tB].filter(t => t.state.activePosition === null).length === 1); // only the zombie
+    [tZ, tL, tS, tQ, tB].filter(t => !(t.state.activePositions?.length)).length === 1); // only the zombie
 }
 
 console.log("\n═══ 9. BLOCKED CLOSE SUPPRESSES OPEN BUT NEVER ENDS THE CYCLE ═══");
 {
   const t = makeTrader({ activePosition: POS75 });
-  const r = t._applyCloseResult({ failed: true, clearState: false, code: "CLOSE_BPS_NOT_FOUND", wait: true }, "S");
+  const r = t._applyCloseResult(t._pos(), { failed: true, clearState: false, code: "CLOSE_BPS_NOT_FOUND", wait: true }, "S");
   check("continueCycle is ALWAYS true (a failed close must not stop the bot)",
     r.continueCycle === true);
   check("ok:false → PHASE 2 OPEN is suppressed this cycle",
     r.ok === false && !(r.ok === true && !r.dryRun));
-  check("position remains active for the next cycle's re-probe", t.state.activePosition !== null);
+  check("position remains active for the next cycle's re-probe", !!(t.state.activePositions?.length));
 }
 
 console.log("\n═══ 10. RESTART RECOVERY — chain truth beats local truth ═══");
@@ -352,46 +364,55 @@ console.log("\n═══ 10. RESTART RECOVERY — chain truth beats local truth 
     positionIsClosed(null) === false);
   check("positionIsClosed(undefined) is FALSE too", positionIsClosed(undefined) === false);
 
-  t._syncActivePositionFromChain(chainView, {});
+  t._syncActivePositionFromChain(t._pos(), chainView, {});
   check("after recovery the local record matches the chain",
-    t.state.activePosition.collateralAmount === "12007481");
-  check("recovery NEVER cleared the position", t.state.activePosition !== null);
+    t.state.activePositions[0].collateralAmount === "12007481");
+  check("recovery NEVER cleared the position", !!(t.state.activePositions?.length));
 }
 
 console.log("\n═══ 11. STALE-STATE INVARIANT: sync is the ONLY path that reconciles ═══");
 {
   const t = makeTrader({ activePosition: JSON.parse(JSON.stringify(POS75)) });
-  const before = JSON.stringify(t.state.activePosition);
-  // A WAIT outcome must not silently rewrite collateral on its own.
-  t._applyCloseResult({ failed: true, clearState: false, code: "CLOSE_BPS_NOT_FOUND", wait: true }, "S");
+  const numericOf = (p) => JSON.stringify({
+    positionId: p?.positionId ?? null,
+    collateralAmount: p?.collateralAmount ?? null,
+    debtAmount: p?.debtAmount ?? null,
+    side: p?.side ?? null,
+  });
+  const before = numericOf(t.state.activePositions?.[0] ?? null);
+  // A WAIT outcome must not silently rewrite collateral on its own (only the
+  // per-record backoff fields are allowed to change).
+  t._applyCloseResult(t._pos(), { failed: true, clearState: false, code: "CLOSE_BPS_NOT_FOUND", wait: true }, "S");
   check("a WAIT leaves the numeric record untouched (only _syncActivePositionFromChain reconciles)",
-    JSON.stringify(t.state.activePosition) === before);
-  check("but the position is still tracked", t.state.activePosition !== null);
+    numericOf(t.state.activePositions?.[0] ?? null) === before);
+  check("but the position is still tracked", !!(t.state.activePositions?.length));
 }
 
 console.log("\n═══ 12. THE #75 CASE, END TO END ═══");
 {
   const t = makeTrader({ activePosition: JSON.parse(JSON.stringify(POS75)) });
   // 1. stale local
-  const stale = t.state.activePosition.collateralAmount === "1721515506";
+  const stale = t.state.activePositions[0].collateralAmount === "1721515506";
   // 2. sync with the real on-chain snapshot
   t._syncActivePositionFromChain(
+    t._pos(),
     { collateralAmount: 12007481n, currentDebt: 1001520786214896827n, isLong: false, active: true },
     { managerAddr: POS75.managerAddr });
   // 3. close is blocked by the degraded pool → controlled WAIT
   const r = t._applyCloseResult(
+    t._pos(),
     { failed: true, clearState: false, code: "CLOSE_BPS_NOT_FOUND", wait: true,
       reason: "no bps in 1..9999 passes previewClosePosition" }, "S");
   check("#75: local state was stale before sync", stale);
   check("#75: local state now matches chain (12007481)",
-    t.state.activePosition.collateralAmount === "12007481");
+    t.state.activePositions[0].collateralAmount === "12007481");
   check("#75: close blocked as a controlled WAIT, not an error-clear",
     r.blocked === true && r.code === "CLOSE_BPS_NOT_FOUND" && r.ok === false);
   check("#75: position STILL ACTIVE and TRACKED (never locally cleared)",
-    t.state.activePosition !== null && t.state.activePosition.positionId === 75);
+    !!(t.state.activePositions?.length) && t.state.activePositions[0].positionId === 75);
   check("#75: cycle continues (OPEN suppressed this cycle only)",
     r.continueCycle === true && r.ok === false);
-  check("#75: a retry is scheduled", t.state.closeRetry !== null);
+  check("#75: a retry is scheduled", t._pos().closeRetry != null);
 }
 
 console.log("\n═══════════════════════════════════════════════════════");

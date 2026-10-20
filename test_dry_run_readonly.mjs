@@ -14,6 +14,7 @@
 //  test is safe to execute at any time and can never corrupt real bot state.
 // ═══════════════════════════════════════════════════════════════════════════
 
+import "./_test_state_isolation.mjs"; // state redirect + default-deny live-TX guard
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
@@ -39,11 +40,9 @@ const sha256 = (buf) => crypto.createHash("sha256").update(buf).digest("hex");
 
 function logicalView(state) {
   return JSON.stringify({
-    activePosition: state.activePosition ?? null,
+    activePositions: state.activePositions ?? null,
     sessionStats: state.sessionStats ?? null,
     rotation: state.rotation ?? null,
-    closeRetry: state.closeRetry ?? null,
-    closeAttempts: state.closeAttempts ?? null,
     directionDisabled: state.directionDisabled ?? null,
     lastSide: state.lastSide ?? null,
     lastCycleTime: state.lastCycleTime ?? null,
@@ -80,8 +79,8 @@ function runDry(stateFile, logFile) {
 {
   const src = fs.readFileSync(path.join(ROOT, "autoTrader.js"), "utf8");
   const dryClose = src.slice(src.indexOf("if (closeResult.dryRun)"), src.indexOf("if (closeResult.pending)"));
-  check("01", "static: dry-CLOSE branch does not clear activePosition",
-    dryClose.length > 0 && !/activePosition\s*=\s*null/.test(dryClose));
+  check("01", "static: dry-CLOSE branch does not clear/track-drop a position",
+    dryClose.length > 0 && !/activePosition\s*=\s*null/.test(dryClose) && !/_clearPosition\(/.test(dryClose));
   check("02", "static: dry-CLOSE branch does not increment sessionStats.closes",
     dryClose.length > 0 && !/sessionStats\.closes\+\+/.test(dryClose));
   check("03", "static: dry-CLOSE branch does not reset closeRetry/backoff",
@@ -111,10 +110,19 @@ fs.mkdirSync(SCRATCH_DIR, { recursive: true });
 // deterministic: a close must not be sitting in backoff, and PHASE 1 must have
 // a record to plan a CLOSE for.
 const scratchSeed = JSON.parse(fs.readFileSync(PROD_STATE, "utf8"));
-scratchSeed.closeRetry = null;
-scratchSeed.closeAttempts = 0;
-if (!scratchSeed.activePosition) {
-  scratchSeed.activePosition = {
+// Migrate a legacy (pre-multi-position) production copy to the array shape so
+// the scratch file the dry bot loads is already canonical.
+if (!Array.isArray(scratchSeed.activePositions)) {
+  scratchSeed.activePositions = scratchSeed.activePosition ? [scratchSeed.activePosition] : [];
+}
+delete scratchSeed.activePosition;
+delete scratchSeed.closeRetry;
+delete scratchSeed.closeAttempts;
+for (const r of scratchSeed.activePositions) {
+  if (r) { r.closeRetry = null; r.closeAttempts = 0; }
+}
+if (!scratchSeed.activePositions.length) {
+  scratchSeed.activePositions = [{
     positionId: 75, side: "SHORT",
     collateralToken: "0xa3215a5cA659e0Bd57c0B33d5EAD71901A24d3d6",
     collateralAmount: "1721515506",
@@ -124,7 +132,7 @@ if (!scratchSeed.activePosition) {
     marketSymbol: "WETH/DAI",
     managerAddr: "0x6562c653a2f2982D8Dad9E420bF3ff5a568eFD82",
     poolAddr: "0x7Ae30ab11117CC324A3102D425208844Ade28001",
-  };
+  }];
 }
 fs.writeFileSync(SCRATCH_STATE, JSON.stringify(scratchSeed, null, 2));
 
@@ -158,9 +166,9 @@ check("10", "state file byte-for-byte identical after dry-run",
 const stateBefore = JSON.parse(beforeBuf.toString("utf8"));
 const stateAfter = JSON.parse(afterBuf.toString("utf8"));
 
-check("11", "activePosition byte-for-byte identical",
-  JSON.stringify(stateBefore.activePosition) === JSON.stringify(stateAfter.activePosition),
-  `positionId=${stateAfter.activePosition?.positionId ?? "null"}`);
+check("11", "activePositions byte-for-byte identical",
+  JSON.stringify(stateBefore.activePositions) === JSON.stringify(stateAfter.activePositions),
+  `ids=${JSON.stringify((stateAfter.activePositions || []).map(p => p?.positionId ?? null))}`);
 
 check("12", "sessionStats identical",
   JSON.stringify(stateBefore.sessionStats) === JSON.stringify(stateAfter.sessionStats),
@@ -169,9 +177,11 @@ check("12", "sessionStats identical",
 check("13", "rotation recency + counts identical",
   JSON.stringify(stateBefore.rotation) === JSON.stringify(stateAfter.rotation));
 
-check("14", "closeRetry + closeAttempts identical",
-  JSON.stringify(stateBefore.closeRetry) === JSON.stringify(stateAfter.closeRetry)
-  && stateBefore.closeAttempts === stateAfter.closeAttempts);
+check("14", "per-record closeRetry/closeAttempts identical",
+  JSON.stringify((stateBefore.activePositions || []).map(r => r?.closeRetry ?? null))
+    === JSON.stringify((stateAfter.activePositions || []).map(r => r?.closeRetry ?? null))
+  && JSON.stringify((stateBefore.activePositions || []).map(r => r?.closeAttempts ?? null))
+    === JSON.stringify((stateAfter.activePositions || []).map(r => r?.closeAttempts ?? null)));
 
 check("15", "directionDisabled + lastSide + lastCycleTime identical",
   JSON.stringify(stateBefore.directionDisabled) === JSON.stringify(stateAfter.directionDisabled)
@@ -192,14 +202,21 @@ check("18", "0 transactions sent (nonce unchanged)",
 check("19", "log: dry-CLOSE reported without a write",
   /\[DRY\] Would (CLOSE|CLEAR) position #\d+/.test(log));
 check("20", "log: dry-CLOSE kept the record and continued to OPEN",
-  /\[DRY\] position #\d+ record kept \(read-only dry-run\) — continuing to the OPEN phase/.test(log));
+  /\[DRY\] Would CLOSE position #\d+ — state untouched \(activePositions\/sessionStats\/closeRetry unchanged\)/.test(log)
+  && /\[DRY\] Open would execute on /.test(log));
 check("21", "log: PHASE-1.5 swap pass ran", /\[SWAP\] PHASE-1\.5 rotation queue:/.test(log));
 check("22", "log: PHASE-3 swap pass ran", /\[SWAP\] PHASE-3 rotation queue:/.test(log));
 check("23", "log: PHASE-2/3 OPEN planned", /\[DRY\] Open would execute on /.test(log));
 check("24", "log: cycle completed", /\[CYCLE\] .*CYCLE END/.test(log));
 check("25", "log: no swap was actually sent", !/\[SWAP SUCCESS\]/.test(log));
+// Evidence that the READ-ONLY pipeline ran on real data. A full pass
+// (`would swap` / `preflight=PASS`) is the strongest form, but against the
+// current environment every direction legitimately stops inside the gates
+// (zero balance / economy veto / zero-min at 50 bps / USDT→router has no
+// allowance so the eth_call reverts) — each of those skip codes can only be
+// emitted AFTER the quote, the slippage math and the eth_call preflight ran.
 check("26", "log: quote + slippage + eth_call preflight were exercised",
-  /\[DRY\][^\n]*would swap|\[SWAP\][^\n]*preflight=PASS/.test(log));
+  /\[DRY\][^\n]*would swap|\[SWAP\][^\n]*preflight=PASS|\[SWAP SKIP\][^\n]*(PREFLIGHT_REVERT|ECONOMY_REJECTED|ZERO_AMOUNT_OUT_MIN)/.test(log));
 
 // ─── cleanup ────────────────────────────────────────────────────────────────
 try { fs.rmSync(SCRATCH_DIR, { recursive: true, force: true }); } catch {}

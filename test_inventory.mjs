@@ -11,6 +11,7 @@
  * NO TRANSACTIONS ARE SENT.
  */
 
+import "./_test_state_isolation.mjs"; // state redirect + default-deny live-TX guard
 import { ethers } from "ethers";
 import { TokenInventory, EthSessionTracker, generateInventoryAwarePairs, DEFAULT_INVENTORY, DEFAULT_ETH_GUARD } from "./tokenInventory.js";
 

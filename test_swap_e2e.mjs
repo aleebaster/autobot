@@ -6,6 +6,15 @@ import { ethers } from "ethers";
 import fs from "fs";
 import { getConfirmedPools } from "./deployments/index.js";
 
+// ═══ LIVE-TEST GATE (default: SKIP) ═══════════════════════════════════════
+// This suite can sign real transactions. Normal runs must never do that:
+// it is only reachable with the explicit opt-in phrase below (the global
+// signer guard in _test_state_isolation.mjs enforces the same + chainId).
+if (process.env.NEMESIS_ALLOW_LIVE_TX !== "SEND LIVE TRANSACTIONS") {
+  console.log('SKIP — live-test opt-in missing. Re-run only with: NEMESIS_ALLOW_LIVE_TX="SEND LIVE TRANSACTIONS" (NEMESIS_LIVE_CHAIN_ID defaults to 11155111).');
+  process.exit(0);
+}
+
 const WETH  = "0x7b79995e5f793A07Bc00c21412e50Ecae098E7f9";
 const USDT  = "0x5f2E83cCDEa73D60aF400e03F1Cd8Fb9eaB07b20";
 const USDC  = "0x5dcf1Db10F87CB7839640F9B85C4ECfA29b56e80";

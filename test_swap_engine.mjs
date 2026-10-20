@@ -19,6 +19,15 @@ import crypto from "crypto";
 import { fileURLToPath } from "url";
 import { ethers } from "ethers";
 
+// ═══ LIVE-TEST GATE (default: SKIP) ═══════════════════════════════════════
+// This suite can sign real transactions. Normal runs must never do that:
+// it is only reachable with the explicit opt-in phrase below (the global
+// signer guard in _test_state_isolation.mjs enforces the same + chainId).
+if (process.env.NEMESIS_ALLOW_LIVE_TX !== "SEND LIVE TRANSACTIONS") {
+  console.log('SKIP — live-test opt-in missing. Re-run only with: NEMESIS_ALLOW_LIVE_TX="SEND LIVE TRANSACTIONS" (NEMESIS_LIVE_CHAIN_ID defaults to 11155111).');
+  process.exit(0);
+}
+
 const REPO = path.dirname(fileURLToPath(import.meta.url));
 const REAL_STATE = path.join(REPO, "auto-trader-state.json");
 const SCRATCH_DIR = path.join(REPO, ".swap-test-state");
@@ -34,8 +43,8 @@ fs.copyFileSync(REAL_STATE, SCRATCH_STATE);
 // (OPEN skipped, swap engine still runs) instead of attempting a dry OPEN.
 {
   const st = JSON.parse(fs.readFileSync(SCRATCH_STATE, "utf8"));
-  if (!st.activePosition) {
-    st.activePosition = { positionId: 0, side: "SHORT", collateralToken: "0x0", positionIdx: 0, marketSymbol: "USDT/DAI", managerAddr: "0x0", poolAddr: "0x0", openedAt: 0 };
+  if (!st.activePositions?.[0] ?? null) {
+    st.activePositions = [{ positionId: 0, side: "SHORT", collateralToken: "0x0", positionIdx: 0, marketSymbol: "USDT/DAI", managerAddr: "0x0", poolAddr: "0x0", openedAt: 0 }];
     fs.writeFileSync(SCRATCH_STATE, JSON.stringify(st, null, 2));
   }
 }
@@ -285,12 +294,12 @@ const src = fs.readFileSync(path.join(REPO, "autoTrader.js"), "utf8");
   });
   // a CLOSE that cannot happen right now — the position record is KEPT
   trader.closeActivePosition = async () => ({ ok: false, blocked: true, continueCycle: true, code: "LIQUIDITY_LOW" });
-  const hadPosition = !!trader.state.activePosition;
+  const hadPosition = !!trader.state.activePositions?.[0] ?? null;
   await trader.runCycle();
   const cycleLines = LOGS.slice(logMark).map(l => l.m);
   const cycleEnded = cycleLines.some(m => m.includes("CYCLE END"));
   const swapRan = cycleLines.some(m => /\[SWAP\].*rotation queue:/.test(m));
-  const positionKept = !!trader.state.activePosition;
+  const positionKept = !!trader.state.activePositions?.[0] ?? null;
 
   // and the swap pass itself is untouched by that close failure: any parked
   // route is parked PER ROUTE — there is no engine-wide gate.

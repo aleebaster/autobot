@@ -82,6 +82,32 @@ async function main() {
   const leverageArg = args.find(a => a.startsWith("--leverage="));
   const leverage = leverageArg ? parseInt(leverageArg.split("=")[1]) : 2;
 
+  if (args.includes("--help") || args.includes("-h")) {
+    console.log(`
+  NEMESIS AUTONOMOUS TRADER — CLI
+
+  Single actions (dry-run by default; writes require BOTH --confirm and
+  config.dryRun=false; exactly ONE action per run, no loop, no retry):
+
+    node auto.js --single=swap   --from=USDT --to=NEMESIS --amount=1 [--confirm]
+    node auto.js --single=open   --side=LONG|SHORT [--market=NEMESIS/USDT] [--leverage=N] [--confirm]
+    node auto.js --single=close  --id=<positionId> --manager=0x… [--confirm]
+    node auto.js --single=partial --id=<positionId> --pct=1..99 --manager=0x… [--confirm]
+    node auto.js --single=status [--id=<positionId>] [--manager=0x…]      (read-only)
+
+  Other modes:
+    node auto.js --dry-run                 one read-only cycle
+    node auto.js --once                    one cycle (live iff config allows)
+    node auto.js [--max-cycles=N]          continuous loop, exit after N cycles (default: unlimited)
+    node auto.js --swap-matrix             read-only route check
+    node auto.js --swap-once [--confirm]   one rotation swap
+    node auto.js --single-swap --from=X --to=Y --amount=N [--confirm]
+    node auto.js --swap-loop [--confirm] [--max-cycles=N]
+    node auto.js --help
+`);
+    process.exit(0);
+  }
+
   // ─── RUNTIME MODE — one answer for "what may this process do?" ───
   // `fullAutoEnabled` in config.json is the ONLY live master. `--dry-run` and
   // `simulateOnly` force a read-only run. There is no implicit path to live.
@@ -104,12 +130,18 @@ async function main() {
   console.log("═══════════════════════════════════════════════════════");
   console.log("  NEMESIS AUTONOMOUS TRADER — Sepolia Testnet");
   console.log("═══════════════════════════════════════════════════════");
+  console.log(`  Deployment:  ${deployment.id} — ${deployment.name}`);
   console.log(`  Factory:     ${deployment.factory}`);
   console.log(`  Router:      ${deployment.router}`);
-  console.log(`  ⚠️  DEPLOYMENT MISMATCH: бот і сайт Nemesis використовують різні Factory/Router.`);
-  console.log(`     Позиції бота можуть не відображатися на сайті (не є помилкою індексатора).`);
-  console.log(`     Bot  factory ${deployment.factory}  router ${deployment.router}`);
-  console.log(`     Site factory 0x35f75f9218c640335d7166628319c4d95d1b0ae8  router 0x6c2844a5aFd10e22195d5f58227434b5b073b6d3`);
+  if (deployment.id === "v5") {
+    console.log("  ✅ Bot is on the nemesis.trade PRODUCTION deployment (site data source).");
+    console.log("     Positions opened here are indexed by the site subgraph and visible on nemesis.trade.");
+  } else {
+    console.log(`  ⚠️  DEPLOYMENT MISMATCH: active deployment is ${deployment.id}, NOT the site (v5).`);
+    console.log(`     Bot factory ${deployment.factory}  router ${deployment.router}`);
+    console.log(`     Site factory 0x35f75f9218c640335d7166628319c4d95d1b0ae8  router 0x6c2844a5aFd10e22195d5f58227434b5b073b6D3`);
+    console.log(`     Positions on ${deployment.id} will NOT appear on nemesis.trade.`);
+  }
   const marketCount = Object.keys(confirmedPools || {}).length;
   const sampleMgr = Object.values(confirmedPools || {}).find(p => p?.manager)?.manager || "N/A";
   console.log(`  Markets:     ${marketCount} confirmed pool(s) + dynamic factory discovery`);
@@ -129,6 +161,84 @@ async function main() {
   const rpcUrl = config.rpcUrl || "https://ethereum-sepolia-rpc.publicnode.com";
   const chainId = config.chainId || 11155111;
   const provider = new ethers.JsonRpcProvider(rpcUrl, chainId);
+
+  // ─── STARTUP DEPLOYMENT VALIDATION (hard-stop on mismatch) ───
+  // Verifies, against the active profile, BEFORE any action:
+  //   1. RPC chainId matches deployment.chainId
+  //   2. Factory has code and Factory.router() == deployment.router
+  //   3. Router has code and Router.getAmountsOut answers
+  //   4. Every deployment token has code
+  //   5. Every confirmed pool has code and Factory.getPool(tokenA, tokenB) matches
+  //   6. Every confirmed pool's manager has code (Factory.getManager cross-check)
+  // Any failure aborts the process with a non-zero exit code. Read-only.
+  {
+    const failHard = (msg) => {
+      console.error(`\n⛔ STARTUP VALIDATION FAILED: ${msg}`);
+      console.error(`   Active deployment: ${deployment.id} (${deployment.name})`);
+      console.error(`   Fix the profile or setActiveDeployment("${deployment.id === "v5" ? "v2" : "v5"}") — refusing to continue.`);
+      process.exit(2);
+    };
+    const net = await provider.getNetwork().catch(e => failHard(`RPC unreachable: ${e.shortMessage || e.message}`));
+    if (Number(net.chainId) !== chainId) failHard(`RPC chainId ${net.chainId} != config chainId ${chainId}`);
+    if (Number(net.chainId) !== deployment.chainId) failHard(`RPC chainId ${net.chainId} != deployment.chainId ${deployment.chainId}`);
+
+    const FACTORY_ABI = [
+      "function router() view returns (address)",
+      "function getPool(address,address) view returns (address)",
+      "function getManager(address) view returns (address)",
+    ];
+    const facCode = await provider.getCode(deployment.factory);
+    if (!facCode || facCode === "0x") failHard(`factory ${deployment.factory} has no code`);
+    const fac = new ethers.Contract(deployment.factory, FACTORY_ABI, provider);
+
+    let facRouter = null;
+    try { facRouter = await fac.router(); } catch (e) { failHard(`Factory.router() reverted: ${e.shortMessage || e.message}`); }
+    if (facRouter.toLowerCase() !== deployment.router.toLowerCase()) {
+      failHard(`Factory.router() ${facRouter} != deployment.router ${deployment.router}`);
+    }
+    const routerCode = await provider.getCode(deployment.router);
+    if (!routerCode || routerCode === "0x") failHard(`router ${deployment.router} has no code`);
+
+    const ERC20_ABI = ["function decimals() view returns (uint8)", "function symbol() view returns (string)"];
+    for (const [sym, addr] of Object.entries(deployment.tokens || {})) {
+      if (sym === "ETH") continue; // alias of WETH
+      const code = await provider.getCode(addr);
+      if (!code || code === "0x") failHard(`token ${sym} ${addr} has no code`);
+      const erc = new ethers.Contract(addr, ERC20_ABI, provider);
+      const onchainSym = await erc.symbol().catch(() => null);
+      if (onchainSym && onchainSym.toUpperCase() !== sym.toUpperCase()) {
+        failHard(`token ${sym} ${addr}: on-chain symbol is "${onchainSym}" — profile/chain mismatch`);
+      }
+    }
+
+    for (const [market, entry] of Object.entries(confirmedPools || {})) {
+      if (!entry?.pool || !entry?.manager) failHard(`confirmedPools[${market}] is missing pool/manager`);
+      const poolCode = await provider.getCode(entry.pool);
+      if (!poolCode || poolCode === "0x") failHard(`pool ${market} ${entry.pool} has no code`);
+      const mgrCode = await provider.getCode(entry.manager);
+      if (!mgrCode || mgrCode === "0x") failHard(`manager ${market} ${entry.manager} has no code`);
+      // Factory.getPool cross-check — resolve the pair from the deployment token table
+      const [aSym, bSym] = market.split("/");
+      const tokenA = deployment.tokens?.[aSym] || (aSym === "ETH" ? deployment.tokens?.WETH : null);
+      const tokenB = deployment.tokens?.[bSym] || (bSym === "ETH" ? deployment.tokens?.WETH : null);
+      if (tokenA && tokenB) {
+        try {
+          const gp = await fac.getPool(tokenA, tokenB);
+          if (!gp || gp === ethers.ZeroAddress) failHard(`Factory.getPool(${market}) returned NONE — pool not registered`);
+          if (gp.toLowerCase() !== entry.pool.toLowerCase()) {
+            failHard(`Factory.getPool(${market}) = ${gp} != profile pool ${entry.pool}`);
+          }
+          const gm = await fac.getManager(entry.pool);
+          if (gm && gm !== ethers.ZeroAddress && gm.toLowerCase() !== entry.manager.toLowerCase()) {
+            failHard(`Factory.getManager(${market}) = ${gm} != profile manager ${entry.manager}`);
+          }
+        } catch (e) {
+          failHard(`Factory.getPool/getManager(${market}) reverted: ${e.shortMessage || e.message}`);
+        }
+      }
+    }
+    console.log(`  ✅ Startup validation: chainId, factory, router, ${Object.keys(deployment.tokens || {}).length} tokens, ${marketCount} pools+managers all verified.`);
+  }
 
   // Show wallet balance
   const walletAddr = accounts[0].address;
@@ -176,6 +286,23 @@ async function main() {
     slippageBps: config.slippageBps || 50,
     availableMarkets: config.availableMarkets || [],
     preferredMarket: config.preferredMarket || null,
+    // HOLD WINDOW — deferred auto-close after a confirmed open (both 0 = off)
+    minHoldSeconds: Number(config.minHoldSeconds ?? 0),
+    maxHoldSeconds: Number(config.maxHoldSeconds ?? 0),
+    // Emergency override of the hold — on-chain risk probe (liquidatable /
+    // healthBps ≤ threshold). Absent/False in config.json → no probe.
+    emergencyCloseEnabled: config.emergencyCloseEnabled === true,
+    emergencyCloseHealthBps: Number(config.emergencyCloseHealthBps ?? 10500),
+    // Confirmed OPENs per process run (0 = unlimited)
+    maxTradesPerRun: Number(config.maxTradesPerRun ?? 0),
+    // MULTI-POSITION — these were previously dropped by this hand-picked
+    // whitelist, silently pinning the cap at DEFAULT_AUTO_CONFIG's 1 and
+    // ignoring the operator's market pin entirely.
+    maxOpenPositions: Number(config.maxOpenPositions ?? 1),
+    enabledMarkets: Array.isArray(config.enabledMarkets) ? config.enabledMarkets : [],
+    // LONG/SHORT selection ratio (never picks a disabled side)
+    longPercent: Number(config.longPercent ?? 50),
+    shortPercent: Number(config.shortPercent ?? 50),
   };
 
   const deps = {
@@ -341,8 +468,15 @@ async function main() {
     trader.stop();
   });
 
-  // Start autonomous loop
-  await trader.start();
+  // Start autonomous loop — `--max-cycles=N` bounds it (0/absent = unlimited)
+  const maxCyclesArg = argValue("--max-cycles");
+  const maxCyclesNum = Number(maxCyclesArg);
+  const maxCycles = maxCyclesArg !== null && maxCyclesArg !== ""
+    && Number.isFinite(maxCyclesNum) && maxCyclesNum > 0 ? Math.floor(maxCyclesNum) : null;
+  if (maxCyclesArg !== null && maxCycles === null) {
+    console.log(`  ⚠️ --max-cycles=${maxCyclesArg} is not a positive number — ignored (unlimited loop).`);
+  }
+  await trader.start({ maxCycles });
 }
 
 main().catch((e) => {

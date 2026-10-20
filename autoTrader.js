@@ -19,10 +19,13 @@ import {
   formatCoverageTable,
 } from "./marketDiscovery.js";
 import { discoverTokens, discoverSwapRoutes, quoteBestPath, routeCandidates, sourcesForTarget, formatRoutesTable, PROBE_LADDER_WHOLE } from "./swapRoutes.js";
-import { probeRouteEconomics, normalizeEconomyConfig, checkRateConsistency } from "./swapEconomics.js";
+import { probeRouteEconomics, normalizeEconomyConfig, checkRateConsistency, poolShareCapAmountIn, shrinkToFitEconomy } from "./swapEconomics.js";
 import { RotationMemory } from "./rotation.js";
 import {
   SWAP_FAILURE_CODES,
+  SWAP_DIRECTION_STATES,
+  swapReasonMeta,
+  classifySwapRevert,
   normalizeSwapConfig,
   reserveRawFor,
   computeSwapAmount,
@@ -66,7 +69,12 @@ const BPS_DENOM = 10000n;
 
 const CLOSE_VIEW_ABI = [
   "function previewClosePosition(uint256 positionId, uint256 closeBps) view returns (tuple(uint256 repayAmount, uint256 collateralReduced, uint256 collateralReturned, uint256 protocolFee, uint256 costBasisReduced, int256 realizedPnl, uint256 closePrice, uint256 projectedHealthBps))",
-  "function positions(uint256) view returns (bool isLong, address user, address collateralToken, uint256 collateralAmount, uint256 debtAmount, uint256 currentDebt, bool active)",
+  // Field 6 is the borrow INDEX (1e18-scaled), NOT a debt amount — misnaming it
+  // `currentDebt` poisoned state.debtAmount with 1.0003e18 on #134. The real
+  // current debt comes from getPositionDebt() (verified: #134 debt=2379 wei,
+  // #101 debt=4060439166).
+  "function positions(uint256) view returns (bool isLong, address user, address collateralToken, uint256 collateralAmount, uint256 debtAmount, uint256 borrowIndex, bool active)",
+  "function getPositionDebt(uint256 positionId) view returns (uint256)",
 ];
 const CLOSE_WRITE_ABI = [
   "function closePosition(uint256 positionId, uint256 amountOutMin, uint256 deadline)",
@@ -273,12 +281,55 @@ class TxManager {
   }
 }
 
+// WETH is the SAME contract on v2 and v5 (canonical Sepolia WETH) — the only
+// address allowed to stay hardcoded. USDT/USDC come EXCLUSIVELY from the active
+// deployment profile: the old v2 constants (USDT 0x5f2E83cC…, USDC 0x5dcf1Db1…)
+// must never be reachable as fallbacks while v5 is active (no-mix guarantee).
 const WETH = "0x7b79995e5f793A07Bc00c21412e50Ecae098E7f9";
-const USDT = "0x5f2E83cCDEa73D60aF400e03F1Cd8Fb9eaB07b20";
-const USDC = "0x5dcf1Db10F87CB7839640F9B85C4ECfA29b56e80";
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 
-const POSITION_CREATED_TOPIC = "0x2e462fabb57854af0ee2383faf948da3dc380bd08e582513c3e8e1177478c64a";
+// MAM_PositionCreated(uint256 indexed positionId, address indexed user, bool, …)
+// — the authoritative "a position was opened" event. positionId = topics[1],
+// user = topics[2] (verified against live v5 reference TX 0x2c08bdcc…61a3e,
+// where these topics resolved to positionId=101 / wallet 0x315E5193…).
+const MAM_POSITION_CREATED_TOPIC = "0x23738081446e33f8965d406c81c9f20028aaea1de091dcd1b756dda92c04ed55";
+// MAM_MarginFeeAssessed(address indexed manager, uint256 indexed positionId,
+// uint8 indexed action, …) — action 0 = OPEN. positionId = topics[2].
+// (Historically this topic was named POSITION_CREATED_TOPIC in this file; the
+// topics[2] extraction was correct BECAUSE of this event's layout.)
+const MARGIN_FEE_ASSESSED_TOPIC = "0x2e462fabb57854af0ee2383faf948da3dc380bd08e582513c3e8e1177478c64a";
+
+/**
+ * Extract the positionId of an OPEN from a receipt/log list, on-chain truth only.
+ *
+ * Primary: MAM_PositionCreated (positionId at topics[1], filtered by manager).
+ * Fallback: MAM_MarginFeeAssessed with action=OPEN (positionId at topics[2]).
+ * Never guesses: returns null when no matching event exists.
+ *
+ * @param {Array} logs          receipt.logs (or getLogs result)
+ * @param {string|null} managerAddr  restrict to this emitting manager
+ * @returns {number|null}
+ */
+function extractPositionIdFromLogs(logs, managerAddr = null) {
+  const mgr = managerAddr ? String(managerAddr).toLowerCase() : null;
+  for (const l of logs || []) {
+    const t = l?.topics;
+    if (!t?.[0]) continue;
+    const from = String(l.address || "").toLowerCase();
+    if (t[0] === MAM_POSITION_CREATED_TOPIC && (!mgr || from === mgr)) {
+      try { return Number(BigInt(t[1])); } catch { /* keep looking */ }
+    }
+  }
+  for (const l of logs || []) {
+    const t = l?.topics;
+    if (!t?.[0] || t[0] !== MARGIN_FEE_ASSESSED_TOPIC) continue;
+    if (mgr && String(l.address || "").toLowerCase() !== mgr) continue;
+    try {
+      if (t[3] !== undefined && BigInt(t[3]) === 0n) return Number(BigInt(t[2]));
+    } catch { /* keep looking */ }
+  }
+  return null;
+}
 
 // CORRECT ABI — params: isLong, collateralToken, collateralAmount, borrowAmount, leverageX10, amountOutMin, deadline
 const MANAGER_ABI = [
@@ -511,15 +562,17 @@ function pairTokensOfMarket(market) {
 
 function collateralTargetStr(config, collateralToken) {
   const t = (collateralToken || "").toLowerCase();
-  if (t === WETH.toLowerCase()) return config.targetCollateralWETH || "0.002";
-  if (t === USDT.toLowerCase()) return config.targetCollateralUSDT || "10";
+  const dep = getActiveDeployment?.().tokens || {};
+  if (t === (dep.WETH || dep.ETH || WETH).toLowerCase()) return config.targetCollateralWETH || "0.002";
+  if (dep.USDT && t === dep.USDT.toLowerCase()) return config.targetCollateralUSDT || "10";
   return config.targetCollateralGeneric || "10";
 }
 
 function reserveTargetStr(config, collateralToken) {
   const t = (collateralToken || "").toLowerCase();
-  if (t === WETH.toLowerCase()) return config.targetReserveWETH || "0.004";
-  if (t === USDT.toLowerCase()) return config.targetReserveUSDT || "20";
+  const dep = getActiveDeployment?.().tokens || {};
+  if (t === (dep.WETH || dep.ETH || WETH).toLowerCase()) return config.targetReserveWETH || "0.004";
+  if (dep.USDT && t === dep.USDT.toLowerCase()) return config.targetReserveUSDT || "20";
   return config.targetReserveGeneric || "20";
 }
 
@@ -989,6 +1042,9 @@ const DEFAULT_AUTO_CONFIG = {
   dryRun: false,
   ethGuard: { ...DEFAULT_ETH_GUARD },
   availableMarkets: [],
+  // Per-pair allow-list for OPEN/rotation — empty = every discovered eligible
+  // market may be traded. Entries are market symbols ("ETH/USDT", …).
+  enabledMarkets: [],
   // No preferred/single market: rotation covers every active MARKET × SIDE
   preferredMarket: null,
   // How many distinct markets to try per cycle when collateral can't be sourced
@@ -996,6 +1052,23 @@ const DEFAULT_AUTO_CONFIG = {
   // Runtime direction kill-switch: disable a MARKET×SIDE after N consecutive open failures
   maxDirectionFailures: 2,
   marketRefreshMs: 120_000,
+  // ─── HOLD WINDOW — deferred auto-close ────────────────────────────────────
+  // After a CONFIRMED open the position is not auto-closed before `holdUntil`
+  // (= openedAt + rand(min..max hold)). Both defaults 0 = hold disabled, so
+  // every existing behavior/tests stay byte-identical unless a run opts in.
+  minHoldSeconds: 0,
+  maxHoldSeconds: 0,
+  // Emergency override: when the on-chain risk probe says `liquidatable` or
+  // `healthBps <= emergencyCloseHealthBps`, the hold is IGNORED (close runs).
+  // A failed probe always keeps the hold — never close on unknown risk.
+  emergencyCloseEnabled: false,
+  emergencyCloseHealthBps: 10500,
+  // Confirmed OPENs allowed per process run (0 = unlimited). A position that
+  // is still open is NEVER abandoned by this cap — only new OPENs stop.
+  maxTradesPerRun: 0,
+  // LONG/SHORT selection ratio (never picks a disabled side).
+  longPercent: 50,
+  shortPercent: 50,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1077,15 +1150,44 @@ function normalizeDirectionDisabled(state) {
   return out;
 }
 
+/**
+ * Migrate a legacy single-position state to the multi-position shape.
+ *
+ * OLD: { activePosition: {...}|null, closeRetry, closeAttempts, … }
+ * NEW: { activePositions: [ {…, closeRetry, closeAttempts} ], … }
+ *
+ * The legacy global closeRetry/closeAttempts move onto the single record they
+ * belonged to (they always described THAT position's on-chain signature).
+ * Idempotent: a state that already has activePositions[] is left untouched.
+ */
+function migrateStateShape(state) {
+  if (Array.isArray(state.activePositions)) return state;
+  state.activePositions = [];
+  const legacy = state.activePosition;
+  if (legacy && typeof legacy === "object" && !Array.isArray(legacy)) {
+    if (state.closeRetry) legacy.closeRetry = state.closeRetry;
+    if (Number.isFinite(Number(state.closeAttempts))) legacy.closeAttempts = Number(state.closeAttempts);
+    state.activePositions.push(legacy);
+  }
+  delete state.activePosition;
+  delete state.closeRetry;
+  delete state.closeAttempts;
+  return state;
+}
+
 function loadState() {
   let state = null;
   try {
     if (fs.existsSync(STATE_FILE)) state = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
   } catch {}
   if (!state || typeof state !== "object" || Array.isArray(state)) {
-    state = { activePosition: null, sessionStats: { opens: 0, closes: 0 }, lastCycleTime: 0, lastSide: null };
+    state = { activePositions: [], sessionStats: { opens: 0, closes: 0 }, lastCycleTime: 0, lastSide: null };
   }
+  migrateStateShape(state);
   if (!state.sessionStats) state.sessionStats = { opens: 0, closes: 0 };
+  for (const p of state.activePositions) {
+    if (p && typeof p === "object" && p.closeAttempts === undefined) p.closeAttempts = 0;
+  }
   normalizeDirectionDisabled(state);
   return state;
 }
@@ -1120,45 +1222,67 @@ async function recoverPosition(provider, walletAddr, managerAddr, log = () => {}
   const latestBlock = await provider.getBlockNumber();
   const fromBlock = Math.max(latestBlock - 2000, 0);
   try {
-    const logs = await provider.getLogs({
-      address: managerAddr,
-      topics: [null, "0x000000000000000000000000" + walletAddr.slice(2).toLowerCase()],
-      fromBlock,
-      toBlock: latestBlock,
-    });
-    const positionCreatedLogs = logs.filter(l => l.topics[0] === POSITION_CREATED_TOPIC);
+    // Address-only scan. On v5 NO manager event carries the wallet as
+    // topics[1] (MAM_PositionCreated: topics[1]=positionId, topics[2]=user),
+    // so the old [null, walletTopic] filter matched nothing and recovery
+    // always returned null. Every manager log is also needed below to detect
+    // closePosition transactions.
+    const logs = await provider.getLogs({ address: managerAddr, fromBlock, toBlock: latestBlock });
+    const walletTopic = "0x000000000000000000000000" + String(walletAddr).slice(2).toLowerCase();
+    const positionCreatedLogs = logs.filter(
+      l => l.topics?.[0] === MAM_POSITION_CREATED_TOPIC && l.topics?.[2] === walletTopic,
+    );
     if (positionCreatedLogs.length === 0) return null;
     const lastOpen = positionCreatedLogs[positionCreatedLogs.length - 1];
-    const positionId = Number(BigInt(lastOpen.topics[2]));
+    const positionId = Number(BigInt(lastOpen.topics[1])); // positionId is topics[1]
     const allTxHashes = [...new Set(logs.map(l => l.transactionHash))];
     let positionClosed = false;
     for (const txHash of allTxHashes) {
       try {
         const tx = await provider.getTransaction(txHash);
         if (tx && tx.data && tx.data.startsWith(CLOSE_POSITION_SELECTOR)) {
-          const closePosId = Number(BigInt("0x" + tx.data.slice(74, 138)));
+          // closePosition(uint256 positionId, …) — positionId is ABI word 0.
+          const closePosId = Number(BigInt("0x" + tx.data.slice(4, 68)));
           if (closePosId === positionId) { positionClosed = true; break; }
         }
+        // partialClose(0xdc439ba7) may also have ended the position — the
+        // on-chain `active` check below is the authority either way.
       } catch {}
     }
     if (positionClosed) {
       log(`[RECOVERY] position #${positionId} was already closed`, "info");
       return null;
     }
-    // On-chain truth for side/collateral: positions(positionId) — NEVER hardcoded
+    // On-chain truth for side/collateral/active: positions(positionId) — NEVER hardcoded
     // (was: side:"LONG", collateralToken: USDT).
     let pos = null;
     try {
       const mgr = new ethers.Contract(managerAddr, [
-        "function positions(uint256) view returns (bool isLong, address user, address collateralToken, uint256 collateralAmount, uint256 debtAmount, uint256 currentDebt)"
+        // Field 6 = borrowIndex (NOT a debt amount) — see CLOSE_VIEW_ABI note.
+        "function positions(uint256) view returns (bool isLong, address user, address collateralToken, uint256 collateralAmount, uint256 debtAmount, uint256 borrowIndex, bool active)",
+        "function getPositionDebt(uint256 positionId) view returns (uint256)",
       ], provider);
       pos = await mgr.positions(positionId);
+      // Real current debt (index-adjusted); borrowIndex must never be used as debt.
+      if (pos?.active) {
+        try { pos.currentDebt = await mgr.getPositionDebt(positionId); }
+        catch { pos.currentDebt = pos.debtAmount; }
+      } else if (pos) {
+        pos.currentDebt = pos.debtAmount;
+      }
     } catch (e) {
       log(`[RECOVERY] AMBIGUITY: cannot read position #${positionId} on-chain (${e.message?.slice(0, 40)}) — refusing to guess side/collateral`, "warn");
       return null;
     }
     if (!pos || pos.user === undefined) {
       log(`[RECOVERY] AMBIGUITY: position #${positionId} returned no on-chain data — refusing to guess side/collateral`, "warn");
+      return null;
+    }
+    // Closed on-chain (active=false) is NEVER recovered — collateral/debt
+    // words are retained by the contract after a close, so a nonzero read
+    // alone cannot prove the position is open (#101: active=true vs #37: false).
+    if (pos.active === false) {
+      log(`[RECOVERY] position #${positionId} is CLOSED on-chain (active=false) — not recovered`, "info");
       return null;
     }
     // Check for zombie position (zeroed collateral/debt on-chain)
@@ -1593,7 +1717,11 @@ export async function resolveLeverageForOpen(provider, {
       log(`[LEVERAGE] preview oracleReady=false — checkpoint will run before the open`, "warn");
     }
   }
-  log(`[LEVERAGE] resolved ${lev}x for ${marketSymbol || "market"} ${isLong ? "LONG" : "SHORT"} (requested ${requested}x, bounds ${bounds.source} ${minContract}x..${maxContract}x${steppedFrom ? `, stepped down from ${steppedFrom}x` : ""}${result.probed ? `, ltv=${result.preview.projectedLtvBps}bps health=${result.preview.projectedHealthBps}bps` : ""})`, "info");
+  // result.preview is null when the preview ran but failed non-stepably (e.g.
+  // ORACLE_DIVERGENCE): the resolution is still valid (the OPEN flow runs the
+  // checkpoint itself), but there are no ltv/health numbers to print — the log
+  // must never dereference the null preview (it crashed the whole dry cycle).
+  log(`[LEVERAGE] resolved ${lev}x for ${marketSymbol || "market"} ${isLong ? "LONG" : "SHORT"} (requested ${requested}x, bounds ${bounds.source} ${minContract}x..${maxContract}x${steppedFrom ? `, stepped down from ${steppedFrom}x` : ""}${result.preview ? `, ltv=${result.preview.projectedLtvBps}bps health=${result.preview.projectedHealthBps}bps` : ""})`, "info");
   return result;
 }
 
@@ -1640,16 +1768,28 @@ async function executeSwap({ wallet, provider, fromToken, toToken, amount, amoun
       return fail("APPROVAL_REQUIRED", `allowance ${ethers.formatUnits(allowance, srcDecimals)} < needed ${ethers.formatUnits(amount, srcDecimals)} (allowApprove=false)`);
     }
     log(`[SWAP] Approve ${fromSym} → Router...`, "info");
+    // GAS: this deployment's approve needs ~129k (cold proxy storage); a
+    // hardcoded 100k limit OOGs. Estimate +25%; estimation failure → do not send.
+    let approveGas;
+    try {
+      const est = await provider.estimateGas({
+        from: walletAddr, to: fromToken,
+        data: fromContract.interface.encodeFunctionData("approve", [routerAddr, ethers.MaxUint256]),
+      });
+      approveGas = est + est / 4n;
+    } catch (e) {
+      return fail("INSUFFICIENT_ALLOWANCE", `approve estimation failed: ${String(e?.shortMessage || e?.message || e).slice(0, 100)}`);
+    }
     if (txManager) {
       const r = await txManager.sendAndWait({
         wallet, provider, txType: "SWAP-APPROVE",
-        sendFn: (nonce) => fromContract.approve(routerAddr, ethers.MaxUint256, { gasLimit: 100000n, nonce }),
+        sendFn: (nonce) => fromContract.approve(routerAddr, ethers.MaxUint256, { gasLimit: approveGas, nonce }),
         log,
       });
       if (r.status === 0) { log(`[SWAP] Approve REVERTED`, "error"); return fail("INSUFFICIENT_ALLOWANCE", "approve transaction reverted"); }
       approveTxHash = r.hash || null;
     } else {
-      const approveTx = await fromContract.approve(routerAddr, ethers.MaxUint256, { gasLimit: 100000n });
+      const approveTx = await fromContract.approve(routerAddr, ethers.MaxUint256, { gasLimit: approveGas });
       approveTxHash = approveTx.hash;
       await approveTx.wait();
     }
@@ -1797,18 +1937,43 @@ async function openPosition({ wallet, provider, managerAddr, poolAddr, side, col
   const allowance = await token.allowance(walletAddr, managerAddr);
   if (allowance < collateralAmount) {
     log(`[OPEN] Approve collateral → Manager...`, "info");
+    // GAS: a hardcoded 100_000 burned 41/41 OPEN-APPROVEs — some deploys (USDT)
+    // need ~129k for approve(). Estimate +25%; NEVER send when the estimate
+    // itself fails (that would burn gas on a guaranteed OOG/revert).
+    const approveCalldata = token.interface.encodeFunctionData("approve", [managerAddr, ethers.MaxUint256]);
+    let approveGas;
+    try {
+      const est = await provider.estimateGas({ from: walletAddr, to: collateralToken, data: approveCalldata, value: 0n });
+      approveGas = est + est / 4n;
+      log(`[OPEN] approve gas estimate=${est} → limit=${approveGas}`, "info");
+    } catch (e) {
+      log(`[BLOCKED] approve estimate FAILED (${revertSelector(e) || e.message?.slice(0, 60)}) — NOT sending`, "error");
+      return null;
+    }
     if (txManager) {
       const r = await txManager.sendAndWait({
         wallet, provider, txType: "OPEN-APPROVE",
-        sendFn: (nonce) => token.approve(managerAddr, ethers.MaxUint256, { gasLimit: 100000n, nonce }),
+        sendFn: (nonce) => token.approve(managerAddr, ethers.MaxUint256, { gasLimit: approveGas, nonce }),
         log,
       });
-      if (r.status === 0) { log(`[OPEN] Approve REVERTED`, "error"); return null; }
+      if (!r || r.status === 0) { log(`[OPEN] Approve REVERTED`, "error"); return null; }
+      if (r.pending) { log(`[OPEN] Approve still PENDING — not proceeding to open`, "warn"); return null; }
     } else {
-      const approveTx = await token.approve(managerAddr, ethers.MaxUint256, { gasLimit: 100000n });
-      await approveTx.wait();
+      try {
+        const approveTx = await token.approve(managerAddr, ethers.MaxUint256, { gasLimit: approveGas });
+        await approveTx.wait();
+      } catch (e) {
+        log(`[OPEN] Approve failed (${e.message?.slice(0, 60)})`, "error");
+        return null;
+      }
     }
-    log(`[OPEN] Approved`, "success");
+    // Receipt is not proof the allowance changed — re-read it before opening.
+    const allowanceAfter = await token.allowance(walletAddr, managerAddr);
+    if (allowanceAfter < collateralAmount) {
+      log(`[BLOCKED] allowance still ${allowanceAfter} < ${collateralAmount} after approve receipt — NOT opening`, "error");
+      return null;
+    }
+    log(`[OPEN] Approved (allowance=${allowanceAfter})`, "success");
   }
 
   // Encode calldata — CORRECT parameter order per on-chain Manager ABI (0xfa2b1dfd):
@@ -1959,14 +2124,9 @@ async function openPosition({ wallet, provider, managerAddr, poolAddr, side, col
 
   log(`[OPEN] SUCCESS gas=${receipt.gasUsed}`, "success");
 
-  // Extract positionId from PositionCreated event
-  let positionId = null;
-  for (const logEntry of receipt.logs) {
-    if (logEntry.topics[0] === POSITION_CREATED_TOPIC && logEntry.address.toLowerCase() === managerAddr.toLowerCase()) {
-      positionId = Number(BigInt(logEntry.topics[2]));
-      break;
-    }
-  }
+  // Extract positionId from on-chain events (MAM_PositionCreated primary,
+  // MAM_MarginFeeAssessed[action=OPEN] fallback — both manager-filtered).
+  const positionId = extractPositionIdFromLogs(receipt.logs, managerAddr);
 
   if (positionId === null) {
     log(`[BLOCKED] TX succeeded but PositionCreated event not found`, "error");
@@ -2027,7 +2187,7 @@ async function verifyOpenedPosition(provider, managerAddr, positionId, walletAdd
     pos: {
       isLong: pos.isLong, user: pos.user, collateralToken: pos.collateralToken,
       collateralAmount: pos.collateralAmount, debtAmount: pos.debtAmount,
-      currentDebt: pos.currentDebt, active: pos.active,
+      borrowIndex: pos.borrowIndex, currentDebt: pos.debtAmount, active: pos.active,
     },
     reason: failed.length ? `failed checks: ${failed.map(([n]) => n).join(",")}` : null,
   };
@@ -2042,10 +2202,16 @@ async function readOnChainPosition(provider, managerAddr, positionId) {
   try {
     const mgr = new ethers.Contract(managerAddr, CLOSE_VIEW_ABI, provider);
     const p = await mgr.positions(positionId);
+    // currentDebt = REAL current debt (getPositionDebt, index-adjusted).
+    // p.borrowIndex is the 1e18-scaled index and must never be treated as debt.
+    let currentDebt = p.debtAmount;
+    if (p.active) {
+      try { currentDebt = await mgr.getPositionDebt(positionId); } catch {}
+    }
     return {
       isLong: p.isLong, user: p.user, collateralToken: p.collateralToken,
       collateralAmount: p.collateralAmount, debtAmount: p.debtAmount,
-      currentDebt: p.currentDebt, active: p.active,
+      borrowIndex: p.borrowIndex, currentDebt, active: p.active,
     };
   } catch (e) {
     return null;
@@ -2089,10 +2255,13 @@ async function findMaxCloseBps(provider, managerAddr, positionId, { log = () => 
     50n, 20n, 10n, 5n, 2n, 1n,
   ];
   let probes = 0;
+  const probed = new Map(); // bps → err|null — EVERY probe (ladder + gap + refine)
   const probe = async (bps) => {
     if (probes >= maxProbes) return { ok: false, err: "PROBE_LIMIT" };
     probes++;
-    return previewCloseAt(provider, managerAddr, positionId, bps);
+    const r = await previewCloseAt(provider, managerAddr, positionId, bps);
+    probed.set(bps, r.ok ? null : (r.err || "UNKNOWN"));
+    return r;
   };
   const isLiquidityErr = (e) => e === ERR_INSUFFICIENT_LIQUIDITY || e === ERR_POOL_INSUFFICIENT_OUTPUT;
 
@@ -2137,7 +2306,27 @@ async function findMaxCloseBps(provider, managerAddr, positionId, { log = () => 
   }
 
   if (seed === null) {
-    return { ok: false, code: lastErr === ERR_CLOSE_AMOUNT_TOO_SMALL ? "CLOSE_AMOUNT_TOO_SMALL" : "CLOSE_BPS_NOT_FOUND", probes, lastErr };
+    // Precise classification from the FULL probe map — the old single-field
+    // `lastErr` check misreported "no feasible window" as dust: on #134
+    // bps 1..4 revert MAM_CloseAmountTooSmall while bps ≥5 revert
+    // MAM_InsufficientLiquidity, i.e. NO bps passes at all, and the position
+    // (16.8 USDT collateral) is anything but dust.
+    const tooSmall = [...probed.entries()].filter(([, e]) => e === ERR_CLOSE_AMOUNT_TOO_SMALL).map(([b]) => b).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+    const illiquid = [...probed.entries()].filter(([, e]) => isLiquidityErr(e)).map(([b]) => b).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+    const other = [...probed.entries()].filter(([, e]) => e && e !== ERR_CLOSE_AMOUNT_TOO_SMALL && !isLiquidityErr(e));
+    const band = {
+      tooSmallMin: tooSmall.length ? tooSmall[0] : null,
+      tooSmallMax: tooSmall.length ? tooSmall[tooSmall.length - 1] : null,
+      illiquidMin: illiquid.length ? illiquid[0] : null,
+      illiquidMax: illiquid.length ? illiquid[illiquid.length - 1] : null,
+      otherErrs: [...new Set(other.map(([, e]) => e))],
+    };
+    let code;
+    if (tooSmall.length && illiquid.length) code = "CLOSE_NO_FEASIBLE_WINDOW";
+    else if (tooSmall.length) code = "CLOSE_AMOUNT_TOO_SMALL";
+    else if (other.length && other.every(([, e]) => e === "PROBE_LIMIT")) code = "PROBE_LIMIT";
+    else code = "CLOSE_BPS_NOT_FOUND";
+    return { ok: false, code, probes, lastErr, band };
   }
 
   // Bracket: lo passes, hi (if any) fails — refine to the highest passing bps.
@@ -2222,8 +2411,11 @@ async function attemptPartialClose({ wallet, provider, managerAddr, positionId, 
       // liquidity), NOT a bot bug. The position is STAYS ACTIVE and STAYS
       // TRACKED; the cycle continues with SWAP/OPEN and re-probes read-only
       // after an exponential backoff. Nothing is cleared, nothing is sent.
-      const detail = found.code === "CLOSE_AMOUNT_TOO_SMALL"
-        ? "every bps ≥ 1 reverts MAM_CloseAmountTooSmall — position is dust-sized relative to the contract minimum"
+      const b = found.band || null;
+      const detail = found.code === "CLOSE_NO_FEASIBLE_WINDOW"
+        ? `no feasible window: bps ${b?.tooSmallMin ?? "?"}..${b?.tooSmallMax ?? "?"} → MAM_CloseAmountTooSmall (contract minimum), bps ${b?.illiquidMin ?? "?"}..${b?.illiquidMax ?? "?"} → MAM_InsufficientLiquidity (pool cannot absorb) — pool liquidity below the minimum closeable slice`
+        : found.code === "CLOSE_AMOUNT_TOO_SMALL"
+        ? `every probed bps (≤${b?.tooSmallMax ?? "?"}) reverts MAM_CloseAmountTooSmall — position slice below the contract minimum`
         : found.code === "PROBE_LIMIT"
           ? `probe budget exhausted after ${found.probes} eth_calls`
           : `no bps in 1..9999 passes previewClosePosition (${found.probes} read-only probes, last revert=${found.lastErr || "none"}) — pool liquidity cannot absorb even 1% of this position`;
@@ -2275,8 +2467,8 @@ async function attemptPartialClose({ wallet, provider, managerAddr, positionId, 
       return { failed: true, clearState: false, code: "PARTIAL_GAS_ESTIMATE", partial: true, reason: "partialClose gas estimation failed" };
     }
 
-    const gasLimit = gasEstimate + gasEstimate / 5n;
-    let txHash, receipt;
+  const gasLimit = gasEstimate + gasEstimate / 5n;
+  let txHash, receipt;
     if (txManager) {
       const r = await txManager.sendAndWait({
         wallet, provider, txType: "PARTIAL-CLOSE",
@@ -2322,6 +2514,18 @@ async function attemptPartialClose({ wallet, provider, managerAddr, positionId, 
         closeBps, amountOut, onChain: after,
       };
     }
+    if (targetCloseBps !== null && targetCloseBps !== undefined) {
+      // Operator-specified slice executed EXACTLY once and verified: the
+      // position is still active (by design — pct was 1..99). Never ladder
+      // the same pct over remaining size: that would overshoot the requested
+      // close and end in a spurious PARTIAL_CLOSE_LIMIT.
+      log(`[VERIFY] position #${positionId} partial target ${closeBps}bps DONE on-chain: collateral=${after.collateralAmount} debt=${after.currentDebt} (still active)`, "success");
+      return {
+        ok: true, closed: false, targetDone: true, partial: true, rounds: round, verified: true,
+        txHash, gasUsed: receipt.gasUsed, blockNumber: receipt.blockNumber,
+        closeBps, amountOut, onChain: after,
+      };
+    }
     log(`[VERIFY] position #${positionId} STILL ACTIVE after partial close: collateral=${after.collateralAmount} debt=${after.currentDebt} (round ${round}/${maxRounds})`, "warn");
     last.residual = { collateralAmount: String(after.collateralAmount), currentDebt: String(after.currentDebt) };
   }
@@ -2341,12 +2545,81 @@ async function closePositionFn({ wallet, provider, managerAddr, positionId, conf
     return { dryRun: true };
   }
 
+  // ── GUARD 1: chain / deployment identity ──────────────────────────────────
+  // The send must target the ACTIVE deployment profile's chainId (and, when
+  // configured, config.chainId must agree with it). A profile switch or a
+  // config edit can silently retarget the send — refuse BEFORE pricing/signing.
+  let expectedChain;
+  try { expectedChain = Number(getActiveDeployment()?.chainId ?? 0) || null; } catch { expectedChain = null; }
+  if (!expectedChain) expectedChain = Number(config.chainId || 11155111);
+  if (config.chainId && Number(config.chainId) !== expectedChain) {
+    log(`[BLOCKED] close: config.chainId ${config.chainId} != active deployment chainId ${expectedChain} — refusing (deployment/config drift)`, "error");
+    return { failed: true, clearState: false, code: "CLOSE_CHAIN_ID_MISMATCH", reason: `config chainId ${config.chainId} != deployment ${expectedChain}` };
+  }
+  let netChain = null;
+  try {
+    netChain = Number((await provider.getNetwork()).chainId);
+  } catch (e) {
+    log(`[BLOCKED] close: RPC chainId unreadable (${e?.shortMessage || e?.message || e}) — refusing to send`, "error");
+    return { failed: true, clearState: false, code: "CLOSE_CHAIN_ID_MISMATCH", reason: "RPC network unreadable" };
+  }
+  if (netChain !== expectedChain) {
+    log(`[BLOCKED] close: RPC chainId ${netChain} != expected ${expectedChain} — refusing (wrong network/deployment)`, "error");
+    return { failed: true, clearState: false, code: "CLOSE_CHAIN_ID_MISMATCH", reason: `chainId ${netChain} != ${expectedChain}` };
+  }
+
+  // ── GUARD 2: the manager must be a contract on THIS chain ─────────────────
+  // Catches a stale/wrong --manager address (no code after a deployment
+  // change, or a mistyped address) before any view call or signature.
+  const mgrCode = await provider.getCode(managerAddr).catch(() => null);
+  if (!mgrCode || mgrCode === "0x") {
+    log(`[BLOCKED] close: manager ${managerAddr} has NO CODE on chain ${netChain} — refusing to send`, "error");
+    return { failed: true, clearState: false, code: "CLOSE_MANAGER_NO_CODE", reason: `no code at ${managerAddr}` };
+  }
+
+  // ── REFERENCE PREVIEW (read-only, mandatory) ──────────────────────────────
+  // The close is priced BEFORE any calldata exists. amountOutMin is derived
+  // from the same preview field the production partialClose path has always
+  // used (quote.collateralReturned − slippage), against the verified ABI
+  // arg[1] of closePosition(uint256 positionId, uint256 amountOutMin,
+  // uint256 deadline) — selector 0xb35648d7 (never hand-rolled calldata).
+  const ref = await previewCloseAt(provider, managerAddr, positionId, BPS_DENOM);
+  if (!ref.ok) {
+    if (ref.err === ERR_INVALID_POSITION) {
+      log(`[CLOSE] MAM_InvalidPosition — zombie position detected, clearing state`, "warn");
+      return { failed: true, clearState: true, reason: "zombie" };
+    }
+    if (ref.err === ERR_INSUFFICIENT_LIQUIDITY || ref.err === ERR_POOL_INSUFFICIENT_OUTPUT) {
+      log(`[CLOSE] ${ref.err === ERR_POOL_INSUFFICIENT_OUTPUT ? "Pool_InsufficientOutputAmount" : "MAM_InsufficientLiquidity"} on full-close preview — read-only closeBps search + partialClose fallback`, "warn");
+      return attemptPartialClose({ wallet, provider, managerAddr, positionId, config, log, txManager });
+    }
+    log(`[BLOCKED] close: reference previewClosePosition REVERTED ${ref.err || "unknown"} — nothing signed`, "error");
+    return { failed: true, clearState: false, code: `CLOSE_PREVIEW_${ref.err || "REVERT"}`, reason: `full-close preview revert ${ref.err || "unknown"}` };
+  }
+
+  const slippageBps = BigInt(config.slippageBps || 50);
+  const refOut = BigInt(ref.quote.collateralReturned);
+  if (!(refOut > 0n)) {
+    log(`[BLOCKED] close: preview returned zero collateral — refusing (a zero floor is never sent)`, "error");
+    return { failed: true, clearState: false, code: "ZERO_AMOUNT_OUT_MIN", reason: "full close quote returned zero collateral" };
+  }
+  const amountOutMin = (refOut * (BPS_DENOM - slippageBps)) / BPS_DENOM;
+  if (!(amountOutMin > 0n)) {
+    log(`[BLOCKED] close: amountOutMin floor is zero (${slippageBps} bps of ${refOut}) — refusing`, "error");
+    return { failed: true, clearState: false, code: "ZERO_AMOUNT_OUT_MIN", reason: "amountOutMin floor is zero after slippage" };
+  }
+  log(`[CLOSE] plan: preview collateralReturned=${refOut} amountOutMin=${amountOutMin} (max slippage ${slippageBps} bps)`, "info");
+
   const deadline = Math.floor(Date.now() / 1000) + config.deadlineSeconds;
   const coder = ethers.AbiCoder.defaultAbiCoder();
-  const params = coder.encode(["uint256", "uint256", "uint256"], [positionId, 0n, BigInt(deadline)]);
+  const params = coder.encode(["uint256", "uint256", "uint256"], [positionId, amountOutMin, BigInt(deadline)]);
   const calldata = CLOSE_POSITION_SELECTOR + params.slice(2);
+  if (calldata.slice(0, 10) !== CLOSE_POSITION_SELECTOR) {
+    log(`[BLOCKED] unexpected close selector ${calldata.slice(0, 10)} — refusing to send`, "error");
+    return { failed: true, clearState: false, code: "BAD_CLOSE_SELECTOR", reason: calldata.slice(0, 10) };
+  }
 
-  // Pre-flight
+  // Pre-flight — the EXACT calldata that would be signed, amountOutMin included
   try {
     await provider.call({ from: walletAddr, to: managerAddr, data: calldata, value: 0n });
     log(`[CLOSE] Pre-flight OK`, "info");
@@ -2382,6 +2655,28 @@ async function closePositionFn({ wallet, provider, managerAddr, positionId, conf
   }
 
   const gasLimit = gasEstimate + gasEstimate / 5n;
+
+  // ── GUARD 3: FRESH preview immediately before signing ─────────────────────
+  // The reference preview may already be stale by now. Compare the CURRENT
+  // closable output against the minimum acceptable result (amountOutMin =
+  // reference − slippageBps): if it deteriorated beyond the threshold —
+  // REFUSE the TX WITHOUT signing. (The same amountOutMin in the calldata is
+  // the contract-side floor for the mined execution.)
+  const fresh = await previewCloseAt(provider, managerAddr, positionId, BPS_DENOM);
+  if (!fresh.ok) {
+    log(`[BLOCKED] close: fresh preview REVERTED ${fresh.err || "unknown"} right before signing — refusing WITHOUT signing`, "error");
+    return { failed: true, clearState: false, code: `CLOSE_SLIPPAGE_FRESH_${fresh.err || "REVERT"}`, reason: `fresh preview revert ${fresh.err || "unknown"}` };
+  }
+  const freshOut = BigInt(fresh.quote.collateralReturned);
+  if (freshOut < amountOutMin) {
+    log(`[BLOCKED] close: preview deteriorated ${refOut} → ${freshOut} (< amountOutMin ${amountOutMin}, allowed ${slippageBps} bps) — refusing WITHOUT signing`, "error");
+    return {
+      failed: true, clearState: false, code: "CLOSE_SLIPPAGE_REFUSED",
+      reason: `collateralReturned ${freshOut} < min ${amountOutMin} (ref ${refOut}, maxSlippage ${slippageBps} bps)`,
+    };
+  }
+  log(`[CLOSE] fresh preview OK: collateralReturned=${freshOut} ≥ amountOutMin=${amountOutMin}`, "info");
+
   let txHash, receipt;
   if (txManager) {
     const r = await txManager.sendAndWait({
@@ -2494,6 +2789,139 @@ export class AutoTrader {
     // ONE active swap scheduler per bot instance (see runSwapLoop/start guards).
     this._swapLoopRunning = false;
     this._cycleNo = 0;
+    // Confirmed OPENs in THIS process — maxTradesPerRun cap (never a restart-
+    // persistent counter: the cap is per run by definition).
+    this._opensThisRun = 0;
+    // Throttled emergency-risk probe cache for the hold window (see _emergencyCloseDue).
+    this._holdProbe = null;
+    // Record created by the most recent successful/pending OPEN (result extraction).
+    this._lastOpenedRecord = null;
+  }
+
+  // ═════════════════════════════════════════════════════════════════════════
+  //  MULTI-POSITION BOOKKEEPING — state.activePositions[]
+  // ═════════════════════════════════════════════════════════════════════════
+
+  /** The tracked positions array (never null — created on demand). */
+  _positions() {
+    if (!Array.isArray(this.state.activePositions)) this.state.activePositions = [];
+    return this.state.activePositions;
+  }
+
+  /** First tracked record (display fallbacks only — never a trading target). */
+  _primaryPosition() {
+    const ps = this._positions();
+    return ps[0] || null;
+  }
+
+  _activeCount() {
+    return this._positions().length;
+  }
+
+  _findPosition(positionId) {
+    if (positionId === null || positionId === undefined) return null;
+    const want = String(positionId);
+    return this._positions().find(p => String(p?.positionId) === want) || null;
+  }
+
+  _findPositionByTx(txHash) {
+    if (!txHash) return null;
+    const want = String(txHash).toLowerCase();
+    return this._positions().find(p => String(p?.txHash || "").toLowerCase() === want) || null;
+  }
+
+  /** Bookkeeping key for a position record — pool first, then manager, then symbol. */
+  _marketKeyOf(rec) {
+    return String(rec?.poolAddr || rec?.managerAddr || rec?.marketSymbol || rec?.marketSymbol || "").toLowerCase();
+  }
+
+  /** Bookkeeping key for a market candidate/plan entry. */
+  _marketKeyOfCandidate(mk) {
+    return String(mk?.poolAddr || mk?.managerAddr || mk?.marketSymbol || mk?.symbol || "").toLowerCase();
+  }
+
+  /**
+   * Per-MARKET slot: another tracked position (active or pending) already
+   * occupies this market. One position per market is a market limit — never a
+   * global one.
+   */
+  _marketHasPosition(market, { excludeRec = null } = {}) {
+    const key = this._marketKeyOfCandidate(market);
+    if (!key) return false;
+    return this._positions().some(p =>
+      p !== excludeRec && this._marketKeyOf(p) === key);
+  }
+
+  /**
+   * The ONE gate every OPEN path consults (runCycle PHASE 3, prepareAndOpen,
+   * --single=open). Global cap + pending-open serialization + per-market slot.
+   *
+   * @param opts.market    market candidate to additionally check for a slot
+   * @param opts.effectiveCount  override the record count (dry-run planning:
+   *        records that "would close" this cycle may be treated as free slots)
+   * @returns {{ok:boolean, code?:string, max?:number, count?:number}}
+   */
+  _canOpenNew({ market = null, effectiveCount = null, log = true } = {}) {
+    if (this._tradeCapReached()) {
+      if (log) this.log(`[LIMIT] maxTradesPerRun=${Number(this.config.maxTradesPerRun || 0)} reached (opens this run=${this._opensThisRun}) — OPEN skipped`, "warn");
+      return { ok: false, code: "TRADE_CAP", count: this._activeCount() };
+    }
+    const count = Number.isFinite(effectiveCount) ? effectiveCount : this._activeCount();
+    const max = Math.max(1, Number(this.config.maxOpenPositions) || 1);
+    if (count >= max) {
+      if (log) this.log(`[LIMIT] maxOpenPositions=${max} reached (tracked=${this._activeCount()}${count !== this._activeCount() ? ` effective=${count}` : ""}) — OPEN skipped`, "warn");
+      return { ok: false, code: "MAX_OPEN_POSITIONS", max, count: this._activeCount() };
+    }
+    const pending = this._positions().find(p => p?.pendingOpen);
+    if (pending) {
+      if (log) this.log(`[LIMIT] open tx ${pending.txHash || "?"} still pending (position #${pending.positionId ?? "?"}) — no new OPEN until it settles`, "warn");
+      return { ok: false, code: "OPEN_PENDING", count: this._activeCount() };
+    }
+    if (market && this._marketHasPosition(market)) {
+      if (log) this.log(`[LIMIT] market ${market.marketSymbol || market.symbol || "?"} already has a tracked position — per-market slot busy`, "warn");
+      return { ok: false, code: "MARKET_BUSY", count: this._activeCount() };
+    }
+    return { ok: true, count };
+  }
+
+  /**
+   * Create a tracked record for a position and persist it.
+   * Confirmed opens also bump lastSide/sessionStats/hold — pending ones do not
+   * (only a receipt may count an open). Adopted records (`adopted:true`) never
+   * count toward the per-run trade cap (they were opened in an earlier run).
+   */
+  _trackOpenedPosition(fields, { pending = false, adopted = false } = {}) {
+    const rec = {
+      positionId: fields.positionId ?? null,
+      side: fields.side,
+      collateralToken: fields.collateralToken,
+      collateralAmount: String(fields.collateralAmount ?? ""),
+      paymentToken: fields.paymentToken || null,
+      leverage: fields.leverage ?? this.config.defaultLeverage,
+      openedAt: fields.openedAt ?? Date.now(),
+      txHash: fields.txHash || null,
+      marketSymbol: fields.marketSymbol || null,
+      managerAddr: fields.managerAddr || null,
+      poolAddr: fields.poolAddr || null,
+      closeRetry: null,
+      closeAttempts: 0,
+    };
+    if (pending) rec.pendingOpen = true;
+    if (adopted) rec.adoptedFromChain = true;
+    this._positions().push(rec);
+    if (!pending) {
+      // HOLD WINDOW: deferred close for THIS confirmed open (absolute ms —
+      // persisted, so a restart keeps the hold).
+      this._ensureHoldScheduled(rec);
+      if (!adopted) {
+        this.state.lastSide = rec.side;
+        this.state.sessionStats.opens++;
+        this._opensThisRun++;
+      }
+    }
+    saveState(this.state);
+    this._lastOpenedRecord = rec;
+    return rec;
   }
 
   /**
@@ -2714,6 +3142,10 @@ export class AutoTrader {
     const rotation = this.rotation;
     const excludeSymbols = opts.excludeSymbols || [];
     const preferSymbol = opts.preferSymbol !== undefined ? opts.preferSymbol : (this.config.preferredMarket ?? null);
+    // Per-pair allow-list: empty/missing = every discovered market is eligible.
+    const enabledList = Array.isArray(this.config.enabledMarkets)
+      ? this.config.enabledMarkets.map(s => String(s).toLowerCase())
+      : [];
 
     const candidates = discovered && discovered.length ? discovered : null;
     if (!candidates) {
@@ -2723,13 +3155,15 @@ export class AutoTrader {
       });
     }
 
-    const enabled = candidates.filter(m =>
-      (m.marketSymbol || m.symbol) &&
-      supportsSide(m, side) &&
-      !this._isDirectionDisabled(m.marketSymbol || m.symbol, side) &&
-      !excludeSymbols.includes(m.marketSymbol || m.symbol) &&
-      m.isActive !== false
-    );
+    const enabled = candidates.filter(m => {
+      const sym = m.marketSymbol || m.symbol;
+      if (!sym) return false;
+      if (enabledList.length && !enabledList.includes(String(sym).toLowerCase())) return false;
+      return supportsSide(m, side) &&
+        !this._isDirectionDisabled(sym, side) &&
+        !excludeSymbols.includes(sym) &&
+        m.isActive !== false;
+    });
     if (!enabled.length) return null;
 
     // Least-recently-used first (rotation), then preferred, then declaration order
@@ -2883,7 +3317,8 @@ export class AutoTrader {
       const m = this.resolveMarket(side);
       if (m?.managerAddr) return m.managerAddr;
     }
-    if (this.state?.activePosition?.managerAddr) return this.state.activePosition.managerAddr;
+    const primary = this._primaryPosition();
+    if (primary?.managerAddr) return primary.managerAddr;
     const forSide = this.resolveMarket(this.state?.lastSide || "SHORT") || this.resolveMarket("LONG");
     if (forSide?.managerAddr) return forSide.managerAddr;
     // Fallback: first discovered market's manager (never a hardcoded address)
@@ -2904,7 +3339,8 @@ export class AutoTrader {
       const m = this.resolveMarket(side);
       if (m?.poolAddr) return m.poolAddr;
     }
-    if (this.state?.activePosition?.poolAddr) return this.state.activePosition.poolAddr;
+    const primary = this._primaryPosition();
+    if (primary?.poolAddr) return primary.poolAddr;
     const forSide = this.resolveMarket(this.state?.lastSide || "SHORT") || this.resolveMarket("LONG");
     if (forSide?.poolAddr) return forSide.poolAddr;
     const first = this.markets.find(m => m.poolAddr) || Object.values(this.deps.confirmedPools || {}).find(p => p?.pool);
@@ -2944,79 +3380,86 @@ export class AutoTrader {
       // Log full token inventory
       await logInventory(provider, walletAddr, this.log.bind(this));
 
-      // Settle any OPEN tx that is still PENDING before anything is decided.
+      // Settle any OPEN txs that are still PENDING before anything is decided.
       // Only a receipt may turn a submitted open into a counted open.
-      await this._settlePendingOpen();
+      await this._settleAllPendingOpens();
 
       // NEXT ACTION prediction for TUI
-      if (this.state.activePosition) {
-        this.log(`[AUTO] NEXT ACTION: CLOSE position #${this.state.activePosition.positionId}`, "info");
+      const trackedNow = [...this._positions()];
+      if (trackedNow.length) {
+        this.log(`[AUTO] NEXT ACTION: CLOSE position(s) #${trackedNow.map(p => p.positionId ?? "?").join(", #")}`, "info");
       } else {
         this.log(`[AUTO] NEXT ACTION: SWAP + OPEN ${this.config.defaultLeverage}x`, "info");
       }
 
-      // PHASE 1: If active position → CLOSE (always via the position's OWN manager).
-      // closeActivePosition() owns the whole path: on-chain truth first (gone →
-      // clear, active → attempt, unreadable → backoff), manager taken from THIS
-      // position, retry backoff on an unchanged position.
+      // PHASE 1: EVERY tracked position gets its OWN close attempt (always via
+      // that position's OWN manager). closeActivePosition() owns the whole path
+      // per record: on-chain truth first (gone → clear, active → attempt,
+      // unreadable → backoff), manager taken from THAT position, retry backoff
+      // on an unchanged position.
       //
-      // A close that cannot happen right now (pool liquidity / preflight / backoff)
-      // is NOT fatal: the position is KEPT, the backoff stands and the cycle keeps
-      // running. Only an on-chain-proven close unlocks the OPEN phase.
+      // A close that cannot happen right now (pool liquidity / preflight /
+      // backoff / hold) is NOT fatal: that record is KEPT, its own backoff
+      // stands, and the loop continues with the NEXT position. One stuck
+      // position can never block closing (or opening) the others.
       //
-      // `closeOk` records what PHASE 1 concluded. A DRY RUN never clears
-      // `activePosition` (read-only), so PHASE 1.5b below uses this flag instead
-      // of `activePosition === null` to decide whether the OPEN phase may run.
-      let closeOk = false;
-      if (this.state.activePosition) {
-        this.setState(STATES.CLOSE);
-        const closeOutcome = (await this.closeActivePosition())
+      // `closesOk` counts verified closes this cycle; `dryWouldClose` counts
+      // dry-run "would close" outcomes (their records stay — planning only).
+      let closesOk = 0;
+      let dryWouldClose = 0;
+      for (const rec of trackedNow) {
+        if (!this._positions().includes(rec)) continue; // already cleared by a sibling
+        const closeOutcome = (await this.closeActivePosition(rec))
           || { ok: false, blocked: true, continueCycle: true, code: "NO_RESULT" };
-        closeOk = !!closeOutcome.ok;
-        if (closeOutcome.ok) {
-          this.setState(STATES.COOLDOWN);
-          this.log(`[COOLDOWN] ${this.config.cooldownAfterCloseMs / 1000}s...`, "info");
-          await this.sleep(this.config.cooldownAfterCloseMs);
-          this.lastCycleAction = "close";
-        } else {
-          this.lastCycleAction = "close-blocked";
-          this.log(`[CLOSE] ${closeOutcome.blocked ? "blocked" : "deferred"} (code=${closeOutcome.code || "?"}) — position KEPT, cycle continues`, "warn");
+        if (closeOutcome.ok && closeOutcome.dryRun) dryWouldClose++;
+        else if (closeOutcome.ok) closesOk++;
+        else {
+          this.log(`[CLOSE] #${rec.positionId ?? "?"} ${closeOutcome.blocked ? "blocked" : "deferred"} (code=${closeOutcome.code || "?"}) — position KEPT, other positions unaffected`, "warn");
         }
+      }
+      if (closesOk > 0) {
+        this.setState(STATES.COOLDOWN);
+        this.log(`[COOLDOWN] ${closesOk} position(s) closed — ${this.config.cooldownAfterCloseMs / 1000}s...`, "info");
+        await this.sleep(this.config.cooldownAfterCloseMs);
+        this.lastCycleAction = "close";
+      } else if (trackedNow.length) {
+        this.lastCycleAction = "close-blocked";
       }
 
       // PHASE 1.5 — SWAP MAINTENANCE. Runs after (or instead of) CLOSE and is
       // completely independent of it: a blocked/deferred close never stops the
-      // rotation, never parks the engine and never clears activePosition.
+      // rotation and never clears any record.
       this.setState(STATES.AUTO_SWAP);
       const swapAfterClose = await this.runSwapMaintenanceCycle({ phase: "PHASE-1.5" });
       this.log(`[CYCLE] swap maintenance (after CLOSE): attempted=${swapAfterClose.attempted} verified=${swapAfterClose.verified} skipped=${swapAfterClose.skipped} failed=${swapAfterClose.failed}`, "info");
 
-      // PHASE 1.5b — the tracked position is STILL active on-chain.
+      // PHASE 1.5b — OPEN gates. Multi-position: the OPEN phase runs whenever
+      // the global cap has room (per-market slots are checked per candidate in
+      // the loop below). A still-open position NEVER globally blocks OPEN —
+      // only maxOpenPositions, a pending open, or the trade cap can.
       //
-      // This bot tracks EXACTLY ONE position: opening a second one would overwrite
-      // (and later clear) the record of an active position, so the OPEN phase is
-      // skipped while a record is held. The swap engine already ran its own pass
-      // above, so liquidity trouble on CLOSE can never stall swaps — the cycle
-      // ends cleanly instead of being cut short.
-      //
-      // DRY-RUN EXCEPTION: the record is held only because dry-CLOSE is
-      // read-only. `closeOk` says the close would have succeeded, so the full
-      // PHASE 2/3 plan still runs — without a single state write.
-      const heldByDryRun = dryRun && closeOk;
-      if (this.state.activePosition && !heldByDryRun) {
-        const held = this.state.activePosition;
-        this.log(`[CYCLE] position #${held.positionId} still active — OPEN skipped (single-position bookkeeping); SWAP engine continued independently`, "warn");
+      // DRY-RUN EXCEPTION: dry closes are read-only, so their records stay in
+      // the array; `dryWouldClose` lets the planner treat those slots as free
+      // for the plan-only PHASE 2/3 (no state is written either way).
+      const gate = this._canOpenNew({
+        effectiveCount: dryRun ? this._activeCount() - dryWouldClose : null,
+      });
+      if (!gate.ok) {
+        if (gate.code === "TRADE_CAP") {
+          this.log(`[LIMIT] maxTradesPerRun=${Number(this.config.maxTradesPerRun || 0)} reached (opens this run=${this._opensThisRun}) — OPEN phase skipped for this run`, "warn");
+          this.lastCycleAction = "idle";
+          this.log("[CYCLE] ═══ CYCLE END ═══", "info");
+          return;
+        }
+        this.log(`[CYCLE] OPEN skipped (code=${gate.code}) — SWAP engine continues independently`, "warn");
         this.log("[CYCLE] ═══ CYCLE END ═══", "info");
         return;
       }
-      if (this.state.activePosition && heldByDryRun) {
-        this.log(`[DRY] position #${this.state.activePosition.positionId} record kept (read-only dry-run) — continuing to the OPEN phase`, "info");
-      }
 
-      // PHASE 2: SELECT DIRECTION + MARKET — RSI may bias side, rotation picks MARKET×SIDE
+      // PHASE 2: SELECT DIRECTION + MARKET — the configured ratio decides SIDE
+      // (an RSI signal may bias it; a disabled side is NEVER picked), rotation
+      // keeps planning the MARKET×SIDE candidate for market selection.
       this.setState(STATES.SIGNAL);
-      const lastSide = this.state.lastSide || null;
-      let side = null;
       let preferredSideFromSignal = null;
 
       // Try RSI first
@@ -3031,16 +3474,15 @@ export class AutoTrader {
         }
       } catch {}
 
-      // Rotation-backed side selection: RSI may bias; otherwise use rotated MARKET×SIDE
       const planned = await this.nextMarketSide();
-      if (preferredSideFromSignal) {
-        side = preferredSideFromSignal;
-      } else if (planned) {
-        side = planned.side;
-      } else {
-        side = lastSide === "LONG" ? "SHORT" : "LONG";
+      const side = this._pickOpenSide(preferredSideFromSignal, planned?.side || null);
+      if (!side) {
+        this.log(`[BLOCKED] no side enabled (enableLong/enableShort both false) — OPEN phase skipped`, "error");
+        this.lastCycleAction = "idle";
+        this.log("[CYCLE] ═══ CYCLE END ═══", "info");
+        return;
       }
-      this.log(`[DIRECTION] ${side}${planned ? ` (rotated candidate: ${planned.marketSymbol || planned.symbol}×${planned.side})` : ""}`, "warn");
+      this.log(`[DIRECTION] ${side}${planned ? ` (rotated candidate: ${planned.marketSymbol || planned.symbol}×${planned.side})` : ""}${preferredSideFromSignal ? ` (RSI bias: ${preferredSideFromSignal})` : ""}`, "warn");
 
       // PHASE 3: plan market candidates for the chosen side (rotation-aware)
       this.setState(STATES.PREPARE_COLLATERAL);
@@ -3078,6 +3520,15 @@ export class AutoTrader {
         const inv = await this._assertCandidateInvariants(candidate, ctx, side, provider);
         if (!inv.ok) {
           this.log(`[SKIP] ${candidate.symbol} ${side}: invariant failed — ${inv.reason} — trying next candidate`, "warn");
+          this._rotMarketSkip(candidate.symbol, side);
+          continue;
+        }
+
+        // PER-MARKET SLOT — another tracked position (active or pending) already
+        // occupies this market. One position per market is a MARKET limit, never
+        // a global one: other markets stay fully tradable.
+        if (this._marketHasPosition(candidate)) {
+          this.log(`[SKIP] ${candidate.symbol} ${side}: market already has a tracked position — trying next candidate`, "warn");
           this._rotMarketSkip(candidate.symbol, side);
           continue;
         }
@@ -3146,7 +3597,7 @@ export class AutoTrader {
         // SUBMITTED/PENDING is NOT an open. The record is kept (so the cycle can
         // never double-open) but sessionStats.opens is NOT incremented and no
         // success is reported until a receipt proves the position exists.
-        this.state.activePosition = {
+        this._trackOpenedPosition({
           positionId: openResult.positionId ?? null,
           side,
           collateralToken: ctxUsed?.collateralToken || marketUsed.collateralToken,
@@ -3158,8 +3609,7 @@ export class AutoTrader {
           marketSymbol: marketUsed.symbol,
           managerAddr: marketUsed.managerAddr,
           poolAddr: marketUsed.poolAddr,
-          pendingOpen: true,
-        };
+        }, { pending: true });
         saveState(this.state);
 
         this.setState(STATES.MONITOR);
@@ -3170,7 +3620,7 @@ export class AutoTrader {
       } else if (openResult) {
         this._recordDirectionSuccess(marketUsed.symbol, side);
         this._rotMarketDone(marketUsed.symbol, side);
-        this.state.activePosition = {
+        const rec = this._trackOpenedPosition({
           positionId: openResult.positionId,
           side,
           // All of these come from the SAME candidate that actually opened
@@ -3183,13 +3633,10 @@ export class AutoTrader {
           marketSymbol: marketUsed.symbol,
           managerAddr: marketUsed.managerAddr,
           poolAddr: marketUsed.poolAddr,
-        };
-        this.state.lastSide = side;
-        this.state.sessionStats.opens++;
-        saveState(this.state);
+        });
 
         this.setState(STATES.MONITOR);
-        this.log(`[MONITOR] position #${openResult.positionId} (${side} ${marketUsed.symbol})`, "success");
+        this.log(`[MONITOR] position #${rec.positionId} (${rec.side} ${marketUsed.symbol}) — ${this._activeCount()} position(s) tracked`, "success");
 
         this.log(`[COOLDOWN] ${this.config.cooldownAfterOpenMs / 1000}s...`, "info");
         await this.sleep(this.config.cooldownAfterOpenMs);
@@ -3269,7 +3716,15 @@ export class AutoTrader {
     }
   }
 
-  async start() {
+  /**
+   * CONTINUOUS RUNNER.
+   *
+   * @param {object} [opts]
+   * @param {number|null} [opts.maxCycles] stop after N loop iterations
+   *        (undefined/0/NaN/≤0 → unlimited). Counter is `this._cycleNo`, the
+   *        same one that prints `[CYCLE] #N`.
+   */
+  async start(opts = {}) {
     if (this.running) { this.log("[AUTO] Already running.", "warn"); return; }
     // ONE swap scheduler per bot instance — never start the maintenance loop
     // while a standalone runSwapLoop() already owns the swap cadence.
@@ -3277,6 +3732,8 @@ export class AutoTrader {
       this.log("[BLOCKED] runSwapLoop() is already running — not starting a second swap engine", "warn");
       return;
     }
+    const maxCyclesRaw = Number(opts.maxCycles);
+    const maxCycles = Number.isFinite(maxCyclesRaw) && maxCyclesRaw > 0 ? Math.floor(maxCyclesRaw) : null;
     this.running = true;
     this.stopRequested = false;
 
@@ -3285,78 +3742,23 @@ export class AutoTrader {
       this.log("  CONTINUOUS AUTO TRADING STARTED", "warn");
       this.log(`  Leverage: ${this.config.defaultLeverage}x`, "info");
       this.log(`  Dry run: ${this.config.dryRun}`, "info");
+      if (maxCycles !== null) this.log(`  Max cycles: ${maxCycles}`, "info");
       this.log("══════════════════════════════════════════════", "warn");
 
       // ── boot banner — config-driven, needs no CLI flags (`npm start` only) ──
       this._logSwapBoot();
 
-      // Recovery — scan EVERY discovered manager (all active markets)
+      // Recovery — reconcile EVERY local record with the chain and adopt EVERY
+      // on-chain position of this wallet (all managers, not just one slot).
       try {
         this.log("[RECOVERY] scanning on-chain...", "info");
-        const { provider } = this.getRuntime();
-        const walletAddr = this.deps.accounts[this.deps.selectedWalletIndex].address;
         await this.ensureMarkets({ force: true });
-        const discoveredMgrs = this.markets.map(m => m.managerAddr).filter(Boolean);
-        const managers = [...new Set([
-          ...discoveredMgrs,
-          this.state.activePosition?.managerAddr,
-          ...Object.values(this.deps.confirmedPools || {}).map(p => p?.manager),
-        ].filter(Boolean))];
-        this.log(`[RECOVERY] ${managers.length} manager(s) to scan`, "info");
-        let recovered = null;
-        for (const mgr of managers) {
-          recovered = await recoverPosition(provider, walletAddr, mgr, this.log.bind(this));
-          if (recovered) {
-            recovered.managerAddr = mgr;
-            const mk = this.markets.find(m => m.managerAddr?.toLowerCase() === mgr.toLowerCase());
-            if (mk) {
-              recovered.marketSymbol = mk.marketSymbol || mk.symbol;
-              recovered.poolAddr = mk.poolAddr;
-              recovered.paymentToken = mk.paymentToken || paymentTokenForMarket(mk);
-            } else {
-              const sym = Object.entries(this.deps.confirmedPools || {})
-                .find(([, p]) => p?.manager?.toLowerCase() === mgr.toLowerCase())?.[0];
-              if (sym) {
-                recovered.marketSymbol = sym;
-                recovered.poolAddr = this.deps.confirmedPools?.[sym]?.pool;
-                recovered.paymentToken = this.deps.confirmedPools?.[sym]?.paymentToken || null;
-              }
-            }
-            break;
-          }
-        }
-        if (recovered) {
-          this.log(`[RECOVERED] position #${recovered.positionId} side=${recovered.side} market=${recovered.marketSymbol || "?"}`, "warn");
-          if (this._isDry()) {
-            this.log(`[DRY] would adopt recovered position #${recovered.positionId} — state untouched`, "info");
-          } else {
-            this.state.activePosition = recovered;
-            this.state.sessionStats.opens++;
-            saveState(this.state);
-          }
-        } else if (this.state.activePosition) {
-          // The recovery scan above only proves "no manager reported an active
-          // position for this wallet"; it never proves THIS stored one is gone.
-          // Verify the stored record itself — a failed read must never clear it.
-          const found = await this._locateStoredPosition();
-          if (found.status === "closed" || found.status === "missing" || found.status === "no-id") {
-            this.log(`[RECOVERY] stored position #${this.state.activePosition.positionId} is gone on-chain — clearing`, "warn");
-            this._clearActivePosition("recovery: gone on-chain", false);
-          } else if (found.status === "active") {
-            if (found.located && found.managerAddr && !this.state.activePosition.managerAddr && !this._isDry()) {
-              this.state.activePosition.managerAddr = found.managerAddr;
-              const mk = (Array.isArray(this.markets) ? this.markets : [])
-                .find(m => String(m.managerAddr || "").toLowerCase() === String(found.managerAddr).toLowerCase());
-              if (mk) {
-                if (!this.state.activePosition.poolAddr) this.state.activePosition.poolAddr = mk.poolAddr;
-                if (!this.state.activePosition.marketSymbol) this.state.activePosition.marketSymbol = mk.marketSymbol || mk.symbol;
-              }
-              saveState(this.state);
-            }
-            this.log(`[RECOVERY] stored position #${this.state.activePosition.positionId} still ACTIVE on-chain (manager=${short(found.managerAddr)}) — keeping state`, "warn");
-          } else {
-            this.log(`[RECOVERY] stored position #${this.state.activePosition.positionId} unreadable on-chain — keeping state (never clear on a failed read)`, "warn");
-          }
+        await this._syncAllPositions();
+        const tracked = this._positions();
+        if (tracked.length) {
+          this.log(`[RECOVERY] tracking ${tracked.length} position(s): #${tracked.map(p => p.positionId ?? "?").join(", #")} — each closes independently on its own manager`, "warn");
+        } else {
+          this.log("[RECOVERY] no active positions tracked", "info");
         }
       } catch (re) {
         this.log(`[RECOVERY] failed: ${re.message?.slice(0, 60)}`, "error");
@@ -3366,23 +3768,26 @@ export class AutoTrader {
       // above by the RECOVERY pass) — informational only, sends nothing.
       await this._logSwapRoutes();
 
-      // CONTINUOUS RUNNER — never stops
-      while (!this.stopRequested) {
+      // CONTINUOUS RUNNER — never stops on its own; `maxCycles` (when given)
+      // bounds the number of iterations via the shared `this._cycleNo` counter.
+      while (!this.stopRequested && (maxCycles === null || this._cycleNo < maxCycles)) {
         try {
           // Cycle marker — the log then follows PHASE 1 → 1.5 → 2 → 3.
           this.log(`[CYCLE] #${++this._cycleNo}`, "warn");
 
-          // STEP 1: CLOSE (only when a position record is held). A blocked close
-          // logs and keeps the record — it never returns out of the loop, so the
-          // swap rotation below always gets its turn.
-          if (this.state.activePosition && !this.stopRequested) {
-            this.log(`[AUTO] NEXT ACTION: CLOSE position #${this.state.activePosition.positionId}`, "info");
-            const closeOutcome = await this.closeActivePosition();
-            if (closeOutcome && !closeOutcome.ok) {
-              this.log(`[CLOSE] ${closeOutcome.blocked ? "blocked" : "deferred"} (code=${closeOutcome.code || "?"}) — position kept; swap engine continues`, "warn");
-              if (closeOutcome.blocked) {
-                this.log(`[CLOSE BLOCKED] position=${this.state.activePosition?.positionId ?? "?"} code=${closeOutcome.code || "?"}`, "warn");
-                this.log(`[SWAP] continuing maintenance`, "warn");
+          // STEP 1: CLOSE — every tracked position gets its OWN attempt. A
+          // blocked close logs and keeps THAT record — it never returns out of
+          // the loop, so sibling positions and the swap rotation always get
+          // their turn.
+          const loopPositions = [...this._positions()];
+          if (loopPositions.length && !this.stopRequested) {
+            this.log(`[AUTO] NEXT ACTION: CLOSE position(s) #${loopPositions.map(p => p.positionId ?? "?").join(", #")}`, "info");
+            for (const rec of loopPositions) {
+              if (!this._positions().includes(rec)) continue;
+              if (this.stopRequested) break;
+              const closeOutcome = await this.closeActivePosition(rec);
+              if (closeOutcome && !closeOutcome.ok) {
+                this.log(`[CLOSE] #${rec.positionId ?? "?"} ${closeOutcome.blocked ? "blocked" : "deferred"} (code=${closeOutcome.code || "?"}) — position kept; other positions and swap engine continue`, "warn");
               }
             }
           }
@@ -3394,13 +3799,31 @@ export class AutoTrader {
             await this.runSwapMaintenanceCycle({ phase: "LOOP" });
           }
 
-          // STEP 3: OPEN position if none active — rotation picks MARKET×SIDE
-          if (!this.state.activePosition && !this.stopRequested) {
-            const planned = await this.nextMarketSide();
-            const side = planned?.side || this.nextSide();
-            this.log(`[AUTO] NEXT ACTION: OPEN ${side}${planned ? ` on ${planned.marketSymbol || planned.symbol}` : ""}`, "info");
-            this.setState(STATES.OPEN);
-            await this.prepareAndOpen(side);
+          // STEP 3: OPEN — allowed whenever the global cap has room (per-market
+          // slots are checked per candidate inside prepareAndOpen). A stuck
+          // position on one market never blocks OPEN on the others.
+          if (!this.stopRequested) {
+            const gate = this._canOpenNew();
+            if (!gate.ok) {
+              if (gate.code === "TRADE_CAP" && this._activeCount() === 0) {
+                // Cap reached with NO open position → stop the run cleanly. A
+                // position still open is never abandoned (STEP 1 keeps closing it).
+                this.log(`[LIMIT] maxTradesPerRun=${Number(this.config.maxTradesPerRun || 0)} reached (opens this run=${this._opensThisRun}) and no position is open — stopping the run`, "warn");
+                this.stopRequested = true;
+              } else {
+                this.log(`[LIMIT] OPEN skipped (code=${gate.code}, tracked=${this._activeCount()}/${Math.max(1, Number(this.config.maxOpenPositions) || 1)}) — waiting for a free slot`, "warn");
+              }
+            } else {
+              const planned = await this.nextMarketSide();
+              const side = this._pickOpenSide(null, planned?.side || null);
+              if (!side) {
+                this.log(`[BLOCKED] no side enabled (enableLong/enableShort both false) — OPEN skipped`, "error");
+              } else {
+                this.log(`[AUTO] NEXT ACTION: OPEN ${side}${planned ? ` on ${planned.marketSymbol || planned.symbol}` : ""} (${this._activeCount()}/${Math.max(1, Number(this.config.maxOpenPositions) || 1)} slots used)`, "info");
+                this.setState(STATES.OPEN);
+                await this.prepareAndOpen(side);
+              }
+            }
           }
 
           // STEP 4: SWAP MAINTENANCE continues regardless of the OPEN outcome
@@ -3806,6 +4229,7 @@ export class AutoTrader {
     const summary = {
       attempted: 0, verified: 0, skipped: 0, failed: 0,
       waiting: 0, blocked: null, total: 0, eligible: 0, results: [],
+      skippedByReason: {}, pendingByState: {}, executable: [],
     };
     const force = options.force === true;
     const phase = options.phase ? `${options.phase} ` : "";
@@ -3871,6 +4295,36 @@ export class AutoTrader {
     summary.failed = res.failed;
     summary.results = res.results;
 
+    // Structured diagnostics: per-reasonCode counts + per-state counts + the
+    // concrete list of directions that are actually executable (dry or live).
+    // Directions the queue never reached (maxSwapsPerCycle=1 → early break)
+    // stay READY — they are re-evaluated on the next pass.
+    summary.skippedByReason = {};
+    summary.pendingByState = {};
+    summary.executable = [];
+    for (const r of res.results) {
+      const code = r?.code || "UNKNOWN";
+      if (r?.status === "skip" || r?.status === "fail") {
+        summary.skippedByReason[code] = (summary.skippedByReason[code] || 0) + 1;
+      }
+      const st = r?.state || (r?.status === "ok" ? SWAP_DIRECTION_STATES.CONFIRMED
+        : r?.status === "dry" ? SWAP_DIRECTION_STATES.EXECUTABLE : SWAP_DIRECTION_STATES.READY);
+      summary.pendingByState[st] = (summary.pendingByState[st] || 0) + 1;
+      if (st === SWAP_DIRECTION_STATES.EXECUTABLE || st === SWAP_DIRECTION_STATES.CONFIRMED) {
+        summary.executable.push(r?.direction || `${r?.from || "?"}->${r?.to || "?"}`);
+      }
+    }
+    const unevaluated = Math.max(0, summary.total - res.results.length);
+    if (unevaluated > 0) {
+      summary.pendingByState[SWAP_DIRECTION_STATES.READY] = (summary.pendingByState[SWAP_DIRECTION_STATES.READY] || 0) + unevaluated;
+    }
+    if (res.results.length) {
+      this.log(
+        `[SWAP DIAG] ${phase}summary attempted=${summary.attempted} confirmed=${summary.verified} ` +
+        `skipped=${summary.skipped} failed=${summary.failed} skippedByReason=${JSON.stringify(summary.skippedByReason)} ` +
+        `states=${JSON.stringify(summary.pendingByState)} executable=${summary.executable.join(",") || "(none)"}`, "warn");
+    }
+
     if (summary.verified > 0) {
       this._lastSwapCycleAt = Date.now();
       this._syncRotation();
@@ -3894,14 +4348,28 @@ export class AutoTrader {
     const direction = `${dir.from}->${dir.to}`;
     const tag = phase ? `${phase} ` : "";
 
-    const skip = (code, reason, rotate = true) => {
-      this.log(`[SWAP SKIP] direction=${direction} code=${code} reason=${reason}`, "warn");
+    // Every skip/fail carries { state, recoverable, recommendedAction } — no
+    // anonymous SKIPs. WAITING_* directions re-enter the queue next pass and
+    // only re-check their precondition (balance/allowance/quote — cheap);
+    // FAILED routes hit the per-route backoff.
+    const skip = (code, reason, extra = {}, rotate = true) => {
+      const m = swapReasonMeta(code);
+      const state = extra.state || m.state;
+      const recoverable = extra.recoverable ?? m.recoverable;
+      const recommendedAction = extra.recommendedAction || m.recommendedAction;
+      this.log(`[SWAP SKIP] direction=${direction} code=${code} state=${state} reason=${reason}`, "warn");
+      this.log(`[SWAP DIAG] direction=${direction} state=${state} reasonCode=${code} recoverable=${recoverable} action=${recommendedAction}`, "info");
       if (rotate) this._rotSwapSkip(dir.from, dir.to);
-      return { status: "skip", code, reason };
+      return { status: "skip", code, reason, state, recoverable, recommendedAction, direction };
     };
-    const fail = (code, reason) => {
-      this.log(`[SWAP SKIP] direction=${direction} code=${code} reason=${reason}`, "error");
-      return { status: "fail", code, reason };
+    const fail = (code, reason, extra = {}) => {
+      const m = swapReasonMeta(code);
+      const state = extra.state || m.state || SWAP_DIRECTION_STATES.FAILED;
+      const recoverable = extra.recoverable ?? m.recoverable;
+      const recommendedAction = extra.recommendedAction || m.recommendedAction;
+      this.log(`[SWAP SKIP] direction=${direction} code=${code} state=${state} reason=${reason}`, "error");
+      this.log(`[SWAP DIAG] direction=${direction} state=${state} reasonCode=${code} recoverable=${recoverable} action=${recommendedAction}`, "info");
+      return { status: "fail", code, reason, state, recoverable, recommendedAction, direction };
     };
 
     // Token decimals always come from the chain — a 6-decimal token must never
@@ -3946,6 +4414,14 @@ export class AutoTrader {
       }
     }
 
+    // Smallest raw amount still worth swapping for the SOURCE token — the
+    // shrink-and-retry floor (never chase an economic gate below dust).
+    const minSwapRawFor = () => {
+      const s = cfg["minSwapAmount" + dir.from];
+      if (s === undefined || s === null || s === "") return 0n;
+      try { return ethers.parseUnits(String(s), fromDec); } catch { return 0n; }
+    };
+
     // ETH GAS RESERVE — a GLOBAL precondition, checked once the route has a
     // concrete size but BEFORE any quote/economic work. If the wallet cannot
     // pay for gas there is no point spending RPC on reserves or quotes, and the
@@ -3964,62 +4440,128 @@ export class AutoTrader {
     if (cfg.maxGasGwei > 0) {
       const gwei = gasGweiFrom(await provider.getFeeData().catch(() => null));
       if (gwei !== null && gwei > cfg.maxGasGwei) {
-        this.log(`[SWAP SKIP] direction=${direction} code=GAS_TOO_HIGH reason=network gas ${gwei.toFixed(2)} gwei > maxGasGwei ${cfg.maxGasGwei}`, "warn");
-        return { status: "stop", code: "GAS_TOO_HIGH", reason: `gas ${gwei.toFixed(2)} gwei > ${cfg.maxGasGwei}` };
+        this.log(`[SWAP SKIP] direction=${direction} code=GAS_TOO_HIGH state=FAILED reason=network gas ${gwei.toFixed(2)} gwei > maxGasGwei ${cfg.maxGasGwei}`, "warn");
+        this.log(`[SWAP DIAG] direction=${direction} state=FAILED reasonCode=GAS_TOO_HIGH recoverable=true action=network gas above the ceiling — wait`, "info");
+        return { status: "stop", code: "GAS_TOO_HIGH", direction, reason: `gas ${gwei.toFixed(2)} gwei > ${cfg.maxGasGwei}`, state: SWAP_DIRECTION_STATES.FAILED, recoverable: true, recommendedAction: "network gas above the ceiling — wait" };
       }
     }
 
     // 3. fresh quote for THIS size (never reuse a stale one)
-    const best = await quoteBestPath({
+    const quoteAt = (amt) => quoteBestPath({
       provider, routerAddress: getRouterAddress(), routes: this.routes,
-      fromAddr: dir.fromAddr, toAddr: dir.toAddr, amountIn: amountRaw,
+      fromAddr: dir.fromAddr, toAddr: dir.toAddr, amountIn: amt,
       log: this.log.bind(this),
     });
+    let best = await quoteAt(amountRaw);
     if (!best) return skip("ROUTE_UNAVAILABLE", "no validated path quotes a non-zero output at this size");
     if (!(best.amountOut > 0n)) return skip("QUOTE_ZERO", "router returned amountOut=0");
 
     // 5. amountOutMin from the configured slippage — never 0, never hardcoded
-    const amountOutMin = applySlippage(best.amountOut, slippageBps);
+    let amountOutMin = applySlippage(best.amountOut, slippageBps);
     if (!(amountOutMin > 0n)) return skip("ZERO_AMOUNT_OUT_MIN", `amountOutMin collapsed to 0 at slippageBps=${cfg.slippageBps}`);
 
     // 5a. ECONOMIC GATES — a quotable route is not automatically a sane route.
     // Every leg is re-priced against the pool's OWN reserves and fee (1% per leg,
     // so a 2-hop pays it twice) and vetoed when the swap would move the pool by
     // more than maxPoolShareBps / maxPriceImpactBps. Thresholds are configurable
-    // and are NEVER loosened automatically; a rejected route is skipped and the
-    // rest of the rotation keeps running. Read-only: eth_call/getReserves only.
+    // and are NEVER loosened automatically. When the failure is size-driven
+    // (POOL_SHARE_HIGH / PRICE_IMPACT_HIGH) the input is SHRUNK — pool-share cap
+    // first, then halvings — and re-quoted through the router each time. Read-only.
     const economyCfg = normalizeEconomyConfig(cfg.swapEconomy);
-    const econ = await probeRouteEconomics({
+    let econ = await probeRouteEconomics({
       provider, factoryAddress: getFactoryAddress(), path: best.path,
       amountIn: amountRaw, amountOut: best.amountOut, amountOutMin,
       economy: economyCfg, log: this.log.bind(this),
     });
-    if (!econ.ok) return skip("ECONOMY_REJECTED", `gates=${econ.gates.join(",")}`);
-
-    // 5a-bis. Cross-direction rate consistency. The reverse direction of this
-    // pair is priced by the SAME reserves, so the product of the two implied
-    // rates must sit near (1−fee)^(2×legs). A product of 148× or 3.15e5× means
-    // the pools contradict each other — do not trade that pair in either
-    // direction. Only checked for direct (single-leg) pairs where both
-    // directions are quoted in this pass.
-    if (best.path.length === 2) {
-      const rev = await quoteBestPath({
-        provider, routerAddress: getRouterAddress(), routes: this.routes,
-        fromAddr: dir.toAddr, toAddr: dir.fromAddr, amountIn: amountRaw,
-        log: () => {},
-      });
-      if (rev && rev.amountOut > 0n) {
-        const decInH = Number(ethers.formatUnits(amountRaw, fromDec));
-        const rateAB = Number(ethers.formatUnits(best.amountOut, toDec)) / decInH;
-        const rateBA = Number(ethers.formatUnits(rev.amountOut, fromDec)) / Number(ethers.formatUnits(amountRaw, toDec));
-        const feeFrac = (econ.legs?.[0]?.swapFeeBps ?? 100) / Number(BPS);
-        const rc = checkRateConsistency({
-          rateAB, rateBA, legs: 1, feeFrac,
-          maxDeviation: economyCfg.maxRateDeviation,
-        });
-        if (!rc.ok) {
-          return skip("ECONOMY_REJECTED", `RATE_DEVIATION product=${rc.product.toExponential(3)} expected=${rc.expected.toFixed(6)} deviation=${rc.deviation.toExponential(3)}× (pools contradict each other)`);
+    let finalAmountRaw = amountRaw;
+    let shrunk = null;
+    if (!econ.ok) {
+      const sizeGates = (econ.gates || []).filter(g => g === "POOL_SHARE_HIGH" || g === "PRICE_IMPACT_HIGH");
+      if (sizeGates.length && !pinned) {
+        const minRaw = minSwapRawFor() > 0n ? minSwapRawFor() : 1n;
+        let start = finalAmountRaw;
+        const caps = (econ.legs || [])
+          .filter(l => l.reserveIn != null)
+          .map(l => poolShareCapAmountIn({ reserveIn: l.reserveIn, maxPoolShareBps: economyCfg.maxPoolShareBps }))
+          .filter(c => c > 0n);
+        if (caps.length) {
+          const cap = caps.reduce((a, b) => (b < a ? b : a));
+          if (cap > 0n && cap < start) start = cap;
         }
+        let lastQuote = null;
+        const probe = async (amt) => {
+          const q = await quoteAt(amt);
+          if (!q || !(q.amountOut > 0n)) { lastQuote = null; return { ok: false, gates: ["QUOTE_ZERO"] }; }
+          const aom = applySlippage(q.amountOut, slippageBps);
+          lastQuote = q;
+          if (!(aom > 0n)) return { ok: false, gates: ["ZERO_AMOUNT_OUT_MIN"] };
+          return probeRouteEconomics({
+            provider, factoryAddress: getFactoryAddress(), path: q.path,
+            amountIn: amt, amountOut: q.amountOut, amountOutMin: aom,
+            economy: economyCfg, log: () => {},
+          });
+        };
+        const shr = await shrinkToFitEconomy({ amountIn: start, minAmountIn: minRaw, maxHalvings: 4, probe });
+        if (shr.ok && lastQuote) {
+          shrunk = { from: String(finalAmountRaw), to: String(shr.amountIn), halvings: shr.halvings };
+          finalAmountRaw = shr.amountIn;
+          best = lastQuote;
+          amountOutMin = applySlippage(best.amountOut, slippageBps);
+          econ = shr.probe;
+          this.log(
+            `[SWAP] shrink-and-retry ${direction}: amountIn ${ethers.formatUnits(BigInt(shrunk.from), fromDec)} → ` +
+            `${ethers.formatUnits(finalAmountRaw, fromDec)} (${shr.halvings} halving(s); previous gates=${sizeGates.join(",")}; thresholds unchanged)`, "warn");
+        } else {
+          return skip("WAITING_FOR_PRICE",
+            `economy gates ${econ.gates.join(",")} not fixed by shrinking to the min ${ethers.formatUnits(minRaw, fromDec)} (${shr.reason}) — deferred until the book deepens (thresholds unchanged)`);
+        }
+      } else {
+        // Non-size gates (ZERO_RESERVE / RESERVE_UNREADABLE / ZERO_QUOTE …)
+        // map to liquidity; everything else waits for a better book.
+        const liqGates = (econ.gates || []).some(g => g === "ZERO_RESERVE" || g === "RESERVE_UNREADABLE" || g === "ZERO_QUOTE");
+        return skip("ECONOMY_REJECTED", `gates=${econ.gates.join(",")}`,
+          liqGates ? { state: SWAP_DIRECTION_STATES.WAITING_FOR_LIQUIDITY } : {});
+      }
+    }
+
+    // 5a-bis. SYMMETRIC ROUND-TRIP rate check (direct pairs only).
+    // Forward quote gives us Y for X. We then ask the SAME reversed path what
+    // it pays for exactly Y — the amount the pool just handed us. For an
+    // honest CPMM the product rateAB×rateBA sits at (1−fee)^2 no matter how
+    // unbalanced the book is; the old check re-quoted a DIFFERENT size on a
+    // possibly DIFFERENT route and false-positived on thin books.
+    if (best.path.length === 2) {
+      let rtOut = null;
+      let rtRevert = null;
+      try {
+        const routerForRt = new ethers.Contract(getRouterAddress(), ROUTER_ABI, provider);
+        const amounts = await routerForRt.getAmountsOut(best.amountOut, [best.path[1], best.path[0]]);
+        rtOut = BigInt(amounts[amounts.length - 1]);
+      } catch (e) {
+        rtRevert = String(e?.shortMessage || e?.message || e).slice(0, 100);
+      }
+      if (rtRevert || !(rtOut > 0n)) {
+        return skip("RATE_DEVIATION_UNVERIFIED",
+          `symmetric round-trip quote unavailable (path ${best.path[1]}→${best.path[0]} amountIn=${ethers.formatUnits(best.amountOut, toDec)}): ${rtRevert || "amountOut=0"} — swap BLOCKED until a consistent reverse quote exists`);
+      }
+      const fwdH = Number(ethers.formatUnits(finalAmountRaw, fromDec));
+      const midH = Number(ethers.formatUnits(best.amountOut, toDec));
+      const rateAB = midH / fwdH;
+      const rateBA = Number(ethers.formatUnits(rtOut, fromDec)) / midH;
+      const feeFrac = (econ.legs?.[0]?.swapFeeBps ?? 100) / Number(BPS);
+      const rc = checkRateConsistency({
+        rateAB, rateBA, legs: 1, feeFrac,
+        maxDeviation: economyCfg.maxRateDeviation,
+      });
+      const fmt = (x) => (Number.isFinite(x) ? x.toExponential(4) : String(x));
+      this.log(
+        `[SWAP RATE] direction=${direction} path=${best.path.join("→")} roundTripOut=${ethers.formatUnits(rtOut, fromDec)} ` +
+        `amountIn=${fwdH} forwardOut=${midH} rateAB=${fmt(rateAB)} rateBA=${fmt(rateBA)} ` +
+        `product=${fmt(rc.product)} expected=${rc.expected} deviation=${fmt(rc.deviation)} ` +
+        `maxDeviation=${economyCfg.maxRateDeviation} feeBps=${econ.legs?.[0]?.swapFeeBps ?? 100}`, "info");
+      if (!rc.ok) {
+        return skip("RATE_DEVIATION",
+          `round-trip product=${fmt(rc.product)} expected=${rc.expected.toFixed(6)} deviation=${fmt(rc.deviation)}× > max ${economyCfg.maxRateDeviation} — pools quote inconsistently, swap BLOCKED`);
       }
     }
 
@@ -4028,23 +4570,91 @@ export class AutoTrader {
       && r.path.every((a, i) => String(a).toLowerCase() === String(best.path[i]).toLowerCase()));
     const pool = rec?.pool || rec?.pool2 || "-";
 
-    // 5b. read-only preflight — nothing is signed before this eth_call succeeds
+    // 5b. ALLOWANCE — approve-FIRST for the automatic maintenance mode. The
+    // router preflight below reverts TransferHelper: TRANSFER_FROM_FAILED when
+    // the v5 Router allowance is missing, so this check MUST run before the
+    // eth_call — otherwise every un-approved direction died behind a generic
+    // PREFLIGHT_REVERT and the approve branch was never reached. Approve is
+    // MaxUint256 (once per token per router), AWAITED, and allowance is then
+    // RE-READ: the swap is only sent once the chain itself agrees the
+    // allowance covers the amount. No second approve while one still suffices.
+    const fromRead = new ethers.Contract(dir.fromAddr, ERC20_ABI, provider);
+    let allowanceNow = await fromRead.allowance(walletAddr, routerAddr).catch(() => null);
+    let approveTxHash = null;
+    const allowApprove = pinned ? pinned.allowApprove !== false : true;
+    if (allowanceNow === null) {
+      return fail("PREFLIGHT_REVERT", "allowance() view reverted — RPC/token issue");
+    }
+    if (allowanceNow < finalAmountRaw) {
+      if (!allowApprove) {
+        return skip("APPROVAL_REQUIRED",
+          `allowance ${ethers.formatUnits(allowanceNow, fromDec)} < needed ${ethers.formatUnits(finalAmountRaw, fromDec)} (allowApprove=false)`);
+      }
+      if (dryRun) {
+        return skip("WAITING_FOR_ALLOWANCE",
+          `allowance ${ethers.formatUnits(allowanceNow, fromDec)} < needed ${ethers.formatUnits(finalAmountRaw, fromDec)} — live mode would approve the v5 Router once, re-check allowance, then swap`);
+      }
+      this.log(`[SWAP] approve required ${dir.from}: allowance ${ethers.formatUnits(allowanceNow, fromDec)} < needed ${ethers.formatUnits(finalAmountRaw, fromDec)} — approving v5 Router ${routerAddr} once`, "warn");
+      const fromSigner = new ethers.Contract(dir.fromAddr, ERC20_ABI, wallet);
+      // GAS: this deployment's DAI/LINK/UNI/WETH/USDC approve needs ~129k gas
+      // (cold proxy storage), so a hardcoded 100k limit OOGs — measured on-chain,
+      // 30 reverted SWAP-APPROVE txs burned real gas before this fix. Estimate
+      // per token (+25%); if estimation itself fails the approve WOULD revert,
+      // so never send it (no wasted gas, explicit failure instead).
+      let approveGas;
+      try {
+        const est = await provider.estimateGas({
+          from: walletAddr, to: dir.fromAddr,
+          data: fromSigner.interface.encodeFunctionData("approve", [routerAddr, ethers.MaxUint256]),
+        });
+        approveGas = est + est / 4n;
+      } catch (e) {
+        return fail("INSUFFICIENT_ALLOWANCE",
+          `approve estimation failed for ${dir.from} — not sending: ${String(e?.shortMessage || e?.message || e).slice(0, 100)}`);
+      }
+      if (this.txManager) {
+        const r = await this.txManager.sendAndWait({
+          wallet, provider, txType: "SWAP-APPROVE",
+          sendFn: (nonce) => fromSigner.approve(routerAddr, ethers.MaxUint256, { gasLimit: approveGas, nonce }),
+          log: this.log.bind(this),
+        });
+        if (!r || r.status === 0) return fail("INSUFFICIENT_ALLOWANCE", `approve transaction reverted for ${dir.from}`);
+        approveTxHash = r.hash || r.txHash || null;
+      } else {
+        const approveTx = await fromSigner.approve(routerAddr, ethers.MaxUint256, { gasLimit: approveGas });
+        approveTxHash = approveTx.hash;
+        await approveTx.wait();
+      }
+      allowanceNow = await fromRead.allowance(walletAddr, routerAddr).catch(() => 0n);
+      if (allowanceNow < finalAmountRaw) {
+        return fail("INSUFFICIENT_ALLOWANCE",
+          `allowance ${ethers.formatUnits(allowanceNow, fromDec)} still < needed ${ethers.formatUnits(finalAmountRaw, fromDec)} after approve ${approveTxHash || "?"}`);
+      }
+      this.log(`[SWAP] allowance re-check OK ${dir.from}: ${ethers.formatUnits(allowanceNow, fromDec)} >= ${ethers.formatUnits(finalAmountRaw, fromDec)} (approve ${approveTxHash})`, "success");
+    }
+
+    // 5c. read-only preflight — nothing is signed before this eth_call succeeds
+    // (allowance is now guaranteed, so TRANSFER_FROM_FAILED here is a real bug,
+    // not a missing approval).
     const deadline = Math.floor(Date.now() / 1000) + Number(this.config.deadlineSeconds || 1200);
     let calldata;
     try {
       calldata = new ethers.Interface(ROUTER_ABI).encodeFunctionData(
-        "swapExactTokensForTokens", [amountRaw, amountOutMin, best.path, walletAddr, deadline]);
+        "swapExactTokensForTokens", [finalAmountRaw, amountOutMin, best.path, walletAddr, deadline]);
       await provider.call({ from: walletAddr, to: routerAddr, data: calldata, value: 0n });
     } catch (e) {
-      return skip("PREFLIGHT_REVERT", String(e?.shortMessage || e?.message || e).slice(0, 120));
+      const msg = String(e?.shortMessage || e?.message || e);
+      const cls = classifySwapRevert(msg);
+      if (cls) return skip(cls.code, cls.detail);
+      return skip("PREFLIGHT_REVERT", msg.slice(0, 120));
     }
 
     this.log(
       `[SWAP] direction=${direction} tokenIn=${dir.fromAddr} tokenOut=${dir.toAddr} ` +
-      `amountIn=${ethers.formatUnits(amountRaw, fromDec)} quoteOut=${ethers.formatUnits(best.amountOut, toDec)} ` +
+      `amountIn=${ethers.formatUnits(finalAmountRaw, fromDec)} quoteOut=${ethers.formatUnits(best.amountOut, toDec)} ` +
       `amountOutMin=${ethers.formatUnits(amountOutMin, toDec)} router=${routerAddr} pool=${pool} ` +
       `reserve=${ethers.formatUnits(sized.reserve, fromDec)} available=${ethers.formatUnits(sized.availableRaw, fromDec)} ` +
-      `hops=${best.type} preflight=PASS`, "warn");
+      `hops=${best.type} preflight=PASS${shrunk ? ` shrunk=${shrunk.from}→${shrunk.to}` : ""}`, "warn");
 
     // 5b-bis. SINGLE-SWAP PLAN — read-only gas + economics snapshot that the
     // operator reviews before anything is signed. estimateGas is an eth_call.
@@ -4059,7 +4669,7 @@ export class AutoTrader {
         direction, from: dir.from, to: dir.to,
         tokenIn: dir.fromAddr, tokenOut: dir.toAddr,
         path: best.path, hops: best.type, pool, router: routerAddr,
-        amountIn: String(amountRaw), amountInHuman: ethers.formatUnits(amountRaw, fromDec),
+        amountIn: String(finalAmountRaw), amountInHuman: ethers.formatUnits(finalAmountRaw, fromDec),
         quoteOut: String(best.amountOut), quoteOutHuman: ethers.formatUnits(best.amountOut, toDec),
         amountOutMin: String(amountOutMin), amountOutMinHuman: ethers.formatUnits(amountOutMin, toDec),
         slippageBps: Number(slippageBps),
@@ -4067,6 +4677,7 @@ export class AutoTrader {
         priceImpactExFeePct: leg0?.priceImpactExFee != null ? Number(leg0.priceImpactExFee) * 100 : null,
         spot: leg0?.spot ?? null, execRate: leg0?.execRate ?? null,
         economyGates: econ?.gates || [],
+        shrunk: shrunk || null,
         gasEstimate: gasEstimate ? String(gasEstimate) : null,
         gasPriceWei: gasPrice ? String(gasPrice) : null,
         gasCostWei: gasCostWei ? String(gasCostWei) : null,
@@ -4083,19 +4694,26 @@ export class AutoTrader {
     }
 
     if (dryRun) {
-      this.log(`[DRY] ${tag}would swap ${direction} ${ethers.formatUnits(amountRaw, fromDec)} → min ${ethers.formatUnits(amountOutMin, toDec)}`, "info");
-      return { status: "dry", code: "DRY_RUN", reason: pinned ? "plan only — no --confirm, nothing signed" : "dry-run — no transaction sent", amountIn: String(amountRaw), amountOutMin: String(amountOutMin), plan };
+      this.log(`[DRY] ${tag}would swap ${direction} ${ethers.formatUnits(finalAmountRaw, fromDec)} → min ${ethers.formatUnits(amountOutMin, toDec)}`, "info");
+      return {
+        status: "dry", code: "DRY_RUN", direction,
+        reason: pinned ? "plan only — no --confirm, nothing signed" : "dry-run — no transaction sent",
+        state: SWAP_DIRECTION_STATES.EXECUTABLE, recoverable: true,
+        recommendedAction: "ready — live mode would execute this swap (allowance + preflight + economy all passed)",
+        amountIn: String(finalAmountRaw), amountOutMin: String(amountOutMin), plan,
+        approveTxHash, shrunk,
+      };
     }
 
-    // 6 + 7. allowance (logged) → approve only when needed → send → wait receipt
+    // 6 + 7. allowance already guaranteed above → send → wait receipt
     const report = {};
     const res = await executeSwap({
       wallet, provider,
       fromToken: dir.fromAddr, toToken: dir.toAddr,
-      amount: amountRaw, amountOutMin,
+      amount: finalAmountRaw, amountOutMin,
       config: this.config, log: this.log.bind(this), txManager: this.txManager,
       path: best.path, report,
-      allowApprove: pinned ? pinned.allowApprove !== false : true,
+      allowApprove,
     });
     if (!res || res.ok === false) return fail(report.code || "TX_REVERTED", report.reason || "swap execution failed");
 
@@ -4116,7 +4734,7 @@ export class AutoTrader {
     const ok = inDelta > 0n && outDelta > 0n && outDelta >= amountOutMin;
     this.log(
       `[SWAP ${ok ? "CONFIRMED" : "MISMATCH"}] direction=${direction} tx=${res.txHash} block=${res.blockNumber ?? "-"} gas=${res.gasUsed ?? "-"} ` +
-      `inDelta=${inDelta} outDelta=${outDelta} amountIn=${amountRaw} amountOutMin=${amountOutMin}`,
+      `inDelta=${inDelta} outDelta=${outDelta} amountIn=${finalAmountRaw} amountOutMin=${amountOutMin}`,
       ok ? "success" : "error");
     if (!ok) {
       // Receipt is CONFIRMED but the balance deltas contradict the expectation.
@@ -4128,17 +4746,20 @@ export class AutoTrader {
     // 10. record the successful pair — runSwapRotationQueue() then advances the
     // rotation queue, so the NEXT pass starts on a different direction.
     this._lastSwapTxAt = Date.now();
-    try { this.swapJournal.record({ from: dir.from, to: dir.to, amount: parseFloat(ethers.formatUnits(amountRaw, fromDec)) }); } catch { /* best-effort */ }
+    try { this.swapJournal.record({ from: dir.from, to: dir.to, amount: parseFloat(ethers.formatUnits(finalAmountRaw, fromDec)) }); } catch { /* best-effort */ }
 
     return {
       status: "ok",
+      direction,
+      state: SWAP_DIRECTION_STATES.CONFIRMED, recoverable: false,
+      recommendedAction: "none — swap confirmed and verified",
       txHash: res.txHash, blockNumber: res.blockNumber ?? null, gasUsed: res.gasUsed ?? null,
-      approveTxHash: res.approveTxHash || null,
-      amountIn: String(amountRaw), quoteOut: String(best.amountOut), amountOutMin: String(amountOutMin),
+      approveTxHash: res.approveTxHash || approveTxHash || null,
+      amountIn: String(finalAmountRaw), quoteOut: String(best.amountOut), amountOutMin: String(amountOutMin),
       inDelta: String(inDelta), outDelta: String(outDelta),
       path: best.path, hops: best.type, pool,
       allowance: report.allowance || null, preflight: report.preflight || "PASS",
-      plan,
+      plan, shrunk,
     };
   }
 
@@ -4469,7 +5090,7 @@ export class AutoTrader {
   }
 
   /**
-   * Locate `state.activePosition` ON-CHAIN without trusting local identity.
+   * Locate a tracked position record ON-CHAIN without trusting local identity.
    *
    * Used when the stored record has no resolvable manager (or at startup), so a
    * stale/legacy record can neither block CLOSE forever nor be cleared on a
@@ -4479,9 +5100,10 @@ export class AutoTrader {
    *   • no identity, some manager has it  → {status:"active", located:true}
    *   • no identity, no manager has it    → {status:"missing"}  (zombie → clear)
    *   • every read failed                 → {status:"unreadable"} (KEEP state)
+   *
+   * @param pos the tracked record to locate
    */
-  async _locateStoredPosition() {
-    const pos = this.state.activePosition;
+  async _locateStoredPosition(pos) {
     if (!pos || pos.positionId === null || pos.positionId === undefined) return { status: "no-id", reads: 0 };
     const { provider } = this.getRuntime();
     const walletAddr = (this.deps?.accounts?.[this.deps.selectedWalletIndex]?.address || "").toLowerCase();
@@ -4519,6 +5141,151 @@ export class AutoTrader {
   }
 
   /**
+   * Adopt EVERY on-chain active position of this wallet that is not already
+   * tracked — across ALL known managers. The chain, not the local file,
+   * decides what must be closed; one adopted record never overwrites another.
+   *
+   * Without this, positions the bot never tracked (e.g. #103/#104/#106 opened
+   * before a restart or by an earlier run) could never be closed: nothing
+   * else ever filled the array with them.
+   *
+   * @returns {Promise<number>} how many records were adopted
+   */
+  async _adoptAllFromChain() {
+    if (this._isDry()) return 0;
+    const { provider, wallet } = this.getRuntime();
+    const walletAddr = (wallet?.address || "").toLowerCase();
+
+    const managers = new Set();
+    const add = (m) => { if (m && typeof m === "string" && m.startsWith("0x")) managers.add(m); };
+    for (const mk of (Array.isArray(this.markets) ? this.markets : [])) add(mk.managerAddr);
+    for (const p of Object.values(this.deps?.confirmedPools || {})) add(p?.manager);
+    if (!managers.size) return 0;
+
+    const already = new Set(this._positions().map(p =>
+      `${String(p?.managerAddr || "").toLowerCase()}:${String(p?.positionId)}`));
+
+    const candidates = [];
+    for (const mgrAddr of managers) {
+      let ids = [];
+      try {
+        const c = new ethers.Contract(mgrAddr, MANAGER_ABI, provider);
+        ids = (await c.getUserPositions(wallet.address)) || [];
+      } catch { continue; }
+      for (const pid of ids) {
+        const key = `${mgrAddr.toLowerCase()}:${Number(pid)}`;
+        if (already.has(key)) continue;
+        const onChain = await readOnChainPosition(provider, mgrAddr, pid);
+        if (!onChain || positionIsClosed(onChain)) continue;
+        if (onChain.user && String(onChain.user).toLowerCase() !== walletAddr) continue;
+        candidates.push({ mgrAddr, pid: Number(pid), onChain });
+      }
+    }
+    if (!candidates.length) return 0;
+
+    let adopted = 0;
+    for (const cand of candidates) {
+      const mk = (Array.isArray(this.markets) ? this.markets : [])
+        .find(m => String(m.managerAddr || "").toLowerCase() === String(cand.mgrAddr).toLowerCase());
+      const sym = mk?.marketSymbol || mk?.symbol
+        || Object.entries(this.deps?.confirmedPools || {})
+          .find(([, p]) => p?.manager?.toLowerCase() === cand.mgrAddr.toLowerCase())?.[0]
+        || null;
+      const rec = this._trackOpenedPosition({
+        positionId: cand.pid,
+        side: cand.onChain.isLong ? "LONG" : "SHORT",
+        collateralToken: cand.onChain.collateralToken,
+        collateralAmount: String(cand.onChain.collateralAmount),
+        paymentToken: mk?.paymentToken || null,
+        leverage: this.config.defaultLeverage,
+        openedAt: Date.now(),
+        txHash: null,
+        marketSymbol: sym,
+        managerAddr: cand.mgrAddr,
+        poolAddr: mk?.poolAddr || null,
+      }, { adopted: true });
+      // HOLD WINDOW for an adopted record: openedAt is the adoption instant
+      // (plausible epoch ms) — the hold starts here, ≤ maxHoldSeconds.
+      rec.currentDebt = String(cand.onChain.currentDebt ?? cand.onChain.debtAmount ?? "0");
+      rec.debtAmount = rec.currentDebt;
+      saveState(this.state);
+      adopted++;
+      this.log(`[ADOPT] ON-CHAIN active position #${rec.positionId} ${rec.side}${sym ? ` ${sym}` : ""} manager=${short(cand.mgrAddr)} — ${this._activeCount()} position(s) now tracked`, "warn");
+    }
+    return adopted;
+  }
+
+  /**
+   * Reconcile ALL local records with the chain and adopt any missing on-chain
+   * positions. Called at startup (recovery) and before planning an OPEN.
+   *
+   * Rules (per record):
+   *  • verified closed on-chain / not ours / no id → zombie cleared
+   *    (countClose=false — the bot did not perform that close)
+   *  • active on-chain                            → identity fields synced
+   *  • unreadable                                 → KEPT (never clear on a
+   *    failed read)
+   */
+  async _syncAllPositions() {
+    const { provider } = this.getRuntime();
+    const walletAddr = (this.deps?.accounts?.[this.deps.selectedWalletIndex]?.address || "").toLowerCase();
+
+    for (const rec of [...this._positions()]) {
+      if (rec?.pendingOpen) continue; // settlement owns pending records
+      if (!rec || rec.positionId === null || rec.positionId === undefined) {
+        this._clearPosition(rec, "no positionId", false);
+        continue;
+      }
+      const resolved = this.resolveManagerForPosition(rec);
+      let mgr = resolved?.managerAddr || rec.managerAddr || null;
+      let onChain = mgr ? await readOnChainPosition(provider, mgr, rec.positionId) : null;
+
+      if (!onChain) {
+        // Missing/unreadable on the known manager — ask the chain which
+        // manager (if any) still reports this id as active for this wallet.
+        const found = await this._locateStoredPosition(rec);
+        if (found.status === "active") {
+          mgr = found.managerAddr;
+          onChain = found.onChain;
+          if (!this._isDry()) {
+            rec.managerAddr = found.managerAddr;
+            const mk = (Array.isArray(this.markets) ? this.markets : [])
+              .find(m => String(m.managerAddr || "").toLowerCase() === String(found.managerAddr).toLowerCase());
+            if (mk) {
+              if (!rec.poolAddr) rec.poolAddr = mk.poolAddr;
+              if (!rec.marketSymbol) rec.marketSymbol = mk.marketSymbol || mk.symbol;
+            }
+            saveState(this.state);
+          }
+          this.log(`[SYNC] #${rec.positionId} located on-chain on manager ${short(found.managerAddr)}`, "warn");
+        } else if (found.status === "closed" || found.status === "missing" || found.status === "no-id") {
+          this.log(`[SYNC] #${rec.positionId} not active on any known manager — clearing zombie record`, "warn");
+          this._clearPosition(rec, "recovery: gone on-chain", false);
+        } else {
+          this.log(`[SYNC] #${rec.positionId} unreadable on-chain — keeping record (never clear on a failed read)`, "warn");
+        }
+        continue;
+      }
+
+      if (positionIsClosed(onChain)) {
+        this.log(`[SYNC] #${rec.positionId} already inactive on-chain — clearing stale record`, "warn");
+        this._clearPosition(rec, "recovery: gone on-chain", false);
+        continue;
+      }
+      if (onChain.user && walletAddr && String(onChain.user).toLowerCase() !== walletAddr) {
+        this.log(`[SYNC] #${rec.positionId} belongs to ${short(onChain.user)} on-chain, not this wallet — clearing`, "warn");
+        this._clearPosition(rec, "recovery: not ours", false);
+        continue;
+      }
+      this._syncActivePositionFromChain(rec, onChain, { managerAddr: mgr });
+    }
+
+    // Any on-chain position of this wallet that is not tracked yet must enter
+    // the array too (it occupies a risk slot and must eventually be closed).
+    await this._adoptAllFromChain();
+  }
+
+  /**
    * Signature of the ON-CHAIN position state a CLOSE attempt depends on.
    *
    * Two attempts with the same signature are literally the same attempt: only
@@ -4539,57 +5306,246 @@ export class AutoTrader {
   }
 
   /**
-   * Record a FAILED close attempt and return the ms to wait before the next one.
-   * A different on-chain signature (state actually moved) resets the backoff.
+   * Record a FAILED close attempt for ONE position and return the ms to wait
+   * before its next attempt. A different on-chain signature (state actually
+   * moved) resets the backoff. Backoff state lives on the record — one stuck
+   * position's backoff never delays a sibling's close.
    */
-  _noteCloseFailure(sig, code) {
-    const prev = this.state.closeRetry || {};
+  _noteCloseFailure(pos, sig, code) {
+    const prev = (pos && typeof pos === "object" ? pos.closeRetry : null) || {};
     const attempts = (prev.sig && prev.sig === sig ? Number(prev.attempts || 0) : 0) + 1;
     const delay = this._closeBackoffMs(attempts);
     // DRY-RUN: report the backoff that WOULD be scheduled — never write it.
     if (this._isDry()) {
-      this.log(`[DRY] would schedule close retry in ${Math.ceil(delay / 1000)}s (code=${code || "?"}) — closeRetry/closeAttempts untouched`, "info");
+      this.log(`[DRY] would schedule close retry for #${pos?.positionId ?? "?"} in ${Math.ceil(delay / 1000)}s (code=${code || "?"}) — closeRetry/closeAttempts untouched`, "info");
       return delay;
     }
     const now = Date.now();
-    this.state.closeRetry = { attempts, sig: sig || null, code: code || null, lastAttemptAt: now, nextAt: now + delay };
-    this.state.closeAttempts = (Number(this.state.closeAttempts) || 0) + 1;
+    if (pos && typeof pos === "object") {
+      pos.closeRetry = { attempts, sig: sig || null, code: code || null, lastAttemptAt: now, nextAt: now + delay };
+      pos.closeAttempts = (Number(pos.closeAttempts) || 0) + 1;
+    }
     saveState(this.state);
     return delay;
   }
 
-  /** Clear close retry bookkeeping (position gone / attempt succeeded). */
-  _resetCloseRetry() {
+  /** Clear ONE position's close retry bookkeeping (position gone / attempt succeeded). */
+  _resetCloseRetry(pos) {
     if (this._isDry()) return;
-    if (this.state.closeRetry) this.state.closeRetry = null;
-    this.state.closeAttempts = 0;
+    if (pos && typeof pos === "object") {
+      if (pos.closeRetry) pos.closeRetry = null;
+      pos.closeAttempts = 0;
+    }
+  }
+
+  // ═════════════════════════════════════════════════════════════════════════
+  //  HOLD WINDOW — deferred auto-close (min..max hold after a confirmed open)
+  // ═════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Hold length in ms for a fresh open: uniform rand(min..max hold), clamped
+   * so `max >= min`. `0` = hold disabled (both defaults are 0 → back-compat:
+   * nothing changes for runs that never configured a hold).
+   */
+  _holdWindowMs() {
+    let minS = Number(this.config.minHoldSeconds);
+    let maxS = Number(this.config.maxHoldSeconds);
+    if (!Number.isFinite(minS) || minS < 0) minS = 0;
+    if (!Number.isFinite(maxS) || maxS < 0) maxS = 0;
+    if (minS <= 0 && maxS <= 0) return 0;
+    if (maxS < minS) maxS = minS; // clamp: max never below min
+    const span = maxS - minS;
+    const pickS = span > 0 ? minS + Math.random() * span : minS;
+    return Math.round(pickS * 1000);
   }
 
   /**
-   * Clear the tracked position record — READ-ONLY in dry-run.
-   *
-   * Every `activePosition = null` / `sessionStats.closes++` pair in this class
-   * goes through here, so a dry run can only ever LOG the clearing it would do.
-   *
-   * @param {string} reason  why the record is being cleared (for the DRY log)
-   * @param {boolean} countClose  bump `sessionStats.closes` (a real close does)
-   * @returns {boolean} true when the record was actually cleared
+   * True only for a plausible epoch-MILLISECONDS open timestamp. Seconds-era
+   * values (e.g. legacy `openedAt`) and future clocks are never trusted — the
+   * hold must never be invented from a time we cannot believe.
    */
-  _clearActivePosition(reason, countClose = true) {
-    const id = this.state.activePosition?.positionId ?? "?";
+  _isPlausibleOpenedAt(ts, now = Date.now()) {
+    const t = Number(ts);
+    if (!Number.isFinite(t) || t <= 0) return false;
+    if (t < 1e12) return false;          // ≪ epoch-ms (seconds / blockNumber)
+    if (t > now + 60_000) return false;  // in the future → clock skew, not an open time
+    return true;
+  }
+
+  /**
+   * Ensure `pos.holdUntil` (absolute epoch ms — restart-safe) exists.
+   *
+   *  • already set        → returned untouched (a persisted hold survives restarts)
+   *  • hold disabled (0/0)→ 0, record untouched (back-compat: no new field)
+   *  • dry-run            → 0, record untouched (dry runs never mutate state)
+   *  • openedAt implausible→ holdUntil = 0 (closeable now — never invent time)
+   *  • otherwise          → openedAt + rand(min..max hold), persisted
+   *
+   * @returns {number} holdUntil epoch ms; 0 = no hold (closeable now)
+   */
+  _ensureHoldScheduled(pos) {
+    if (!pos || typeof pos !== "object") return 0;
+    if (pos.holdUntil !== undefined && pos.holdUntil !== null && Number.isFinite(Number(pos.holdUntil))) {
+      return Number(pos.holdUntil);
+    }
+    const windowMs = this._holdWindowMs();
+    if (windowMs <= 0 || this._isDry()) return 0;
+    const now = Date.now();
+    const openedAt = Number(pos.openedAt);
+    if (!this._isPlausibleOpenedAt(openedAt, now)) {
+      pos.holdUntil = 0;
+      saveState(this.state);
+      this.log(`[HOLD] #${pos.positionId ?? "?"} open time unknown (openedAt=${pos.openedAt ?? "∅"}) — no hold, closeable now`, "warn");
+      return 0;
+    }
+    pos.holdUntil = openedAt + windowMs;
+    saveState(this.state);
+    this.log(`[HOLD] #${pos.positionId ?? "?"} auto-close deferred until ${new Date(pos.holdUntil).toISOString()} (+${Math.round(windowMs / 1000)}s from open)`, "info");
+    return pos.holdUntil;
+  }
+
+  /**
+   * Emergency-risk probe — ONE throttled (15s) `getPositionRisk` read decides
+   * whether the hold must be ignored right now.
+   *
+   * Any read failure KEEPS the hold (never close on unknown risk) and is
+   * throttled with the same cache so a dead RPC cannot be hammered every cycle.
+   *
+   * @returns {Promise<boolean>} true → close now despite the hold
+   */
+  async _emergencyCloseDue({ provider, managerAddr, positionId }) {
+    if (!this.config.emergencyCloseEnabled) return false;
+    const now = Date.now();
+    const key = `${String(managerAddr || "").toLowerCase()}:${String(positionId)}`;
+    const cached = this._holdProbe;
+    if (cached && cached.key === key && (now - cached.at) < 15_000) return cached.due;
+
+    let threshold = Number(this.config.emergencyCloseHealthBps);
+    if (!Number.isFinite(threshold)) threshold = 10500;
+    let due = false;
+    try {
+      const mgr = new ethers.Contract(managerAddr, MANAGER_ABI, provider);
+      const risk = await mgr.getPositionRisk(BigInt(positionId));
+      const healthBps = Number(risk.healthBps);
+      due = !!risk.liquidatable || (Number.isFinite(healthBps) && healthBps <= threshold);
+      this.log(`[HOLD] risk probe #${positionId}: healthBps=${risk.healthBps} liquidatable=${!!risk.liquidatable} threshold=${threshold} → ${due ? "EMERGENCY CLOSE DUE" : "hold stands"}`, due ? "error" : "info");
+    } catch (e) {
+      due = false;
+      this.log(`[HOLD] risk probe #${positionId} failed (${revertSelector(e) || String(e?.message || e).slice(0, 40)}) — hold stands`, "warn");
+    }
+    this._holdProbe = { key, at: now, due };
+    return due;
+  }
+
+  /**
+   * maxTradesPerRun gate — true when THIS run may not open any new position.
+   * Counts confirmed OPENs only (pending/dry/adoption never increment it).
+   */
+  _tradeCapReached() {
+    const max = Number(this.config.maxTradesPerRun || 0);
+    return max > 0 && this._opensThisRun >= max;
+  }
+
+  /**
+   * HOLD GATE — evaluated from `closeActivePosition` AFTER on-chain truth and
+   * BEFORE the backoff/attempt, so every automatic close path (runCycle PHASE 1,
+   * start() STEP 1) inherits it. Operator single-action closes bypass it.
+   *
+   * A held close is NOT a failure: no backoff is scheduled, no retry counter
+   * moves — the cycle simply continues with THIS record kept (sibling
+   * positions and the OPEN phase are unaffected).
+   *
+   * @returns {Promise<null|{ok:false, blocked:boolean, continueCycle:boolean,
+   *                         code:"HOLD_UNTIL", holdUntil:number}>}
+   *   null → the close may proceed; object → return it from closeActivePosition.
+   */
+  async _evaluateHoldGate(pos, { provider, managerAddr, positionId }) {
+    if (!pos) return null;
+    const holdUntil = this._ensureHoldScheduled(pos);
+    const now = Date.now();
+    if (!(holdUntil > now)) return null;
+    if (await this._emergencyCloseDue({ provider, managerAddr, positionId })) {
+      this.log(`[HOLD] EMERGENCY override — position #${positionId} at on-chain risk; ignoring the remaining ${Math.ceil((holdUntil - now) / 1000)}s of hold`, "error");
+      return null;
+    }
+    const remainS = Math.ceil((holdUntil - now) / 1000);
+    this.log(`[HOLD] position #${positionId} inside hold window — auto-close deferred ${remainS}s (until ${new Date(holdUntil).toISOString()}); OPEN stays skipped`, "info");
+    return { ok: false, blocked: false, continueCycle: true, code: "HOLD_UNTIL", holdUntil };
+  }
+
+  // ═════════════════════════════════════════════════════════════════════════
+  //  SIDE SELECTION — configured ratio, NEVER a disabled side
+  // ═════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Pick the side for the next OPEN. Fallback chain:
+   *   1) RSI hint (only when that side is enabled)
+   *   2) configured ratio longPercent/shortPercent (weights both 0 → below)
+   *   3) rotation-planned side → 4) alternation
+   * With one side disabled that side wins unconditionally; with BOTH disabled
+   * there is no legal side → null (the caller skips the OPEN with a reason).
+   *
+   * @param {string|null} hint    RSI signal ("LONG"/"SHORT")
+   * @param {string|null} planned rotation-planned side (market planning stays
+   *        rotation-driven either way — only SIDE is decided here)
+   * @returns {"LONG"|"SHORT"|null}
+   */
+  _pickOpenSide(hint = null, planned = null) {
+    const enabled = [];
+    if (this.config.enableLong !== false) enabled.push("LONG");
+    if (this.config.enableShort !== false) enabled.push("SHORT");
+    if (!enabled.length) return null;
+    if (enabled.length === 1) return enabled[0];
+    const legal = (s) => (s === "LONG" || s === "SHORT") ? s : null;
+
+    const hinted = legal(hint);
+    if (hinted) return hinted;
+
+    let lw = Number(this.config.longPercent);
+    let sw = Number(this.config.shortPercent);
+    if (!Number.isFinite(lw) || lw < 0) lw = 0;
+    if (!Number.isFinite(sw) || sw < 0) sw = 0;
+    if (lw > 0 || sw > 0) {
+      const r = Math.random() * (lw + sw);
+      return r < lw ? "LONG" : "SHORT";
+    }
+    return legal(planned) || this.nextSide();
+  }
+
+  /**
+   * Remove ONE tracked position record — READ-ONLY in dry-run.
+   *
+   * Every record removal in this class goes through here, so a dry run can
+   * only ever LOG the clearing it would do. Removing a record frees its
+   * per-market slot and its share of the global cap.
+   *
+   * @param {object|null} pos  the record to remove
+   * @param {string} reason    why it is being cleared (for the DRY log)
+   * @param {boolean} countClose  bump `sessionStats.closes` (a real close does)
+   * @returns {boolean} true when the record was actually removed
+   */
+  _clearPosition(pos, reason, countClose = true) {
+    const id = pos?.positionId ?? "?";
     if (this._isDry()) {
-      this.log(`[DRY] Would CLEAR position #${id} (${reason}) — activePosition/sessionStats untouched`, "info");
+      this.log(`[DRY] Would CLEAR position #${id} (${reason}) — activePositions/sessionStats untouched`, "info");
       return false;
     }
-    this.state.activePosition = null;
+    const arr = this._positions();
+    const idx = arr.indexOf(pos);
+    if (idx >= 0) arr.splice(idx, 1);
+    else {
+      // Same id, different object identity (defensive) — remove by id.
+      const byId = arr.findIndex(p => String(p?.positionId) === String(id));
+      if (byId >= 0) arr.splice(byId, 1);
+    }
     if (countClose) this.state.sessionStats.closes++;
-    this._resetCloseRetry();
+    this._resetCloseRetry(pos);
     saveState(this.state);
     return true;
   }
 
   /**
-   * Reconcile the local `activePosition` record with an authoritative on-chain
+   * Reconcile ONE local position record with an authoritative on-chain
    * snapshot. The CHAIN is the source of truth; the local record is only a cache.
    *
    * Why this exists: a partial close (or any externally-settled close) reduces
@@ -4602,17 +5558,17 @@ export class AutoTrader {
    * Rules:
    *  • NEVER called with an unreadable/ambiguous snapshot (callers pass only a
    *    snapshot they just successfully read).
-   *  • NEVER clears `activePosition` — only updates its numeric identity fields.
-   *    Clearing remains exclusive to `_clearActivePosition` (verified close or
-   *    zombie), so an on-chain-confirmed active position can never be forgotten.
+   *  • NEVER removes the record — removal remains exclusive to
+   *    `_clearPosition` (verified close or zombie), so an on-chain-confirmed
+   *    active position can never be forgotten.
    *  • DRY-RUN: logs the divergence but writes nothing.
    *
+   * @param {object} pos      the tracked record to reconcile
    * @param {object} onChain  {collateralAmount, currentDebt, debtAmount, isLong, active}
    * @param {object} [opts]   {managerAddr}
    * @returns {{synced:boolean, changed:string[]}}
    */
-  _syncActivePositionFromChain(onChain, { managerAddr = null } = {}) {
-    const pos = this.state.activePosition;
+  _syncActivePositionFromChain(pos, onChain, { managerAddr = null } = {}) {
     if (!pos || !onChain) return { synced: false, changed: [] };
 
     // Compute the diff FIRST, apply it only if this instance may persist. A dry
@@ -4628,7 +5584,13 @@ export class AutoTrader {
       plan("collateralAmount", String(onChain.collateralAmount));
     }
     if (onChain.currentDebt !== undefined && onChain.currentDebt !== null) {
+      // onChain.currentDebt = getPositionDebt() (real, index-adjusted) — never
+      // the borrowIndex (the pre-fix mapping poisoned debtAmount with 1.0003e18).
       plan("debtAmount", String(onChain.currentDebt));
+      plan("currentDebt", String(onChain.currentDebt));
+    }
+    if (onChain.debtAmount !== undefined && onChain.debtAmount !== null) {
+      plan("storedDebt", String(onChain.debtAmount));
     }
     if (onChain.isLong !== undefined && onChain.isLong !== null) {
       const side = onChain.isLong ? "LONG" : "SHORT";
@@ -4652,7 +5614,16 @@ export class AutoTrader {
   }
 
   /**
-   * Settle a still-PENDING open transaction.
+   * Settle EVERY still-PENDING open transaction in the array.
+   */
+  async _settleAllPendingOpens() {
+    for (const rec of [...this._positions()]) {
+      if (rec?.pendingOpen) await this._settlePendingOpen(rec);
+    }
+  }
+
+  /**
+   * Settle ONE still-PENDING open transaction.
    *
    * An open only becomes an OPEN when a receipt proves it: `sessionStats.opens`,
    * `lastSide`, the direction-success counters and `[OPEN] … SUCCESS` are all
@@ -4661,18 +5632,18 @@ export class AutoTrader {
    * recorded as a successful open — a success the chain (and nemesis.trade)
    * never saw.
    *
+   * @param {object} pos the pending record to settle
    * @returns {Promise<{status:string, done:boolean}>}
    *   `done` — the record no longer needs another settlement pass.
    */
-  async _settlePendingOpen() {
-    const pos = this.state.activePosition;
+  async _settlePendingOpen(pos) {
     if (!pos?.pendingOpen) return { status: "none", done: true };
     if (this._isDry()) return { status: "none", done: true };
 
     const hash = pos.txHash || null;
     if (!hash) {
-      this.log(`[OPEN] pending open record has no txHash — clearing`, "warn");
-      this._clearActivePosition("pending open without txHash", false);
+      this.log(`[OPEN] pending open record #${pos.positionId ?? "?"} has no txHash — clearing`, "warn");
+      this._clearPosition(pos, "pending open without txHash", false);
       return { status: "cleared", done: true };
     }
 
@@ -4685,7 +5656,7 @@ export class AutoTrader {
       const state = classifyTx({ receipt: null, tx: txObj });
       if (state === TX_STATE.DROPPED_OR_REPLACED) {
         this.log(`[OPEN] tx ${hash} DROPPED_OR_REPLACED — no receipt and no longer in the mempool`, "error");
-        this._clearActivePosition("pending open dropped/replaced", false);
+        this._clearPosition(pos, "pending open dropped/replaced", false);
         return { status: state, done: true };
       }
       if (state === TX_STATE.UNKNOWN) {
@@ -4698,19 +5669,12 @@ export class AutoTrader {
 
     if (Number(receipt.status) !== 1) {
       this.log(`[OPEN] tx ${hash} REVERTED (receipt.status=0) — not an open`, "error");
-      this._clearActivePosition("pending open reverted", false);
+      this._clearPosition(pos, "pending open reverted", false);
       return { status: TX_STATE.REVERTED, done: true };
     }
 
-    // CONFIRMED — but only a PositionCreated event identifies WHAT opened.
-    let positionId = null;
-    for (const logEntry of receipt.logs || []) {
-      if (logEntry.topics?.[0] === POSITION_CREATED_TOPIC
-        && (!pos.managerAddr || String(logEntry.address).toLowerCase() === String(pos.managerAddr).toLowerCase())) {
-        positionId = Number(BigInt(logEntry.topics[2]));
-        break;
-      }
-    }
+    // CONFIRMED — but only the open events identify WHAT opened.
+    const positionId = extractPositionIdFromLogs(receipt.logs || [], pos.managerAddr || null);
     if (positionId === null) {
       this.log(`[OPEN] CONFIRMED_STATE_MISMATCH tx=${hash} block=${receipt.blockNumber} — receipt status 1 but no PositionCreated event; not counting it as an open`, "error");
       pos.pendingOpen = false;
@@ -4725,145 +5689,161 @@ export class AutoTrader {
       this._recordDirectionSuccess(pos.marketSymbol, pos.side);
       this._rotMarketDone(pos.marketSymbol, pos.side);
     }
+    // HOLD WINDOW starts from the CONFIRMED open (openedAt = submission time,
+    // well within the window) — a restart between submit and receipt still
+    // derives the same hold because the clock input is persisted.
+    this._ensureHoldScheduled(pos);
     this.state.lastSide = pos.side;
     this.state.sessionStats.opens++;
+    this._opensThisRun++;
     saveState(this.state);
     this.log(`[OPEN] CONFIRMED tx=${hash} block=${receipt.blockNumber} — position #${positionId} (${pos.side} ${pos.marketSymbol || "?"}); sessionStats.opens=${this.state.sessionStats.opens}`, "success");
     return { status: TX_STATE.CONFIRMED, done: true };
   }
 
   /**
-   * Apply a closePositionFn() result to `state`.
+   * Apply a closePositionFn() result to ONE tracked record.
    *
-   * `activePosition` is cleared ONLY when the position is provably gone:
+   * The record is removed ONLY when the position is provably gone:
    * a zombie (MAM_InvalidPosition) or an on-chain verified close.
    * Every other outcome — dry run, pending TX, liquidity-blocked partial close,
-   * unreadable verification — KEEPS the position and schedules a backoff, so the
-   * bot can never orphan an open one and can never spin on an identical failing
-   * close. A DRY RUN never mutates anything at all (see `_clearActivePosition`).
+   * unreadable verification — KEEPS the record and schedules ITS OWN backoff, so
+   * the bot can never orphan an open one and can never spin on an identical
+   * failing close. A DRY RUN never mutates anything at all (see `_clearPosition`).
    *
+   * @param {object|null} pos         the tracked record this result belongs to
    * @param {object|null} closeResult outcome from closePositionFn()
    * @param {string|null} sig on-chain signature captured before the attempt
    * @returns {{ok:boolean, blocked:boolean, continueCycle:boolean, code:string|null, dryRun?:boolean}}
-   *   `ok`          — the position is (or would be) gone, so the OPEN phase may run.
+   *   `ok`          — the position is (or would be) gone.
    *   `dryRun`      — true when the close was only PLANNED: `ok` is true but the
-   *                   record was deliberately kept, so PHASE 1.5b must not treat
-   *                   it as a still-open position.
+   *                   record was deliberately kept.
    *   `blocked`     — the position was KEPT and nothing is in flight: the close
    *                   cannot happen right now (liquidity / preflight / still
    *                   active) but the cycle must keep going.
    *   `continueCycle` — ALWAYS true. A failed close never ends the runCycle; it
-   *                   only decides whether the OPEN phase is skipped.
+   *                   only affects THIS position.
    */
-  _applyCloseResult(closeResult, sig = null) {
+  _applyCloseResult(pos, closeResult, sig = null) {
     const CONTINUE = true;
+    const id = pos?.positionId ?? "?";
     this.lastCloseTxHash = closeResult?.txHash || null;
     if (!closeResult) {
-      const d = this._noteCloseFailure(sig, "CLOSE_NO_RESULT");
-      this.log(`[CLOSE] Failed — position KEPT, retry in ${Math.ceil(d / 1000)}s`, "error");
+      const d = this._noteCloseFailure(pos, sig, "CLOSE_NO_RESULT");
+      this.log(`[CLOSE] #${id} Failed — position KEPT, retry in ${Math.ceil(d / 1000)}s`, "error");
       return { ok: false, blocked: true, continueCycle: CONTINUE, code: "CLOSE_NO_RESULT" };
     }
     if (closeResult.dryRun) {
       // ─── DRY-CLOSE: REPORT ONLY ──────────────────────────────────────────
       // `[DRY] Would CLOSE position #N` was already logged by closePositionFn().
-      // The record is KEPT: activePosition, sessionStats.closes and the close
+      // The record is KEPT: activePositions, sessionStats.closes and the close
       // backoff all stay byte-identical (requirement 4).
-      const id = this.state.activePosition?.positionId ?? "?";
-      this.log(`[DRY] Would CLOSE position #${id} — state untouched (activePosition/sessionStats/closeRetry unchanged)`, "info");
+      this.log(`[DRY] Would CLOSE position #${id} — state untouched (activePositions/sessionStats/closeRetry unchanged)`, "info");
       return { ok: true, blocked: false, continueCycle: CONTINUE, code: null, dryRun: true };
     }
     if (closeResult.pending) {
-      const d = this._noteCloseFailure(sig, "TX_PENDING");
-      this.log(`[CLOSE] TX ${closeResult.txHash || ""} pending — state kept, will verify next cycle (in ${Math.ceil(d / 1000)}s)`, "warn");
+      const d = this._noteCloseFailure(pos, sig, "TX_PENDING");
+      this.log(`[CLOSE] #${id} TX ${closeResult.txHash || ""} pending — state kept, will verify next cycle (in ${Math.ceil(d / 1000)}s)`, "warn");
       return { ok: false, blocked: false, continueCycle: CONTINUE, code: "TX_PENDING" };
     }
     if (closeResult.failed) {
       if (closeResult.clearState === false) {
-        const d = this._noteCloseFailure(sig, closeResult.code || "FAILED");
-        this.log(`[CLOSE] blocked (${closeResult.code || closeResult.reason || "?"}) — position KEPT, retry in ${Math.ceil(d / 1000)}s`, "warn");
+        const d = this._noteCloseFailure(pos, sig, closeResult.code || "FAILED");
+        this.log(`[CLOSE] #${id} blocked (${closeResult.code || closeResult.reason || "?"}) — position KEPT, retry in ${Math.ceil(d / 1000)}s`, "warn");
         return { ok: false, blocked: true, continueCycle: CONTINUE, code: closeResult.code || "FAILED" };
       }
-      this.log(`[CLOSE] Position gone (${closeResult.reason || "zombie"}) — clearing state`, "warn");
-      this._clearActivePosition(closeResult.reason || "zombie");
+      this.log(`[CLOSE] #${id} Position gone (${closeResult.reason || "zombie"}) — clearing state`, "warn");
+      this._clearPosition(pos, closeResult.reason || "zombie");
       return { ok: true, blocked: false, continueCycle: CONTINUE, code: null };
     }
+    // Operator partial (--single=partial --pct): the REQUESTED slice executed
+    // and was verified. The position legitimately stays active — this is a
+    // success, not a blocked close, and the record must be kept (reconciled
+    // by the caller via _syncActivePositionFromChain).
+    if (closeResult.ok && closeResult.targetDone && closeResult.closed === false) {
+      this.log(`[CLOSE] partial target done — position #${id} reduced on-chain, record KEPT`, "success");
+      return { ok: true, blocked: false, continueCycle: CONTINUE, code: null, targetDone: true };
+    }
     if (closeResult.closed === false) {
-      const d = this._noteCloseFailure(sig, closeResult.code || "STILL_ACTIVE");
-      this.log(`[CLOSE] ${closeResult.code || "not closed"} — position KEPT, retry in ${Math.ceil(d / 1000)}s`, "warn");
+      const d = this._noteCloseFailure(pos, sig, closeResult.code || "STILL_ACTIVE");
+      this.log(`[CLOSE] #${id} ${closeResult.code || "not closed"} — position KEPT, retry in ${Math.ceil(d / 1000)}s`, "warn");
       return { ok: false, blocked: true, continueCycle: CONTINUE, code: closeResult.code || "STILL_ACTIVE" };
     }
     const part = closeResult.partial ? ` (partial closeBps=${closeResult.closeBps})` : "";
-    this.log(`[CLOSE] SUCCESS TX: ${closeResult.txHash || "dry-run"}${part} — verified on-chain`, "success");
-    this._clearActivePosition("verified close");
+    this.log(`[CLOSE] #${id} SUCCESS TX: ${closeResult.txHash || "dry-run"}${part} — verified on-chain`, "success");
+    this._clearPosition(pos, "verified close");
     return { ok: true, blocked: false, continueCycle: CONTINUE, code: null };
   }
 
   /**
-   * Close `state.activePosition` via ITS OWN manager (`resolveManagerForPosition`).
+   * Close ONE tracked position via ITS OWN manager (`resolveManagerForPosition`).
    *
-   * Always returns a structured result so a caller can tell "position gone →
-   * OPEN may run" from "position still active → OPEN must be skipped but the
-   * cycle (and the swap engine) keeps running". A liquidity-blocked close KEEPS
-   * the position, schedules the backoff and never clears on-chain state.
+   * Always returns a structured result so a caller can tell "position gone"
+   * from "position still active → this cycle moves on, siblings unaffected".
+   * A liquidity-blocked close KEEPS the record, schedules ITS backoff and never
+   * clears on-chain state.
    *
+   * @param {object} pos the tracked record to close
    * @returns {Promise<{ok:boolean, blocked:boolean, continueCycle:boolean, code:string|null}>}
    */
-  async closeActivePosition() {
+  async closeActivePosition(pos) {
     const DONE = { ok: true, blocked: false, continueCycle: true, code: null };
-    if (!this.state.activePosition) return { ...DONE, code: "NO_ACTIVE_POSITION" };
-    if (this.state.activePosition.pendingOpen) {
+    if (!pos || !this._positions().includes(pos)) {
+      return { ...DONE, code: "NO_ACTIVE_POSITION" };
+    }
+    if (pos.pendingOpen) {
       // A submitted-but-unconfirmed open must never be dropped as a
       // "failed-open leftover" — that would let the next cycle double-open.
-      const settle = await this._settlePendingOpen();
+      const settle = await this._settlePendingOpen(pos);
       if (!settle.done) {
-        this.log(`[CLOSE] open tx ${this.state.activePosition.txHash || "?"} still ${settle.status} — deferring close`, "warn");
+        this.log(`[CLOSE] open tx ${pos.txHash || "?"} still ${settle.status} — deferring close`, "warn");
         return { ok: false, blocked: false, continueCycle: true, code: `OPEN_${String(settle.status).toUpperCase()}` };
       }
-      if (!this.state.activePosition) return { ...DONE, code: "OPEN_NOT_CONFIRMED" };
+      if (!this._positions().includes(pos)) return { ...DONE, code: "OPEN_NOT_CONFIRMED" };
     }
-    if (this.state.activePosition.positionId === null || this.state.activePosition.positionId === undefined) {
+    if (pos.positionId === null || pos.positionId === undefined) {
       this.log(`[CLOSE] stored record has no positionId (failed-open leftover) — clearing`, "warn");
-      this._clearActivePosition("no positionId", false);
+      this._clearPosition(pos, "no positionId", false);
       return DONE;
     }
 
     const { provider, wallet } = this.getRuntime();
     // P7: the manager comes from THIS position's identity — never from a
     // side-derived getManagerAddr() fallback (that can target another market).
-    const resolved = this.resolveManagerForPosition(this.state.activePosition);
-    const positionId = this.state.activePosition.positionId;
+    const resolved = this.resolveManagerForPosition(pos);
+    const positionId = pos.positionId;
     let managerAddr = resolved?.managerAddr || null;
     let onChain = null;
 
     if (!managerAddr) {
       // No usable local identity — the CHAIN decides (never a guessed manager).
-      const found = await this._locateStoredPosition();
+      const found = await this._locateStoredPosition(pos);
       if (found.status === "active") {
         managerAddr = found.managerAddr;
         onChain = found.onChain;
         if (!this._isDry()) {
-          this.state.activePosition.managerAddr = found.managerAddr;
+          pos.managerAddr = found.managerAddr;
           const mk = (Array.isArray(this.markets) ? this.markets : [])
             .find(m => String(m.managerAddr || "").toLowerCase() === String(found.managerAddr).toLowerCase());
           if (mk) {
-            if (!this.state.activePosition.poolAddr) this.state.activePosition.poolAddr = mk.poolAddr;
-            if (!this.state.activePosition.marketSymbol) this.state.activePosition.marketSymbol = mk.marketSymbol || mk.symbol;
+            if (!pos.poolAddr) pos.poolAddr = mk.poolAddr;
+            if (!pos.marketSymbol) pos.marketSymbol = mk.marketSymbol || mk.symbol;
           }
           saveState(this.state);
         }
         this.log(`[CLOSE] position #${positionId} located on-chain on manager ${short(found.managerAddr)} — identity recorded`, "warn");
       } else if (found.status === "closed" || found.status === "missing") {
         this.log(`[CLOSE] position #${positionId} not active on any known manager (id never reported) — clearing zombie state`, "warn");
-        this._clearActivePosition("zombie (never reported)");
+        this._clearPosition(pos, "zombie (never reported)");
         return DONE;
       } else if (found.status === "no-id") {
         // A record without positionId is a failed-OPEN leftover — no on-chain
-        // position can exist for it, so it must not block the OPEN phase.
+        // position can exist for it, so it must not block anything.
         this.log(`[CLOSE] stored record has no positionId (failed-open leftover) — clearing`, "warn");
-        this._clearActivePosition("no positionId", false);
+        this._clearPosition(pos, "no positionId", false);
         return DONE;
       } else {
-        const d = this._noteCloseFailure(null, "POSITION_UNRESOLVED");
+        const d = this._noteCloseFailure(pos, null, "POSITION_UNRESOLVED");
         this.log(`[CLOSE] position #${positionId} identity unresolved and chain unreadable — position KEPT, retry in ${Math.ceil(d / 1000)}s`, "warn");
         return { ok: false, blocked: true, continueCycle: true, code: "POSITION_UNRESOLVED" };
       }
@@ -4875,11 +5855,11 @@ export class AutoTrader {
 
     if (onChain && positionIsClosed(onChain)) {
       this.log(`[CLOSE] position #${positionId} already inactive on-chain — clearing local state`, "success");
-      this._clearActivePosition("already inactive on-chain");
+      this._clearPosition(pos, "already inactive on-chain");
       return DONE;
     }
     if (!onChain) {
-      const d = this._noteCloseFailure(null, "POSITION_UNREADABLE");
+      const d = this._noteCloseFailure(pos, null, "POSITION_UNREADABLE");
       this.log(`[CLOSE] positions(${positionId}) unreadable on ${short(managerAddr)} — position KEPT, retry in ${Math.ceil(d / 1000)}s`, "warn");
       return { ok: false, blocked: true, continueCycle: true, code: "POSITION_UNREADABLE" };
     }
@@ -4890,27 +5870,35 @@ export class AutoTrader {
     // partial close, as on #75: local 1721515506 vs chain 12007481) would make
     // every locally-computed close size wrong. Reconcile BEFORE attempting so
     // the attempt uses real numbers; never the other way round.
-    this._syncActivePositionFromChain(onChain, { managerAddr });
+    this._syncActivePositionFromChain(pos, onChain, { managerAddr });
+
+    // HOLD WINDOW — an open position is not auto-closed before holdUntil
+    // (min..max hold from the confirmed open) UNLESS the emergency probe
+    // proves on-chain risk. Runs AFTER on-chain truth (the record above is
+    // live) and BEFORE the backoff: a hold is not a failure, so no backoff,
+    // no retry counter — the cycle continues with the record kept.
+    const heldOutcome = await this._evaluateHoldGate(pos, { provider, managerAddr, positionId });
+    if (heldOutcome) return heldOutcome;
 
     // Identical attempt inside the backoff window → do not touch the chain,
     // let SWAP maintenance continue this cycle and come back later.
-    const retry = this.state.closeRetry || null;
+    const retry = pos.closeRetry || null;
     if (retry && retry.sig === sig && Number(retry.nextAt || 0) > Date.now()) {
       const waitS = Math.ceil((Number(retry.nextAt) - Date.now()) / 1000);
-      this.log(`[CLOSE] backoff ${waitS}s — attempt ${retry.attempts} on unchanged position (code=${retry.code || "?"}); SWAP/OPEN cycle continues`, "info");
+      this.log(`[CLOSE] #${positionId} backoff ${waitS}s — attempt ${retry.attempts} on unchanged position (code=${retry.code || "?"}); other positions unaffected`, "info");
       return { ok: false, blocked: true, continueCycle: true, code: retry.code || "BACKOFF" };
     }
 
     const dryRun = this.config.dryRun;
     this.setState(STATES.CLOSE);
-    this.log(`[AUTO] CLOSING position #${positionId} (${this.state.activePosition.side}) market=${this.state.activePosition.marketSymbol || resolved?.marketSymbol || "?"} manager=${short(managerAddr)} src=${resolved?.source || "chain"} attempt=${retry && retry.sig === sig ? Number(retry.attempts) + 1 : 1}`, "warn");
+    this.log(`[AUTO] CLOSING position #${positionId} (${pos.side}) market=${pos.marketSymbol || resolved?.marketSymbol || "?"} manager=${short(managerAddr)} src=${resolved?.source || "chain"} attempt=${retry && retry.sig === sig ? Number(retry.attempts) + 1 : 1}`, "warn");
 
     const closeResult = await closePositionFn({
       wallet, provider, managerAddr, positionId,
       config: this.config, log: this.log.bind(this), dryRun, txManager: this.txManager,
     });
 
-    return this._applyCloseResult(closeResult, sig);
+    return this._applyCloseResult(pos, closeResult, sig);
   }
 
   /**
@@ -5337,9 +6325,28 @@ export class AutoTrader {
   async prepareAndOpen(side, opts = {}) {
     const { provider, wallet } = this.getRuntime();
     const walletAddr = wallet.address;
-    const dryRun = this.config.dryRun;
+    // The caller may force read-only (runSingleAction passes its confirm-gated
+    // dryRun). Without --confirm the OPEN path must be a plan, never a TX —
+    // documented contract: "TX writes require BOTH confirm and config.dryRun=false".
+    const dryRun = opts.dryRun !== undefined && opts.dryRun !== null ? !!opts.dryRun : this.config.dryRun;
 
     await this.ensureMarkets();
+
+    // CAP / PENDING GATE — enforced in EVERY open path (auto loop, --single=open).
+    // Dry-run planning may exceed the cap (records are kept by dry closes), but
+    // a pending open always blocks (double-open protection is not optional).
+    if (!dryRun) {
+      const gate = this._canOpenNew();
+      if (!gate.ok) {
+        this.log(`[BLOCKED] OPEN ${side} refused (code=${gate.code})`, "error");
+        return false;
+      }
+    } else if (this._positions().some(p => p?.pendingOpen)) {
+      const pending = this._positions().find(p => p?.pendingOpen);
+      this.log(`[BLOCKED] open tx ${pending.txHash || "?"} still pending — resolve it before planning another OPEN`, "error");
+      return false;
+    }
+
     let marketCandidates = await this.planMarketsForSide(side, {
       max: Number(this.config.maxMarketAttemptsPerCycle || 3),
     });
@@ -5389,6 +6396,15 @@ export class AutoTrader {
       const inv = await this._assertCandidateInvariants(candidate, ctx, side, provider);
       if (!inv.ok) {
         this.log(`[SKIP] ${candidate.symbol} ${side}: invariant failed — ${inv.reason} — trying next candidate`, "warn");
+        this._rotMarketSkip(candidate.symbol, side);
+        continue;
+      }
+
+      // PER-MARKET SLOT — another tracked position (active or pending) already
+      // occupies this market. One position per market is a MARKET limit, never
+      // a global one: other markets stay fully tradable.
+      if (this._marketHasPosition(candidate)) {
+        this.log(`[SKIP] ${candidate.symbol} ${side}: market already has a tracked position — trying next candidate`, "warn");
         this._rotMarketSkip(candidate.symbol, side);
         continue;
       }
@@ -5454,7 +6470,7 @@ export class AutoTrader {
     } else if (openResult?.pending) {
       // SUBMITTED/PENDING is NOT an open — kept only to block a second OPEN.
       // sessionStats.opens stays untouched until _settlePendingOpen() proves it.
-      this.state.activePosition = {
+      this._trackOpenedPosition({
         positionId: openResult.positionId ?? null,
         side,
         collateralToken: ctxUsed?.collateralToken || marketUsed.collateralToken,
@@ -5466,15 +6482,13 @@ export class AutoTrader {
         marketSymbol: marketUsed.symbol,
         managerAddr: marketUsed.managerAddr,
         poolAddr: marketUsed.poolAddr,
-        pendingOpen: true,
-      };
-      saveState(this.state);
+      }, { pending: true });
       this.log(`[OPEN] PENDING tx=${openResult.txHash} — awaiting confirmation; sessionStats.opens NOT incremented`, "warn");
       return true;
     } else if (openResult) {
       this._recordDirectionSuccess(marketUsed.symbol, side);
       this._rotMarketDone(marketUsed.symbol, side);
-      this.state.activePosition = {
+      this._trackOpenedPosition({
         positionId: openResult.positionId,
         side,
         // All of these come from the SAME candidate that actually opened
@@ -5487,11 +6501,8 @@ export class AutoTrader {
         marketSymbol: marketUsed.symbol,
         managerAddr: marketUsed.managerAddr,
         poolAddr: marketUsed.poolAddr,
-      };
-      this.state.lastSide = side;
-      this.state.sessionStats.opens++;
-      saveState(this.state);
-      this.log(`[OPEN] SUCCESS — position #${openResult.positionId} (${side} ${marketUsed.symbol})`, "success");
+      });
+      this.log(`[OPEN] SUCCESS — position #${openResult.positionId} (${side} ${marketUsed.symbol}) — ${this._activeCount()} position(s) tracked`, "success");
       return true;
     } else {
       this.log(`[BLOCKED] Open failed on all candidate markets`, "error");
@@ -5520,11 +6531,15 @@ export class AutoTrader {
     try { id = BigInt(positionId); } catch { return { ok: false, code: "BAD_ID", positionId: idStr, reason: "positionId is not a number" }; }
 
     let mgrAddr = managerAddr || null;
-    const stored = this.state.activePosition;
-    if (!mgrAddr && stored && String(stored.positionId ?? "") === idStr) {
+    const stored = this._findPosition(positionId) || null;
+    if (!mgrAddr && stored) {
       mgrAddr = this.resolveManagerForPosition(stored)?.managerAddr || stored.managerAddr || null;
     }
-    if (!mgrAddr && stored?.managerAddr && !managerAddr) mgrAddr = stored.managerAddr;
+    if (!mgrAddr && !managerAddr) {
+      // Last resort: any tracked record's manager (display-only fallback).
+      const primary = this._primaryPosition();
+      if (primary?.managerAddr) mgrAddr = primary.managerAddr;
+    }
     if (!mgrAddr) {
       return {
         ok: false, code: "NO_MANAGER", positionId: idStr,
@@ -5601,6 +6616,18 @@ export class AutoTrader {
     else if (hf !== null && Number(hf) === 0) status = "AT_RISK";
     else status = "ACTIVE";
 
+    // previewClosePosition() answers projectedHealthBps = type(uint256).max
+    // (2^256−1) for a FULL close — the position is gone afterwards, so there is
+    // no projected health. A real health value is ~bps (≪1e12); the sentinel
+    // must never surface as a number (it renders as 1.15e77 on screen).
+    let closeFullHealthBps = null;
+    if (closeFull && !closeFull.err) {
+      try {
+        const v = BigInt(closeFull.projectedHealthBps);
+        closeFullHealthBps = v >= 2n ** 255n ? null : Number(v);
+      } catch { closeFullHealthBps = null; }
+    }
+
     const report = {
       ok: true, found, active, positionId: idStr, managerAddr: mgrAddr, status,
       isLong, side: isLong === null ? null : isLong ? "LONG" : "SHORT",
@@ -5631,9 +6658,12 @@ export class AutoTrader {
             repayAmount: String(closeFull.repayAmount),
             collateralReturned: String(closeFull.collateralReturned),
             realizedPnl: String(closeFull.realizedPnl),
-            realizedPnlHuman: debtDec !== null ? ethers.formatUnits(closeFull.realizedPnl, debtDec) : null,
+            // realizedPnl is returned in COLLATERAL (token0) units — the site
+            // formats it with collateralDecimals, never with the debt decimals.
+            realizedPnlHuman: collateralDec !== null ? ethers.formatUnits(closeFull.realizedPnl, collateralDec) : null,
             closePrice: String(closeFull.closePrice),
-            projectedHealthBps: Number(closeFull.projectedHealthBps),
+            projectedHealthBps: closeFullHealthBps,
+            projectedHealthNote: closeFullHealthBps === null ? "N/A (position fully closed)" : null,
           }
         : active && closeFull?.err
           ? { ok: false, err: closeFull.err }
@@ -5670,7 +6700,7 @@ export class AutoTrader {
     ];
     this.log(`[STATUS] ${parts.join(" | ")}`, rep.status === "LIQUIDATION_RISK" ? "error" : "info");
     if (rep.closeFull && rep.closeFull.closeBps) {
-      this.log(`[STATUS] full-close preview: recv=${rep.closeFull.collateralReturned} repay=${rep.closeFull.repayAmount} pnl=${rep.closeFull.realizedPnlHuman ?? rep.closeFull.realizedPnl} closePrice=${rep.closeFull.closePrice} (closeBps=${rep.closeFull.closeBps})`, "info");
+      this.log(`[STATUS] full-close preview: recv=${rep.closeFull.collateralReturned} repay=${rep.closeFull.repayAmount} pnl=${rep.closeFull.realizedPnlHuman ?? rep.closeFull.realizedPnl} closePrice=${rep.closeFull.closePrice} health=${rep.closeFull.projectedHealthBps ?? rep.closeFull.projectedHealthNote ?? "?"} (closeBps=${rep.closeFull.closeBps})`, "info");
     } else if (rep.closeFull?.ok === false) {
       this.log(`[STATUS] full-close preview REVERTED ${rep.closeFull.err} — close would need partialClose ladder`, "warn");
     }
@@ -5688,13 +6718,17 @@ export class AutoTrader {
     if (positionId !== null && positionId !== undefined && `${positionId}` !== "") {
       const rep = await this.describePosition(positionId, managerAddr);
       this._logPositionReport(rep);
+      this._syncFromReport(rep); // POSITION SYNC — chain → local cache for the tracked id
+      this._clearIfTrackedClosed(rep);
       return { ok: rep.ok !== false, action: "status", reports: [rep] };
     }
 
     const mgrs = new Map();
     const add = (a) => { if (a && typeof a === "string" && a.startsWith("0x")) mgrs.set(a.toLowerCase(), a); };
-    add(this.state.activePosition?.managerAddr);
-    if (this.state.activePosition) add(this.resolveManagerForPosition(this.state.activePosition)?.managerAddr);
+    for (const rec of this._positions()) {
+      add(rec?.managerAddr);
+      add(this.resolveManagerForPosition(rec)?.managerAddr);
+    }
     for (const m of (this.markets || [])) add(m.managerAddr);
     const list = [...mgrs.values()].slice(0, 12);
 
@@ -5712,6 +6746,8 @@ export class AutoTrader {
         const rep = await this.describePosition(pid, a);
         reports.push(rep);
         this._logPositionReport(rep);
+        this._syncFromReport(rep);
+        this._clearIfTrackedClosed(rep);
       }
     }
     if (!reports.length) {
@@ -5723,6 +6759,56 @@ export class AutoTrader {
   // ═════════════════════════════════════════════════════════════════════════
   //  SINGLE ACTION DISPATCH — open | close | partial | status | swap
   // ═════════════════════════════════════════════════════════════════════════
+
+  /**
+   * POSITION SYNC for single actions: push an authoritative describePosition()
+   * snapshot into the matching tracked local record (never the other way
+   * around).
+   *
+   * Only acts when the report matches a tracked record by id and actually read
+   * the chain (found, active is a boolean). Never removes a record — removal
+   * stays exclusive to _clearPosition (verified close / zombie).
+   *
+   * @param {object} report result of describePosition()
+   * @returns {{synced:boolean, changed:string[]}}
+   */
+  _syncFromReport(report) {
+    if (!report || report.found !== true || typeof report.active !== "boolean") {
+      return { synced: false, changed: [] };
+    }
+    const tracked = this._findPosition(report.positionId);
+    if (!tracked || tracked.pendingOpen) return { synced: false, changed: [] };
+    const currentDebt = report.currentDebt ?? report.storedDebt ?? null;
+    return this._syncActivePositionFromChain(
+      tracked,
+      {
+        collateralAmount: report.collateralAmount !== undefined && report.collateralAmount !== null
+          ? BigInt(report.collateralAmount) : null,
+        currentDebt: currentDebt !== null && currentDebt !== undefined ? BigInt(currentDebt) : null,
+        isLong: report.isLong ?? null,
+      },
+      { managerAddr: report.managerAddr || null },
+    );
+  }
+
+  /**
+   * When a read-only snapshot PROVES a tracked position is gone on-chain
+   * (active=false), the stale local record is dropped (countClose=false — an
+   * externally-closed position is not a close this bot performed).
+   *
+   * @returns {boolean} true when a stale record was cleared
+   */
+  _clearIfTrackedClosed(report) {
+    if (!report || report.found !== true || report.active !== false) return false;
+    const tracked = this._findPosition(report.positionId);
+    if (!tracked || tracked.pendingOpen) return false;
+    return this._clearPosition(tracked, "proven closed on-chain", false);
+  }
+
+  // Test seams — production delegates straight to the module functions below;
+  // behavioral tests stub these to exercise decision logic without a chain.
+  async _closePositionImpl(args) { return closePositionFn(args); }
+  async _attemptPartialCloseImpl(args) { return attemptPartialClose(args); }
 
   /**
    * ONE operator action. Dry-run is the default: TX writes require BOTH
@@ -5772,18 +6858,84 @@ export class AutoTrader {
         this.log(`[BLOCKED] --leverage must be an integer ≥1 (got ${opts.leverage})`, "error");
         return { ...base, code: "BAD_LEVERAGE" };
       }
+
+      // A submitted-but-unconfirmed open must settle first: if its receipt
+      // already proves a position, opening again would DOUBLE-OPEN.
+      // Settle every pending open first — a receipt may already prove a
+      // position (and its slot must be counted before another open).
+      await this._settleAllPendingOpens();
+      const stillPending = this._positions().find(p => p?.pendingOpen);
+      if (stillPending) {
+        this.log(`[BLOCKED] open tx ${stillPending.txHash || "?"} still pending — resolve it before opening again`, "error");
+        return { ...base, code: "OPEN_PENDING", txHash: stillPending.txHash || null };
+      }
+
+      // RECONCILE BEFORE GATING — a stale record for a position the chain
+      // already closed must not occupy an open slot (read-only views only).
+      for (const rec of [...this._positions()]) {
+        if (rec?.pendingOpen || rec?.positionId == null) continue;
+        try {
+          const mgr = this.resolveManagerForPosition(rec)?.managerAddr || rec.managerAddr || null;
+          if (!mgr) continue;
+          const rep = await this.describePosition(String(rec.positionId), mgr);
+          if (rep && rep.found === false) continue; // unreadable → KEEP
+          if (rep && rep.active === false) {
+            this.log(`[SYNC] tracked position #${rec.positionId} already closed on-chain — clearing stale record`, "warn");
+            this._clearPosition(rec, "already closed on-chain", false);
+            continue;
+          }
+          if (rep) this._syncFromReport(rep);
+        } catch { /* unreadable → KEEP */ }
+      }
+
+      // CAP + PER-MARKET SLOT — a second open is refused when the global cap is
+      // full or the SAME market already has a tracked position. A position on
+      // market A never blocks opening on market B (multi-position).
+      const pinMarket = opts.marketSymbol
+        ? { marketSymbol: opts.marketSymbol, symbol: opts.marketSymbol }
+        : null;
+      const gate = this._canOpenNew({ market: pinMarket });
+      if (!gate.ok) {
+        if (gate.code === "MARKET_BUSY") {
+          return { ...base, code: "OPEN_EXISTS", positionId: String(this._positions().find(p => this._marketKeyOf(p) === this._marketKeyOfCandidate(pinMarket))?.positionId ?? "") };
+        }
+        return { ...base, code: gate.code === "MAX_OPEN_POSITIONS" ? "OPEN_EXISTS" : gate.code };
+      }
+
       this.log(`[SINGLE] OPEN ${side}${opts.marketSymbol ? ` on ${opts.marketSymbol}` : ""}${lev !== null ? ` @ ${lev}x` : ""} confirm=${confirm} dryRun=${dryRun}`, "warn");
-      const ok = await this.prepareAndOpen(side, { marketSymbol: opts.marketSymbol || null, leverage: lev });
-      const ap = this.state.activePosition;
+      const ok = await this.prepareAndOpen(side, {
+        marketSymbol: opts.marketSymbol || null,
+        leverage: lev,
+        dryRun, // confirm-gated: without --confirm this is a PLAN, never a TX
+      });
+      const ap = this._lastOpenedRecord && this._positions().includes(this._lastOpenedRecord)
+        ? this._lastOpenedRecord
+        : null;
+      const pending = !!ap?.pendingOpen && !!ap?.txHash;
       return {
-        ...base, ok: !!ok, code: ok ? (dryRun ? "OPEN_PLANNED" : "OPENED") : "OPEN_BLOCKED", dryRun,
+        ...base,
+        ok: !!ok && (dryRun || pending || !!ap),
+        code: !ok ? "OPEN_BLOCKED"
+          : dryRun ? "OPEN_PLANNED"
+          : pending ? "OPEN_PENDING"
+          : "OPENED",
+        dryRun,
         opened: ok ? ap : null,
+        txHash: pending ? ap.txHash : (ap && !dryRun ? ap.txHash : null),
         // dry-run: the leverage/market plan was logged by _resolveOpenLeverage
       };
     }
 
     if (action === "close" || action === "partial") {
-      const idRaw = opts.positionId ?? this.state.activePosition?.positionId ?? null;
+      // Settle pending opens first — a receipt may already prove the position
+      // (confirmed-but-not-synced): the id fallback below then works.
+      await this._settleAllPendingOpens();
+      const stillPending = this._positions().find(p => p?.pendingOpen);
+      if (stillPending) {
+        this.log(`[BLOCKED] open tx ${stillPending.txHash || "?"} still pending — cannot resolve a position id yet`, "error");
+        return { ...base, code: "OPEN_PENDING" };
+      }
+      const idRaw = opts.positionId ?? this._primaryPosition()?.positionId ?? null;
       if (idRaw === null || idRaw === undefined || `${idRaw}` === "") {
         this.log(`[BLOCKED] --id=<positionId> required (no tracked active position to fall back to)`, "error");
         return { ...base, code: "NO_POSITION_ID" };
@@ -5791,8 +6943,8 @@ export class AutoTrader {
       const idStr = String(idRaw);
 
       let mgrAddr = opts.manager || null;
-      const stored = this.state.activePosition;
-      if (!mgrAddr && stored && String(stored.positionId ?? "") === idStr) {
+      const stored = this._findPosition(idStr);
+      if (!mgrAddr && stored) {
         mgrAddr = this.resolveManagerForPosition(stored)?.managerAddr || stored.managerAddr || null;
       }
       if (!mgrAddr) {
@@ -5803,8 +6955,25 @@ export class AutoTrader {
       const { provider, wallet } = this.getRuntime();
       const report = await this.describePosition(idStr, mgrAddr);
       this._logPositionReport(report);
+      this._syncFromReport(report);
       if (!report.found) return { ...base, code: "NOT_FOUND", report };
-      if (report.active === false) return { ok: true, ...base, code: "ALREADY_CLOSED", report };
+      if (report.active === false) {
+        // Proven gone on-chain: a stale tracked record for this id must not
+        // survive as a fake "active" position (occupies a slot / repeats close).
+        if (stored && !stored.pendingOpen) {
+          this.log(`[SYNC] tracked position #${idStr} already closed on-chain — clearing stale record`, "warn");
+          this._clearPosition(stored, "already closed on-chain", false);
+        }
+        return { ...base, ok: true, code: "ALREADY_CLOSED", report };
+      }
+
+      // OWNER GUARD — describePosition proved who owns this id on THAT manager.
+      // A foreign owner (wrong --manager, cross-market id collision, stale
+      // deployment address) must never reach the send path, dry or live.
+      if (report.found && report.ours === false && report.user) {
+        this.log(`[BLOCKED] position #${idStr} on ${short(mgrAddr)} belongs to ${short(report.user)}, not this wallet — refusing ${action}`, "error");
+        return { ...base, code: "NOT_OURS", report };
+      }
 
       if (action === "close") {
         if (dryRun) {
@@ -5816,16 +6985,28 @@ export class AutoTrader {
           }
           return { ...base, ok: true, code: "DRY", report };
         }
-        const res = await closePositionFn({
+        const res = await this._closePositionImpl({
           wallet, provider, managerAddr: mgrAddr, positionId: BigInt(idStr),
           config: this.config, log: this.log.bind(this), dryRun: false, txManager: this.txManager,
         });
         const after = await this.describePosition(idStr, mgrAddr);
         this._logPositionReport(after);
+        this._syncFromReport(after);
         const verifiedClosed = res?.ok && after.found && after.active === false;
+        // Apply to local state: clears ONLY a verified close / zombie, keeps
+        // the record on pending/blocked/still-active (never marks closed early).
+        let applied = null;
+        if (stored) {
+          applied = this._applyCloseResult(stored, res);
+        } else if (verifiedClosed) {
+          this.log(`[CLOSE] #${idStr} closed on-chain (not tracked locally — local state untouched)`, "info");
+        }
+        // Chain-proven closed always wins: a failed/blocked result whose
+        // post-read now shows active=false clears the stale record too.
+        this._clearIfTrackedClosed(after);
         if (verifiedClosed) this.log(`[VERIFY] close CONFIRMED on-chain: #${idStr} is closed`, "success");
         else if (res && !res.ok && !res.failed) { /* dry or pending */ }
-        return { ...base, ok: !!verifiedClosed, result: res, report: after };
+        return { ...base, ok: !!verifiedClosed, result: res, report: after, applied };
       }
 
       // partial
@@ -5858,19 +7039,27 @@ export class AutoTrader {
         } : null, report };
       }
 
-      const res = await attemptPartialClose({
+      const res = await this._attemptPartialCloseImpl({
         wallet, provider, managerAddr: mgrAddr, positionId: BigInt(idStr),
         config: this.config, log: this.log.bind(this), txManager: this.txManager,
         targetCloseBps: closeBps,
       });
       const after = await this.describePosition(idStr, mgrAddr);
       this._logPositionReport(after);
+      this._syncFromReport(after);
+      let applied = null;
+      if (stored) {
+        // Verified full close → clears; target-done (still active) → keeps the
+        // record but reconciled with on-chain values; failed → keeps + backoff.
+        applied = this._applyCloseResult(stored, res);
+      }
+      this._clearIfTrackedClosed(after);
       if (res?.ok && after.found && after.active === false) {
         this.log(`[VERIFY] partial #${idStr} drove the position to CLOSED on-chain`, "success");
       } else if (res?.ok) {
         this.log(`[VERIFY] partial #${idStr} confirmed on-chain (position still active, reduced)`, "success");
       }
-      return { ...base, ok: !!res?.ok, result: res, report: after };
+      return { ...base, ok: !!res?.ok, result: res, report: after, applied };
     }
 
     this.log(`[BLOCKED] unknown action "${opts.action}" — use open|close|partial|status|swap`, "error");
@@ -5887,6 +7076,9 @@ export {
   encodeOpenPositionCalldata, TxManager, normalizeDirectionDisabled, recoverPosition,
   // Read-only helpers (view calls only — safe to use from tests)
   readOnChainPosition, previewCloseAt, findMaxCloseBps, positionIsClosed,
-  revertSelector, verifyOpenedPosition, verifySwapBalances,
+  revertSelector, verifyOpenedPosition, verifySwapBalances, attemptPartialClose,
+  // Open-event positionId extraction (topics layout proven on reference TX)
+  extractPositionIdFromLogs, MAM_POSITION_CREATED_TOPIC, MARGIN_FEE_ASSESSED_TOPIC,
+  CLOSE_POSITION_SELECTOR, MAX_PARTIAL_CLOSE_BPS,
 };
 export default AutoTrader;

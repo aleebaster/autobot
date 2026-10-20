@@ -612,7 +612,6 @@ async function testOnChainCycle({ provider, walletAddr }) {
   // (and a zero ok-count IS a failure). With none, it degrades to INFO.
   const evidence = (name, ok, detail, opTotal) => {
     if (opTotal === 0) {
-      total++;
       console.log(`  INFO  ${name} — ${detail} | no ${name.includes("SWAP") ? "SWAP" : "OPEN/CLOSE"} transactions for this wallet in the ${SCAN} window (condition, not a logic failure)`);
       return;
     }
@@ -680,7 +679,7 @@ async function testClosePlanning({ provider, wallet, walletAddr, markets }) {
   }
 
   // bot state
-  const st = trader.state.activePosition;
+  const st = trader.state.activePositions?.[0] ?? null;
   if (st) {
     console.log(`  bot state has activePosition #${st.positionId} (${st.side} ${st.marketSymbol})`);
     if (!ids.includes(Number(st.positionId))) ids.push(Number(st.positionId));
@@ -759,8 +758,8 @@ async function testClosePlanning({ provider, wallet, walletAddr, markets }) {
     let result;
     if (pre === "PASS") result = "EXECUTE";
     else if (pre === "ZOMBIE") result = "CLEAR";
-    else if (window !== "-" && window !== "CLOSE_BPS_NOT_FOUND" && window !== "PROBE_LIMIT" && window !== "CLOSE_AMOUNT_TOO_SMALL") result = "PARTIAL";
-    else if (window === "CLOSE_BPS_NOT_FOUND" || window === "PROBE_LIMIT" || window === "CLOSE_AMOUNT_TOO_SMALL") result = "WAIT";
+    else if (window !== "-" && window !== "CLOSE_BPS_NOT_FOUND" && window !== "PROBE_LIMIT" && window !== "CLOSE_AMOUNT_TOO_SMALL" && window !== "CLOSE_NO_FEASIBLE_WINDOW") result = "PARTIAL";
+    else if (window === "CLOSE_BPS_NOT_FOUND" || window === "PROBE_LIMIT" || window === "CLOSE_AMOUNT_TOO_SMALL" || window === "CLOSE_NO_FEASIBLE_WINDOW") result = "WAIT";
     else result = "FAIL";
 
     row([pid, statePos.side, `${side}/${pos.active ? "active" : "closed"}`, trunc(mgr, 10), src, calldata.slice(0, 10), pre, window, result, reason]);
@@ -858,8 +857,8 @@ function staticSafetyScan() {
   check("partialClose selector 0xdc439ba7 guard present", /0xdc439ba7/.test(src));
 
   // 5) swap always approves before swapExactTokensForTokens
-  // Window 900 (was 400): single-swap allowApprove guard sits between the check and the approve.
-  check("executeSwap approves router before swapping", /allowance < amount[\s\S]{0,900}approve\(routerAddr/.test(src));
+  // Window 1600 (was 900/400): the single-swap allowApprove guard AND the approve gas-estimate block (~129k deploys) sit between the check and the approve.
+  check("executeSwap approves router before swapping", /allowance < amount[\s\S]{0,1600}approve\(routerAddr/.test(src));
 
   // 6) state file untouched by this harness
   check("harness never writes auto-trader-state.json", !/saveState\(/.test(fs.readFileSync(repoFile("test_execution_matrix.mjs"), "utf8")));

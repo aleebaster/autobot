@@ -19,6 +19,15 @@ import { AutoTrader } from "./autoTrader.js";
 import { getConfirmedPools } from "./deployments/index.js";
 import { DEFAULT_ETH_GUARD } from "./tokenInventory.js";
 
+// ═══ LIVE-TEST GATE (default: SKIP) ═══════════════════════════════════════
+// This suite can sign real transactions. Normal runs must never do that:
+// it is only reachable with the explicit opt-in phrase below (the global
+// signer guard in _test_state_isolation.mjs enforces the same + chainId).
+if (process.env.NEMESIS_ALLOW_LIVE_TX !== "SEND LIVE TRANSACTIONS") {
+  console.log('SKIP — live-test opt-in missing. Re-run only with: NEMESIS_ALLOW_LIVE_TX="SEND LIVE TRANSACTIONS" (NEMESIS_LIVE_CHAIN_ID defaults to 11155111).');
+  process.exit(0);
+}
+
 const RPC_URL = "https://ethereum-sepolia-rpc.publicnode.com";
 const CHAIN_ID = 11155111;
 const WETH  = "0x7b79995e5f793A07Bc00c21412e50Ecae098E7f9";
@@ -154,7 +163,10 @@ async function main() {
   printBalances("INITIAL BALANCES", balInitial);
 
   // Save state for restore
-  const stateFile = "auto-trader-state.json";
+  // 2026-10 incident: this used the REAL repo path and (when the run was
+  // killed mid-test) left auto-trader-state.json overwritten with the 4-key
+  // fixture — always operate on this suite's isolated scratch copy instead.
+  const stateFile = TEST_STATE_FILE;
   const savedState = JSON.parse(fs.readFileSync(stateFile, "utf8"));
 
   // ════════ CONFIG ════════
@@ -192,7 +204,7 @@ async function main() {
 
   // Set state: lastSide=SHORT so next cycle goes LONG
   fs.writeFileSync(stateFile, JSON.stringify({
-    activePosition: null,
+    activePositions: [],
     sessionStats: savedState.sessionStats,
     lastCycleTime: 0,
     lastSide: "SHORT",
@@ -211,11 +223,11 @@ async function main() {
 
   // Close the opened position
   const stateAfterLong = JSON.parse(fs.readFileSync(stateFile, "utf8"));
-  if (stateAfterLong.activePosition) {
+  if (stateAfterLong.activePositions?.[0]) {
     console.log("\n  Closing LONG position...");
     fs.writeFileSync(stateFile, JSON.stringify({
       ...stateAfterLong,
-      activePosition: stateAfterLong.activePosition,
+      activePositions: stateAfterLong.activePositions || [],
     }, null, 2));
 
     const closer1 = new AutoTrader(deps);
@@ -240,7 +252,7 @@ async function main() {
 
   // Set state: lastSide=LONG so next cycle goes SHORT
   fs.writeFileSync(stateFile, JSON.stringify({
-    activePosition: null,
+    activePositions: [],
     sessionStats: savedState.sessionStats,
     lastCycleTime: 0,
     lastSide: "LONG",
@@ -259,11 +271,11 @@ async function main() {
 
   // Close the SHORT position
   const stateAfterShort = JSON.parse(fs.readFileSync(stateFile, "utf8"));
-  if (stateAfterShort.activePosition) {
+  if (stateAfterShort.activePositions?.[0]) {
     console.log("\n  Closing SHORT position...");
     fs.writeFileSync(stateFile, JSON.stringify({
       ...stateAfterShort,
-      activePosition: stateAfterShort.activePosition,
+      activePositions: stateAfterShort.activePositions || [],
     }, null, 2));
 
     const closer2 = new AutoTrader(deps);

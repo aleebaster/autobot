@@ -5,8 +5,8 @@
 //
 //  Candidate sources (merged, never invented):
 //    1. config.json           → availableMarkets  (declared symbols, supportsLong/Short, isActive)
-//    2. deployments/v2.js     → confirmedPools     (verified pool + manager addresses)
-//    3. deployments/v2.js     → knownMarkets       (reference symbols)
+//    2. deployments/<active>   → confirmedPools     (verified pool + manager addresses)
+//    3. deployments/<active>   → knownMarkets       (reference symbols)
 //    4. on-chain Factory      → getPool(tA,tB) / getManager(pool)  (authoritative pool set)
 //    5. on-chain Pool         → token0() / token1() / getReserves() / swapFeeBps()
 //    6. on-chain ERC20        → symbol() / decimals()   (NO hardcoded decimals anywhere)
@@ -455,6 +455,13 @@ export async function discoverMarkets({
   const tokenMetaCache = new TokenMetaCache(provider);
   const declared = mergeMarketSources({ availableMarkets, confirmedPools, knownMarkets });
 
+  // Active-deployment token set — used by the no-mix token-set gate below.
+  // Empty `tokens` (unit tests with no deployment context) disables the gate.
+  const activeTokenSet = new Set(
+    Object.values(tokens || {}).filter(Boolean).map(a => String(a).toLowerCase())
+  );
+  const tokenSetSize = activeTokenSet.size;
+
   // Seed meta cache from deployment token table (still verified on-chain below)
   for (const [sym, addr] of Object.entries(tokens)) {
     if (!addr) continue;
@@ -533,6 +540,19 @@ export async function discoverMarkets({
         rejected.push({ symbol: cand.symbol || poolAddr, pool: poolAddr, reason: `token0/token1: ${e.message?.slice(0, 40)}` });
         continue;
       }
+      // ── TOKEN-SET GATE (no-mix) ─────────────────────────────────────────────
+      // Both pool tokens must belong to the ACTIVE deployment token table.
+      // Blocks factory-registered pools that pair LEGACY tokens from another
+      // deployment era — e.g. 0xb773392D… USDT(old 0x5f2E83cC…)/WETH, which IS
+      // registered on the v5 factory but whose token0 is the pre-migration USDT.
+      if (tokenSetSize > 0) {
+        const outside = [token0, token1].filter(t => !activeTokenSet.has(String(t).toLowerCase()));
+        if (outside.length) {
+          rejected.push({ symbol: cand.symbol || poolAddr, pool: poolAddr, reason: `token(s) outside active deployment token set: ${outside.join(", ")}` });
+          log(`[DISCOVERY] REJECT ${cand.symbol || shortAddr(poolAddr)} — token(s) not in active deployment token table (no-mix gate)`, "warn");
+          continue;
+        }
+      }
       try {
         const r = await pool.getReserves();
         reserve0 = BigInt(r[0]); reserve1 = BigInt(r[1]);
@@ -542,10 +562,28 @@ export async function discoverMarkets({
       // manager — declared address verified, factory used as fallback/consistency check
       let managerAddr = cand.managerAddr || null;
       let factoryManager = null;
+      let factoryKnowsPool = null; // true/false/null(unknown — factory lacks the views)
       try {
         factoryManager = await factory.getManager(poolAddr);
         if (!factoryManager || factoryManager === ZERO_ADDRESS) factoryManager = null;
-      } catch {}
+        factoryKnowsPool = factoryManager ? true : false;
+      } catch { /* factory may not implement getManager */ }
+      // ── DEPLOYMENT-MIXING GATE ─────────────────────────────────────────────
+      // A declared candidate from ANOTHER deployment (e.g. config.availableMarkets
+      // left over from v2) has live pool code and a live manager, but the ACTIVE
+      // factory does not register it. Reject unless the active factory confirms
+      // the pool via getManager(pool) or getPool(token0, token1) == poolAddr.
+      if (factoryKnowsPool === false) {
+        try {
+          const gp = await factory.getPool(token0, token1);
+          factoryKnowsPool = !!(gp && gp !== ZERO_ADDRESS && addrEq(gp, poolAddr));
+        } catch { factoryKnowsPool = null; }
+        if (factoryKnowsPool === false) {
+          rejected.push({ symbol: cand.symbol || poolAddr, pool: poolAddr, reason: "pool not registered on active factory (other deployment?)" });
+          log(`[DISCOVERY] REJECT ${cand.symbol || shortAddr(poolAddr)} — not registered on active factory ${shortAddr(factoryAddress)}`, "warn");
+          continue;
+        }
+      }
       if (!managerAddr) managerAddr = factoryManager;
       if (!managerAddr) {
         rejected.push({ symbol: cand.symbol || poolAddr, pool: poolAddr, reason: "no manager" });

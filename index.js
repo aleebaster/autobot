@@ -15,19 +15,27 @@ const SEPOLIA_RPC_URL = "https://ethereum-sepolia-rpc.publicnode.com";
 const SEPOLIA_CHAIN_ID = 11155111;
 const CONFIG_FILE = "config.json";
 
-// Production manifest of nemesis.trade (site deployment) — NOT the bot deployment.
+// Production manifest of nemesis.trade (site deployment). Since the 2026-10-15
+// migration this IS the active bot deployment (v5). Kept as a named constant
+// for the mismatch banner comparison against non-v5 active deployments.
 const SITE_DEPLOYMENT = {
+  id: "v5",
   factory: "0x35f75f9218c640335d7166628319c4d95d1b0ae8",
-  router: "0x6c2844a5aFd10e22195d5f58227434b5b073b6d3",
-  source: "nemesis.trade client chunk (module 49514)",
+  router: "0x6c2844a5aFd10e22195d5f58227434b5b073b6D3",
+  source: "nemesis.trade client chunk (module 49514) — deployments/v5.js",
   startBlock: 11873268,
 };
 
 const DEPLOYMENT_BANNER_HEIGHT = 7;
 
-const WETH_ADDRESS = "0x7b79995e5f793A07Bc00c21412e50Ecae098E7f9";
-const USDT_ADDRESS = "0x5f2E83cCDEa73D60aF400e03F1Cd8Fb9eaB07b20";
-const USDC_ADDRESS = "0x5dcf1Db10F87CB7839640F9B85C4ECfA29b56e80";
+// Balance-display tokens — resolved from the ACTIVE deployment profile
+// (v5 = site tokens; switching deployments via setActiveDeployment updates these).
+const depTokens = () => {
+  try { return getActiveDeployment()?.tokens || {}; } catch { return {}; }
+};
+const WETH_ADDRESS = "0x7b79995e5f793A07Bc00c21412e50Ecae098E7f9"; // same on v2 and v5
+const USDT_ADDRESS = () => depTokens().USDT || "0x3a1ff83bfd63e5e2564aec95ade244234773049f";
+const USDC_ADDRESS = () => depTokens().USDC || "0xdac9ea11f206a88e00d4d6b8e5e767ac429c17b6";
 
 const ERC20_ABI = [
   "function balanceOf(address account) view returns (uint256)",
@@ -96,7 +104,9 @@ const ocStatusCache = { at: 0, inFlight: false, data: null };
 function refreshOnChainPositionStatus() {
   if (ocStatusCache.inFlight) return;
   if (Date.now() - ocStatusCache.at < 60_000) return;
-  const posState = autoTrader?.state?.activePosition;
+  // Multi-position: the on-chain detail panel shows the FIRST tracked record;
+  // the TRACKED line below lists every id.
+  const posState = autoTrader?.state?.activePositions?.[0] || null;
   const id = posState?.positionId;
   if (!id) {
     ocStatusCache.data = null;
@@ -252,8 +262,15 @@ function shortEvm(addr) {
 function deploymentMismatchLines() {
   let bot = {};
   try { bot = getActiveDeployment() || {}; } catch { bot = {}; }
+  if (bot.id === "v5") {
+    return [
+      `{bold}{green-fg}DEPLOYMENT OK:{/green-fg}{/bold} бот на production-деплої сайту nemesis.trade (v5).`,
+      `{bold}Bot=Site:{/bold} Factory ${shortEvm(bot.factory)} · Router ${shortEvm(bot.router)}`,
+      `{bold}Позиції:{/bold} відображатимуться на сайті (site subgraph).`,
+    ];
+  }
   return [
-    `{bold}{red-fg}DEPLOYMENT MISMATCH:{/red-fg}{/bold} бот і сайт Nemesis використовують різні Factory/Router. Позиції бота можуть не відображатися на сайті.`,
+    `{bold}{red-fg}DEPLOYMENT MISMATCH:{/red-fg}{/bold} active deployment is ${bot.id || "?"} — NOT the site (v5). Позиції бота НЕ відображатимуться на nemesis.trade.`,
     `{bold}Bot:{/bold}  Factory ${shortEvm(bot.factory)} · Router ${shortEvm(bot.router)}`,
     `{bold}Site:{/bold} Factory ${shortEvm(SITE_DEPLOYMENT.factory)} · Router ${shortEvm(SITE_DEPLOYMENT.router)}`,
   ];
@@ -261,6 +278,15 @@ function deploymentMismatchLines() {
 
 function updateDeploymentBanner() {
   try {
+    let bot = {};
+    try { bot = getActiveDeployment() || {}; } catch { bot = {}; }
+    if (bot.id === "v5") {
+      mismatchBox.style = { fg: "green", border: { fg: "green" }, label: { fg: "green", bold: true } };
+      mismatchBox.setLabel(" DEPLOYMENT ");
+    } else {
+      mismatchBox.style = { fg: "red", border: { fg: "red" }, label: { fg: "yellow", bold: true } };
+      mismatchBox.setLabel(" DEPLOYMENT WARNING ");
+    }
     mismatchBox.setContent(deploymentMismatchLines().join("\n"));
     safeRender();
   } catch {}
@@ -358,7 +384,8 @@ function updateAutoStatus() {
   autoStatusBox.show();
   refreshOnChainPositionStatus();
 
-  const pos = autoTrader?.state?.activePosition;
+  const trackedList = autoTrader?.state?.activePositions || [];
+  const pos = trackedList[0] || null;
   const stateColor = {
     IDLE: "white", SIGNAL: "yellow", SWAP: "yellow", ORACLE: "yellow",
     QUOTE: "yellow", PRE_FLIGHT: "yellow", OPEN: "green", MONITOR: "green",
@@ -373,6 +400,7 @@ function updateAutoStatus() {
     `{bold}{yellow-fg}● SWAP: {white-fg}${autoStatus.swap}{/white-fg}{/yellow-fg}{/bold}`,
     `{bold}{yellow-fg}● LEVERAGE: {white-fg}${autoStatus.leverage}{/white-fg}{/yellow-fg}{/bold}`,
     `{bold}{yellow-fg}● POSITION ID: {white-fg}${autoStatus.positionId}{/white-fg}{/yellow-fg}{/bold}`,
+    `{bold}{yellow-fg}● TRACKED: {white-fg}${trackedList.length} position(s)${trackedList.length ? ` — #${trackedList.map(p => p.positionId ?? "?").join(", #")}` : ""}{/white-fg}{/yellow-fg}{/bold}`,
     ...(() => {
       if (!pos) return [];
       const oc = ocStatusCache.data;
@@ -453,9 +481,9 @@ async function refreshWallet() {
     const addr = accounts[selectedWalletIndex].address;
 
     const ethBal = await provider.getBalance(addr);
-    const usdtContract = new ethers.Contract(USDT_ADDRESS, ERC20_ABI, provider);
+    const usdtContract = new ethers.Contract(USDT_ADDRESS(), ERC20_ABI, provider);
     const wethContract = new ethers.Contract(WETH_ADDRESS, ERC20_ABI, provider);
-    const usdcContract = new ethers.Contract(USDC_ADDRESS, ERC20_ABI, provider);
+    const usdcContract = new ethers.Contract(USDC_ADDRESS(), ERC20_ABI, provider);
 
     const [usdtBal, wethBal, usdcBal] = await Promise.all([
       usdtContract.balanceOf(addr),
@@ -621,48 +649,61 @@ async function closeManual() {
     const chainId = config.chainId || SEPOLIA_CHAIN_ID;
     const provider = new ethers.JsonRpcProvider(rpcUrl, chainId);
     const wallet = new ethers.Wallet(accounts[selectedWalletIndex].privateKey, provider);
-    const posState = autoTrader?.state?.activePosition;
-    if (!posState) {
-      addLog("No tracked position to close. Use Full Auto for automatic recovery.", "warn");
+    const trackedList = autoTrader?.state?.activePositions || [];
+    if (!trackedList.length) {
+      addLog("No tracked positions to close. Use Full Auto for automatic recovery.", "warn");
       return;
     }
 
-    // ALWAYS close via THIS position's own manager — never a side-derived fallback,
-    // which can target a DIFFERENT market's manager (P7).
-    const resolved = autoTrader?.resolveManagerForPosition?.(posState) || null;
-    const managerAddr = resolved?.managerAddr || posState.managerAddr || null;
-    if (!managerAddr) {
-      addLog(`Cannot resolve manager for position #${posState.positionId} — NOT closing, NOT clearing`, "error");
-      return;
-    }
-    addLog(`Closing position #${posState.positionId} on manager ${managerAddr.slice(0,10)}... (market=${posState.marketSymbol || resolved?.marketSymbol || "?"}, src=${resolved?.source || "state"})`, "info");
-
-    const { closePositionFn } = await import("./autoTrader.js");
-    const result = await closePositionFn({
-      wallet, provider, managerAddr,
-      positionId: posState.positionId,
-      config: { deadlineSeconds: 1200, dryRun: false },
-      log: addLog,
-      dryRun: false,
-    });
-
-    if (result?.pending) {
-      addLog(`Close TX ${result.txHash || ""} pending — keeping position in state`, "warn");
-    } else if (result?.failed) {
-      if (result.clearState === false) {
-        addLog(`Close blocked (${result.code || result.reason}) — keeping position in state`, "warn");
+    const dropRecord = (rec, reason) => {
+      if (typeof autoTrader._clearPosition === "function") {
+        autoTrader._clearPosition(rec, reason, true);
       } else {
-        addLog("Position no longer exists", "warn");
-        autoTrader.state.activePosition = null;
+        const a = autoTrader.state.activePositions || [];
+        const i = a.indexOf(rec);
+        if (i >= 0) a.splice(i, 1);
         autoTrader.state.sessionStats.closes++;
       }
-    } else if (result?.closed === false) {
-      addLog(`Close not finished (${result.code || "still active"}) — keeping position in state`, "warn");
-    } else if (result) {
-      addLog("Position CLOSED (verified on-chain)", "success");
-      autoTrader.state.activePosition = null;
-      autoTrader.state.sessionStats.closes++;
+    };
+    const { closePositionFn } = await import("./autoTrader.js");
+    let closed = 0;
+    for (const posState of [...trackedList]) {
+      // ALWAYS close via THIS position's own manager — never a side-derived
+      // fallback, which can target a DIFFERENT market's manager (P7).
+      const resolved = autoTrader?.resolveManagerForPosition?.(posState) || null;
+      const managerAddr = resolved?.managerAddr || posState.managerAddr || null;
+      if (!managerAddr) {
+        addLog(`Cannot resolve manager for position #${posState.positionId} — NOT closing, NOT clearing`, "error");
+        continue;
+      }
+      addLog(`Closing position #${posState.positionId} on manager ${managerAddr.slice(0,10)}... (market=${posState.marketSymbol || resolved?.marketSymbol || "?"}, src=${resolved?.source || "state"})`, "info");
+
+      const result = await closePositionFn({
+        wallet, provider, managerAddr,
+        positionId: posState.positionId,
+        config: { deadlineSeconds: 1200, dryRun: false },
+        log: addLog,
+        dryRun: false,
+      });
+
+      if (result?.pending) {
+        addLog(`Close TX ${result.txHash || ""} pending — keeping position in state`, "warn");
+      } else if (result?.failed) {
+        if (result.clearState === false) {
+          addLog(`Close blocked (${result.code || result.reason}) — keeping position in state`, "warn");
+        } else {
+          addLog(`Position #${posState.positionId} no longer exists`, "warn");
+          dropRecord(posState, "manual: gone");
+        }
+      } else if (result?.closed === false) {
+        addLog(`Close not finished (${result.code || "still active"}) — keeping position in state`, "warn");
+      } else if (result) {
+        addLog(`Position #${posState.positionId} CLOSED (verified on-chain)`, "success");
+        dropRecord(posState, "manual: verified close");
+        closed++;
+      }
     }
+    addLog(`Manual close pass done: ${closed}/${trackedList.length} verified`, closed ? "success" : "warn");
   } catch (e) {
     addLog(`Close error: ${e.message?.slice(0, 80)}`, "error");
   } finally {

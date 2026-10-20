@@ -1,21 +1,27 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-//  DEPLOYMENT SWITCHER — Unified interface for V1/V2/V3/V4 deployments
+//  DEPLOYMENT SWITCHER — Unified interface for V1/V2/V3/V4/V5 deployments
 //  Provides: getDeploymentProfile(), getActiveDeployment(), setActiveDeployment()
+//  Default active: V5 = nemesis.trade production (site deployment).
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import { V1_PROFILE } from "./v1.js";
 import { V2_PROFILE } from "./v2.js";
 import { V3_PROFILE } from "./v3.js";
 import { V4_PROFILE } from "./v4.js";
+import { V5_PROFILE } from "./v5.js";
 
 const DEPLOYMENTS = {
   v1: V1_PROFILE,
   v2: V2_PROFILE,
   v3: V3_PROFILE,
   v4: V4_PROFILE,
+  v5: V5_PROFILE,
 };
 
-let activeDeploymentId = "v2"; // Default to V2 (active Nemesis deployment)
+// Default: V5 = nemesis.trade production (site deployment, migrated 2026-10-15).
+// V2 remains selectable for read-only diagnostics of the OLD bot deployment
+// (positions #75/#61 and their state are preserved under v2 addresses).
+let activeDeploymentId = "v5";
 
 /**
  * Get all available deployment profiles
@@ -27,7 +33,7 @@ export function getAllDeployments() {
 
 /**
  * Get a specific deployment profile by ID
- * @param {string} id - "v1" | "v2" | "v3" | "v4"
+ * @param {string} id - "v1" | "v2" | "v3" | "v4" | "v5"
  * @returns {Object|null} Deployment profile or null
  */
 export function getDeploymentProfile(id) {
@@ -44,7 +50,7 @@ export function getActiveDeployment() {
 
 /**
  * Set the active deployment by ID
- * @param {string} id - "v1" | "v2" | "v3" | "v4"
+ * @param {string} id - "v1" | "v2" | "v3" | "v4" | "v5"
  * @returns {Object} The activated deployment profile
  * @throws {Error} If deployment ID is unknown or not configured
  */
@@ -60,7 +66,7 @@ export function setActiveDeployment(id) {
 
 /**
  * Get the active deployment ID
- * @returns {string} Current deployment ID ("v1", "v2", etc.)
+ * @returns {string} Current deployment ID ("v1", "v2", …, "v5")
  */
 export function getActiveDeploymentId() {
   return activeDeploymentId;
@@ -76,8 +82,14 @@ export async function autoDetectDeployment(provider) {
   try {
     const { ethers } = await import("ethers");
 
-    // Check NEW V2 Factory first (0xdED3D3CA2F7eFDE734790ce51bD03D5145E4830B)
-    // This is the active deployment confirmed by reference manual tx 0x47b31...
+    // Check V5 (site / nemesis.trade production) Factory first — this is the
+    // active deployment after the 2026-10-15 migration.
+    const v5FactoryCode = await provider.getCode("0x35f75f9218c640335d7166628319c4d95d1b0ae8");
+    if (v5FactoryCode && v5FactoryCode !== "0x" && v5FactoryCode.length > 10) {
+      return "v5";
+    }
+
+    // Check OLD V2 Factory (0xdED3D3CA2F7eFDE734790ce51bD03D5145E4830B)
     const newV2FactoryCode = await provider.getCode("0xdED3D3CA2F7eFDE734790ce51bD03D5145E4830B");
     if (newV2FactoryCode && newV2FactoryCode !== "0x" && newV2FactoryCode.length > 10) {
       return "v2";
@@ -108,7 +120,7 @@ export function isV1() {
  * @returns {boolean}
  */
 export function isV2Plus() {
-  return activeDeploymentId === "v2" || activeDeploymentId === "v3" || activeDeploymentId === "v4";
+  return ["v2", "v3", "v4", "v5"].includes(activeDeploymentId);
 }
 
 /**
@@ -192,4 +204,5 @@ export default {
   V2_PROFILE,
   V3_PROFILE,
   V4_PROFILE,
+  V5_PROFILE,
 };

@@ -3,6 +3,7 @@
 //  Uses the EXACT same code path as autoTrader (imported directly)
 // ═══════════════════════════════════════════════════════════════════════════
 
+import "./_test_state_isolation.mjs"; // state redirect + default-deny live-TX guard
 import { ethers } from "ethers";
 import fs from "fs";
 import { getConfirmedPools } from "./deployments/index.js";
