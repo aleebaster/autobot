@@ -37,6 +37,8 @@
   "continuousTradingEnabled": true,
   "swapsPerPosition": 10,
   "maxSwapAttemptsPerCycle": 40,
+  "openRetryIntervalMs": 60000,
+  "maxFailedAttemptCostWei": "50000000000000000",
   "minHoldSeconds": 60,
   "maxHoldSeconds": 300,
   "emergencyCloseEnabled": true,

@@ -311,6 +311,10 @@ async function main() {
     continuousTradingEnabled: config.continuousTradingEnabled === true,
     swapsPerPosition: Number(config.swapsPerPosition ?? 10),
     maxSwapAttemptsPerCycle: Number(config.maxSwapAttemptsPerCycle ?? 40),
+    // CONTINUOUS RETRY CONTROLS — failed OPEN is rate-limited (never a halt);
+    // reverted-tx gas is budgeted before swap-quota attempts pause.
+    openRetryIntervalMs: Number(config.openRetryIntervalMs ?? 60_000),
+    ...(config.maxFailedAttemptCostWei !== undefined ? { maxFailedAttemptCostWei: config.maxFailedAttemptCostWei } : {}),
     // Only forwarded when set — an explicit undefined would clobber the
     // per-symbol default map in DEFAULT_AUTO_CONFIG via the config spread.
     ...(config.minExitReserveWhole !== undefined ? { minExitReserveWhole: config.minExitReserveWhole } : {}),

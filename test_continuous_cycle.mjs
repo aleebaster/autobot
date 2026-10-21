@@ -129,11 +129,17 @@ section("C1: config wiring — defaults, auto.js whitelist, config.json");
     /continuousTradingEnabled:\s*false/.test(src)
     && /swapsPerPosition:\s*10/.test(src)
     && /maxSwapAttemptsPerCycle:\s*40/.test(src));
+  check("autoTrader defaults declare the retry-control keys",
+    /openRetryIntervalMs:\s*60_000/.test(src)
+    && /maxFailedAttemptCostWei:\s*"50000000000000000"/.test(src));
   const js = fs.readFileSync(path.resolve("auto.js"), "utf8");
   check("auto.js wires continuousTradingEnabled/swapsPerPosition/maxSwapAttemptsPerCycle into autoConfig",
     js.includes("continuousTradingEnabled: config.continuousTradingEnabled === true,")
     && js.includes("swapsPerPosition: Number(config.swapsPerPosition ?? 10),")
     && js.includes("maxSwapAttemptsPerCycle: Number(config.maxSwapAttemptsPerCycle ?? 40),"));
+  check("auto.js wires openRetryIntervalMs + maxFailedAttemptCostWei",
+    js.includes("openRetryIntervalMs: Number(config.openRetryIntervalMs ?? 60_000),")
+    && js.includes("maxFailedAttemptCostWei: config.maxFailedAttemptCostWei"));
   check("auto.js parses --max-trading-cycles and --reset-halt and passes them to start()",
     js.includes('argValue("--max-trading-cycles")')
     && js.includes('process.argv.includes("--reset-halt")')
@@ -144,6 +150,9 @@ section("C1: config wiring — defaults, auto.js whitelist, config.json");
   check("config.json: continuousTradingEnabled=true, swapsPerPosition=10, maxSwapAttemptsPerCycle=40",
     cfg.continuousTradingEnabled === true && cfg.swapsPerPosition === 10 && cfg.maxSwapAttemptsPerCycle === 40,
     `cte=${cfg.continuousTradingEnabled} spp=${cfg.swapsPerPosition} msac=${cfg.maxSwapAttemptsPerCycle}`);
+  check("config.json: openRetryIntervalMs=60000 + maxFailedAttemptCostWei=0.05ETH",
+    cfg.openRetryIntervalMs === 60000 && cfg.maxFailedAttemptCostWei === "50000000000000000",
+    `orim=${cfg.openRetryIntervalMs} mfacw=${cfg.maxFailedAttemptCostWei}`);
   check("config.json: sequential cycle — maxOpenPositions=1, maxTradesPerRun=0, both sides + swaps enabled",
     cfg.maxOpenPositions === 1 && cfg.maxTradesPerRun === 0
     && cfg.enableLong === true && cfg.enableShort === true && cfg.enableSwaps === true,
@@ -153,6 +162,13 @@ section("C1: config wiring — defaults, auto.js whitelist, config.json");
     && Array.isArray(cfg.enabledMarkets) && cfg.enabledMarkets.length === 0
     && Number.isFinite(cfg.swap?.maxConsecutiveFailures),
     `hold=${cfg.minHoldSeconds}-${cfg.maxHoldSeconds} haltThr=${cfg.swap?.maxConsecutiveFailures}`);
+  // defaults resolve on a bare trader
+  const t2 = makeTrader({ openRetryIntervalMs: undefined, maxFailedAttemptCostWei: undefined });
+  delete t2.config.openRetryIntervalMs;
+  delete t2.config.maxFailedAttemptCostWei;
+  check("bare defaults: openRetryIntervalMs=60000, maxFailedAttemptCostWei=0.05ETH",
+    t2._openRetryIntervalMs() === 60_000 && t2._failedAttemptBudgetWei() === 50000000000000000n,
+    `orim=${t2._openRetryIntervalMs()} budget=${t2._failedAttemptBudgetWei()}`);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -281,7 +297,7 @@ section("C3: verified close completes the cycle; halt trips at the threshold");
 // ═══════════════════════════════════════════════════════════════════════════
 // C4 — _canOpenNew in continuous mode
 // ═══════════════════════════════════════════════════════════════════════════
-section("C4: _canOpenNew — sequential max=1, closeBlocked excluded, legacy unchanged");
+section("C4: _canOpenNew — sequential max=1, blocked positions occupy the slot");
 
 {
   const t = makeTrader();
@@ -292,13 +308,9 @@ section("C4: _canOpenNew — sequential max=1, closeBlocked excluded, legacy unc
     t._canOpenNew({ log: false }).code === "MAX_OPEN_POSITIONS",
     `code=${t._canOpenNew({ log: false }).code}`);
   live.closeBlocked = true;
-  check("closeBlocked legacy position does NOT occupy the sequential slot",
-    t._canOpenNew({ log: false }).ok === true,
-    `count=${t._canOpenNew({ log: false }).count}`);
-  t._positions().push(rec(802, "SHORT"));
-  check("a second (non-blocked) position fills the slot again",
-    t._canOpenNew({ log: false }).code === "MAX_OPEN_POSITIONS");
-
+  check("closeBlocked position OCCUPIES the slot (no OPEN on top of a blocked one)",
+    t._canOpenNew({ log: false }).code === "MAX_OPEN_POSITIONS",
+    `code=${t._canOpenNew({ log: false }).code} count=${t._canOpenNew({ log: false }).count}`);
   // legacy mode (continuous off) — closeBlocked still counts, max from config
   const leg = makeTrader({ continuousTradingEnabled: false, maxOpenPositions: 3 });
   const p1 = rec(811, "LONG", { closeBlocked: true });
@@ -311,24 +323,34 @@ section("C4: _canOpenNew — sequential max=1, closeBlocked excluded, legacy unc
 // ═══════════════════════════════════════════════════════════════════════════
 // C5 — _swapRunOpts
 // ═══════════════════════════════════════════════════════════════════════════
-section("C5: _swapRunOpts — quota-limited while HOLDING, skipped when closing");
+section("C5: _swapRunOpts — quota-limited while HOLDING, safe maintenance when closing");
 
 {
   const t = makeTrader();
-  check("no live cycle → plain maintenance pass", t._swapRunOpts("LOOP")?.phase === "LOOP" && !("maxSwaps" in (t._swapRunOpts("LOOP") || {})));
+  check("no live cycle → plain maintenance pass with protectedPools", (() => {
+    const o = t._swapRunOpts("LOOP");
+    return o && o.phase === "LOOP" && !("maxSwaps" in o) && Array.isArray(o.protectedPools);
+  })());
   t._trackOpenedPosition(rec(901, "LONG"));
   t._ingestSwapSummary({ results: [okSwap(1), okSwap(2), okSwap(3)] });
   const o = t._swapRunOpts("LOOP");
-  check("HOLDING with 3/10 verified → maxSwaps = remaining (7)",
-    o && o.phase === "LOOP" && o.maxSwaps === 7,
+  check("HOLDING with 3/10 verified → maxSwaps = remaining (7), protectedPools present",
+    o && o.phase === "LOOP" && o.maxSwaps === 7 && Array.isArray(o.protectedPools),
     `maxSwaps=${o?.maxSwaps}`);
+  check("protectedPools contains the tracked position's pool (POOL_A)",
+    o.protectedPools.includes(POOL_A.toLowerCase()),
+    `pools=${JSON.stringify(o.protectedPools)}`);
   t._ingestSwapSummary({ results: [okSwap(4), okSwap(5), okSwap(6), okSwap(7), okSwap(8), okSwap(9), okSwap(10)] });
-  check("READY_TO_CLOSE → swap phase skipped (never overshoot the quota)",
-    t._swapRunOpts("LOOP") === null);
+  check("READY_TO_CLOSE → safe maintenance continues (protectedPools only, no quota maxSwaps)",
+    (() => {
+      const oo = t._swapRunOpts("LOOP");
+      return oo && oo.phase === "LOOP" && !("maxSwaps" in oo) && Array.isArray(oo.protectedPools);
+    })(),
+    `opts=${JSON.stringify(t._swapRunOpts("LOOP"))}`);
   const off = makeTrader({ continuousTradingEnabled: false });
   off._trackOpenedPosition(rec(911, "LONG"));
   const oo = off._swapRunOpts("LOOP");
-  check("continuous OFF → plain pass even with a live position",
+  check("continuous OFF → plain pass even with a live position (no protectedPools forced)",
     oo && oo.phase === "LOOP" && oo.maxSwaps === undefined);
 }
 
@@ -545,6 +567,280 @@ section("C11: static wiring — exit probe before OPEN, cycle hooks in start()")
     src.includes("!(maxTradingCycles !== null && this._haltInfo())"));
   check("counted swaps are exactly the balance-verified ok results (status:\"ok\" + txHash)",
     src.includes('if (r?.status === "ok" && r.txHash)'));
+  // retry-control wiring (new behavior)
+  check("start() uses _noteOpenFailure on a failed OPEN (never _noteCycleFailure(OPEN_FAILED))",
+    src.includes('this._noteOpenFailure(side, "all candidate markets failed");')
+    && !src.includes('_noteCycleFailure("OPEN_FAILED"'));
+  check("start() gates OPEN on the openRetry rate-limit (OPEN_RETRY_WAIT)",
+    src.includes("const retryAt = this._continuousEnabled() ? this._openRetryPending() : 0;")
+    && src.includes("reason=OPEN_RETRY_WAIT"));
+  check("TxManager forwards reverted receipts to the budget hook (onReverted)",
+    src.includes("onReverted = onReverted || null;")
+    && src.includes("this.onReverted?.(receipt, txType);")
+    && src.includes("onReverted: (receipt, txType) => this._noteFailedTxCost(receipt, txType),"));
+  check("_swapRunOpts gates swaps on the failed-attempt budget + carries protectedPools",
+    src.includes("if (this._failedAttemptBudgetExceeded())")
+    && src.includes("protectedPools = [...this._protectedPools()]"));
+  check("runSwapMaintenanceCycle filters protected-pool directions",
+    src.includes("directions = this._filterProtectedDirections(directions, options.protectedPools);"));
+  check("_ingestSwapSummary logs SWAP_SUCCESS / SWAP_FAILED",
+    src.includes("[SWAP_SUCCESS]") && src.includes("[SWAP_FAILED]"));
+  check("_applyCloseResult logs CLOSE_RETRY / POSITION_BLOCKED",
+    src.includes("[CLOSE_RETRY]") && src.includes("[POSITION_BLOCKED]"));
+  check("_onPositionClosed logs NEXT_CYCLE + resets the failed-attempt budget",
+    src.includes("[NEXT_CYCLE]") && src.includes("delete this.state.failedGasCostWei;"));
+  check("recovery auto-clears a stale OPEN_FAILED halt",
+    src.includes('staleHalt.reason === "OPEN_FAILED"'));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// R1 — failed OPEN: rate-limited retry, NEVER a halt
+// ═══════════════════════════════════════════════════════════════════════════
+section("R1: failed OPEN — rate-limited retry, never trips the halt");
+
+{
+  const t = makeTrader({ openRetryIntervalMs: 60_000 });
+  t._noteOpenFailure("LONG", "all candidate markets failed");
+  check("1st OPEN failure: openRetryAt set ~60s ahead, openFailures=1",
+    t._openRetryPending() > Date.now() && Number(t.state.openFailures) === 1,
+    `retryIn=${Math.round((t._openRetryPending() - Date.now()) / 1000)}s failures=${t.state.openFailures}`);
+  check("OPEN_RETRY log emitted", t._logText().includes("[OPEN_RETRY]"));
+  check("no halt after 1st failure", !t._haltInfo());
+  t._noteOpenFailure("SHORT", "exit probe failed");
+  t._noteOpenFailure("LONG", "all candidate markets failed");
+  check("3 consecutive OPEN failures → still NO halt (failures not counted toward continuousFailures)",
+    !t._haltInfo() && Number(t.state.continuousFailures || 0) === 0,
+    `halt=${JSON.stringify(t.state.continuousHalt)} contFail=${t.state.continuousFailures}`);
+  check("_canOpenNew is NOT TRADING_HALTED (gate still live, only rate-limited)",
+    t._canOpenNew({ log: false }).code !== "TRADING_HALTED",
+    `code=${t._canOpenNew({ log: false }).code}`);
+  check("openRetryReason/side recorded for the gate log",
+    t.state.openRetryReason === "all candidate markets failed" && t.state.openRetrySide === "LONG",
+    `reason=${t.state.openRetryReason} side=${t.state.openRetrySide}`);
+  // a successful OPEN clears the window
+  t._clearOpenRetry();
+  check("_clearOpenRetry resets the window + counter",
+    t._openRetryPending() === 0 && Number(t.state.openFailures || 0) === 0
+    && !t.state.openRetryAt && !t.state.openRetryReason);
+  // retry window expiry: backdated timestamp → gate open again
+  t.state.openRetryAt = Date.now() - 1;
+  check("expired window → _openRetryPending() returns 0 (OPEN allowed again)",
+    t._openRetryPending() === 0);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// R2 — failed CLOSE: record kept, CLOSE_RETRY logged, no halt, no fake close
+// ═══════════════════════════════════════════════════════════════════════════
+section("R2: failed CLOSE — record kept, CLOSE_RETRY logged, cycle not completed");
+
+{
+  const t = makeTrader();
+  const p = rec(1301, "LONG");
+  t._trackOpenedPosition(p);
+  const tracked = t._positions().find(x => x.positionId === 1301);
+  const r1 = t._applyCloseResult(tracked, { failed: true, clearState: false, code: "CLOSE_NO_FEASIBLE_WINDOW", wait: true }, "1:9:1");
+  check("CLOSE_NO_FEASIBLE_WINDOW → blocked + record KEPT + CLOSE_RETRY logged",
+    r1.blocked === true && t._positions().some(x => x.positionId === 1301) && t._logText().includes("[CLOSE_RETRY]"),
+    `code=${r1.code}`);
+  check("POSITION_BLOCKED logged + closeBlocked=true",
+    t._logText().includes("[POSITION_BLOCKED]") && tracked.closeBlocked === true);
+  check("cycle NOT completed by the failed close (still HOLDING, no cyclesDone)",
+    t._getCycle().status === "HOLDING" && t._tradingCyclesDone === 0,
+    `status=${t._getCycle().status} done=${t._tradingCyclesDone}`);
+  check("no halt from a failed CLOSE", !t._haltInfo() && Number(t.state.continuousFailures || 0) === 0);
+  check("closeRetry scheduled per-position (exponential backoff exists)",
+    tracked.closeRetry != null && Number(tracked.closeAttempts || 0) >= 1,
+    `retryAt=${tracked.closeRetry} attempts=${tracked.closeAttempts}`);
+  // a still-active close result (closed===false) also keeps + CLOSE_RETRY
+  const t2 = makeTrader();
+  const p2 = rec(1311, "SHORT");
+  t2._positions().push(p2);
+  const r2 = t2._applyCloseResult(p2, { ok: true, closed: false, code: "STILL_ACTIVE", txHash: "0x" + "aa".repeat(32) }, "2:9:1");
+  check("closed===false → blocked + record KEPT + CLOSE_RETRY + no cycle completion",
+    r2.blocked === true && t2._positions().includes(p2)
+    && t2._logText().includes("[CLOSE_RETRY]") && t2._tradingCyclesDone === 0,
+    `code=${r2.code}`);
+  // pending close → state kept, CLOSE_RETRY
+  const t3 = makeTrader();
+  const p3 = rec(1321, "LONG");
+  t3._positions().push(p3);
+  const r3 = t3._applyCloseResult(p3, { pending: true, txHash: "0x" + "bb".repeat(32) }, "3:9:1");
+  check("pending close → state kept + CLOSE_RETRY (never treated as closed)",
+    r3.blocked === false && t3._positions().includes(p3) && t3._logText().includes("[CLOSE_RETRY]"),
+    `code=${r3.code}`);
+  // blocked position occupies the open slot → no duplicate open
+  const gate = t._canOpenNew({ log: false });
+  check("blocked position occupies the slot → _canOpenNew=MAX_OPEN_POSITIONS (dup protection)",
+    gate.code === "MAX_OPEN_POSITIONS",
+    `code=${gate.code} count=${gate.count}`);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// R3 — repeated SWAP failures: not counted toward quota, attempt cap bounds
+// ═══════════════════════════════════════════════════════════════════════════
+section("R3: repeated SWAP failures — never counted, attempt cap bounds, SWAP_FAILED logged");
+
+{
+  const t = makeTrader({ maxSwapAttemptsPerCycle: 5 });
+  t._trackOpenedPosition(rec(1401, "LONG"));
+  for (let i = 0; i < 5; i++) {
+    t._ingestSwapSummary({ results: [{ status: "fail", code: "TX_REVERTED", direction: `USDT->USDC` }] });
+  }
+  check("5 failed swaps → 0 verified, attempts=5, SWAP_QUOTA_EXHAUSTED",
+    (t._getCycle().confirmedSwaps || []).length === 0 && t._getCycle().attempts === 5
+    && t._getCycle().status === "SWAP_QUOTA_EXHAUSTED",
+    `verified=${(t._getCycle().confirmedSwaps || []).length} attempts=${t._getCycle().attempts} status=${t._getCycle().status}`);
+  check("SWAP_FAILED logged for each failure",
+    (t._logText().match(/\[SWAP_FAILED\]/g) || []).length === 5,
+    `count=${(t._logText().match(/\[SWAP_FAILED\]/g) || []).length}`);
+  check("SWAP_QUOTA_EXHAUSTED counts ONE cycle failure (halt threshold reuses swap.maxConsecutiveFailures)",
+    Number(t.state.continuousFailures) === 1,
+    `failures=${t.state.continuousFailures}`);
+  // mixed ok + fail: only ok counts
+  const t2 = makeTrader();
+  t2._trackOpenedPosition(rec(1411, "SHORT"));
+  t2._ingestSwapSummary({ results: [okSwap(1), { status: "fail", code: "TX_REVERTED" }, okSwap(2)] });
+  check("mixed results → only status:\"ok\" counted (2 verified), SWAP_SUCCESS logged",
+    (t2._getCycle().confirmedSwaps || []).length === 2
+    && (t2._logText().match(/\[SWAP_SUCCESS\]/g) || []).length === 2,
+    `verified=${(t2._getCycle().confirmedSwaps || []).length}`);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// R4 — protected pools: tracked position's pool is never swapped through
+// ═══════════════════════════════════════════════════════════════════════════
+section("R4: protected pools — tracked position's pool filtered from swap directions");
+
+{
+  const t = makeTrader();
+  t._positions().push(rec(1501, "LONG", { poolAddr: POOL_A }));
+  const prot = t._protectedPools();
+  check("_protectedPools returns the tracked pool (lowercased)",
+    prot instanceof Set && prot.has(POOL_A.toLowerCase()),
+    `pools=${[...prot].join(",")}`);
+  const dirs = [
+    { pool: POOL_A, pool2: null, key: "USDT>USDC" },
+    { pool: "0x" + "cc".repeat(20), pool2: POOL_A, key: "USDC>DAI" },
+    { pool: "0x" + "dd".repeat(20), pool2: "0x" + "ee".repeat(20), key: "DAI>LINK" },
+  ];
+  const kept = t._filterProtectedDirections(dirs, prot);
+  check("directions touching the protected pool (either leg) are dropped",
+    kept.length === 1 && kept[0].key === "DAI>LINK",
+    `kept=${kept.map(d => d.key).join(",")}`);
+  check("empty protected set → nothing filtered",
+    t._filterProtectedDirections(dirs, new Set()).length === 3);
+  check("case-insensitive pool match",
+    t._filterProtectedDirections([{ pool: POOL_A.toUpperCase(), key: "X>Y" }], prot).length === 0);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// R5 — failed-attempt gas budget: accumulates, pauses swaps, resets on success
+// ═══════════════════════════════════════════════════════════════════════════
+section("R5: failed-attempt gas budget — accumulate, pause swaps, reset on cycle success");
+
+{
+  const t = makeTrader({ maxFailedAttemptCostWei: "1000000000000000" }); // 0.001 ETH
+  t._trackOpenedPosition(rec(1601, "LONG"));
+  t._noteFailedTxCost({ gasUsed: 100000n, effectiveGasPrice: 10n ** 9n }, "SWAP"); // 0.0001 ETH
+  check("1st revert accumulates failedGasCostWei (0.0001 ETH)",
+    t.state.failedGasCostWei === "100000000000000",
+    `cost=${t.state.failedGasCostWei}`);
+  check("budget not yet exceeded", t._failedAttemptBudgetExceeded() === false);
+  check("swaps still allowed while under budget",
+    t._swapRunOpts("LOOP") !== null && t._swapRunOpts("LOOP").maxSwaps === 10);
+  t._noteFailedTxCost({ gasUsed: 100000n, effectiveGasPrice: 10n ** 10n }, "SWAP"); // 0.001 ETH → total 0.0011
+  check("budget now exceeded (0.0011 ≥ 0.001 ETH)", t._failedAttemptBudgetExceeded() === true);
+  check("BUDGET log emitted", t._logText().includes("[BUDGET]"));
+  check("swaps PAUSED while HOLDING (quota swaps blocked)",
+    t._swapRunOpts("LOOP") === null);
+  check("BUDGET pause logged once", (t._logText().match(/\[BUDGET\] failed-attempt gas budget exhausted/g) || []).length === 1);
+  // successful cycle resets the budget
+  t._ingestSwapSummary({ results: Array.from({ length: 10 }, (_, i) => okSwap(i + 1)) });
+  const p = t._positions()[0];
+  t._clearPosition(p, "verified close");
+  check("successful cycle resets failedGasCostWei", !t.state.failedGasCostWei,
+    `cost=${t.state.failedGasCostWei}`);
+  check("swaps allowed again after the reset",
+    t._swapRunOpts("LOOP") !== null);
+  // 0 = unlimited
+  const t2 = makeTrader({ maxFailedAttemptCostWei: "0" });
+  check("budget=0 → never exceeded",
+    t2._failedAttemptBudgetExceeded() === false && t2._failedAttemptBudgetWei() === 0n);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// R6 — restart recovery: stale OPEN_FAILED halt auto-cleared, no dup opens
+// ═══════════════════════════════════════════════════════════════════════════
+section("R6: restart recovery — stale OPEN_FAILED halt cleared, dup-position protection");
+
+{
+  // stale OPEN_FAILED halt from an older build → auto-cleared on recovery
+  const t = makeTrader({}, { keepActive: true });
+  t.state.continuousHalt = { reason: "OPEN_FAILED", failures: 3, since: Date.now() - 60_000 };
+  t.state.continuousFailures = 3;
+  await t._recoverContinuousCycle();
+  check("stale OPEN_FAILED halt auto-cleared on recovery",
+    !t.state.continuousHalt && Number(t.state.continuousFailures || 0) === 0,
+    `halt=${JSON.stringify(t.state.continuousHalt)}`);
+  check("recovery log explains the migration", t._logText().includes("clearing stale halt"));
+  // a DIFFERENT halt reason is NOT auto-cleared
+  const t2 = makeTrader({}, { keepActive: true });
+  t2.state.continuousHalt = { reason: "SWAP_QUOTA_EXHAUSTED", failures: 3, since: Date.now() };
+  await t2._recoverContinuousCycle();
+  check("non-OPEN_FAILED halt is kept", t2.state.continuousHalt?.reason === "SWAP_QUOTA_EXHAUSTED",
+    `reason=${t2.state.continuousHalt?.reason}`);
+  // unconfirmed OPEN (pendingOpen) → no duplicate open.
+  // Continuous sequential mode (max=1): the pending record fills the slot →
+  // MAX_OPEN_POSITIONS. Legacy multi-slot mode: the pending check fires first.
+  const t3 = makeTrader({}, { keepActive: true });
+  t3.state.activePositions = [rec(1701, "LONG", { pendingOpen: true })];
+  const gate3 = t3._canOpenNew({ log: false });
+  check("continuous mode: pendingOpen record blocks a duplicate open (MAX_OPEN_POSITIONS)",
+    gate3.ok === false && gate3.code === "MAX_OPEN_POSITIONS",
+    `code=${gate3.code}`);
+  const t3b = makeTrader({ continuousTradingEnabled: false, maxOpenPositions: 5 }, { keepActive: true });
+  t3b.state.activePositions = [rec(1702, "LONG", { pendingOpen: true })];
+  const gate3b = t3b._canOpenNew({ log: false });
+  check("legacy mode: pendingOpen blocks a duplicate open (OPEN_PENDING)",
+    gate3b.ok === false && gate3b.code === "OPEN_PENDING",
+    `code=${gate3b.code}`);
+  // blocked (closeBlocked) tracked position → no duplicate open (MAX_OPEN_POSITIONS)
+  const t4 = makeTrader({}, { keepActive: true });
+  t4.state.activePositions = [rec(1711, "SHORT", { closeBlocked: true })];
+  const gate4 = t4._canOpenNew({ log: false });
+  check("closeBlocked tracked position blocks a duplicate open (MAX_OPEN_POSITIONS)",
+    gate4.ok === false && gate4.code === "MAX_OPEN_POSITIONS",
+    `code=${gate4.code}`);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// R7 — NEXT_CYCLE log on cycle completion
+// ═══════════════════════════════════════════════════════════════════════════
+section("R7: NEXT_CYCLE — logged on every cycle completion path");
+
+{
+  const t = makeTrader();
+  const r = rec(1801, "LONG");
+  t._trackOpenedPosition(r);
+  t._ingestSwapSummary({ results: Array.from({ length: 10 }, (_, i) => okSwap(i + 1)) });
+  t._clearPosition(r, "verified close");
+  check("quota-met completion logs NEXT_CYCLE",
+    t._logText().includes("[NEXT_CYCLE]"));
+  check("NEXT_CYCLE mentions the budget reset",
+    t._logText().includes("failed-attempt gas budget reset"));
+  const t2 = makeTrader();
+  const r2 = rec(1811, "SHORT");
+  t2._trackOpenedPosition(r2);
+  t2._ingestSwapSummary({ results: [okSwap(1)] });
+  t2._clearPosition(r2, "verified close"); // under quota
+  check("under-quota completion also logs NEXT_CYCLE",
+    t2._logText().includes("[NEXT_CYCLE]"));
+  const t3 = makeTrader();
+  const r3 = rec(1821, "LONG");
+  t3._trackOpenedPosition(r3);
+  t3._clearPosition(r3, "recovery: gone", false); // countClose=false
+  check("recovery close-out also logs NEXT_CYCLE",
+    t3._logText().includes("[NEXT_CYCLE]"));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
