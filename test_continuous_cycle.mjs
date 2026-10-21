@@ -297,7 +297,7 @@ section("C3: verified close completes the cycle; halt trips at the threshold");
 // ═══════════════════════════════════════════════════════════════════════════
 // C4 — _canOpenNew in continuous mode
 // ═══════════════════════════════════════════════════════════════════════════
-section("C4: _canOpenNew — sequential max=1, blocked positions occupy the slot");
+section("C4: _canOpenNew — sequential max=1, closeBlocked EXCLUDED from global slot, own market busy");
 
 {
   const t = makeTrader();
@@ -308,9 +308,18 @@ section("C4: _canOpenNew — sequential max=1, blocked positions occupy the slot
     t._canOpenNew({ log: false }).code === "MAX_OPEN_POSITIONS",
     `code=${t._canOpenNew({ log: false }).code}`);
   live.closeBlocked = true;
-  check("closeBlocked position OCCUPIES the slot (no OPEN on top of a blocked one)",
-    t._canOpenNew({ log: false }).code === "MAX_OPEN_POSITIONS",
+  check("closeBlocked position does NOT occupy the sequential slot (dead dust on dead pool must not deadlock all markets)",
+    t._canOpenNew({ log: false }).ok === true,
     `code=${t._canOpenNew({ log: false }).code} count=${t._canOpenNew({ log: false }).count}`);
+  // per-market safety: the blocked position's OWN market stays busy
+  const blockedMarket = { marketSymbol: "NEMESIS/USDT", poolAddr: "0xcca34A36A37941bF54eE0eEFe5a86f98d93ACDd0", managerAddr: "0x186eA8d6c4CBbcEd1466338B1Ed41C7EF331f480" };
+  live.poolAddr = blockedMarket.poolAddr; live.managerAddr = blockedMarket.managerAddr; live.marketSymbol = "NEMESIS/USDT";
+  check("blocked position still occupies ITS OWN market (MARKET_BUSY)",
+    t._canOpenNew({ log: false, market: blockedMarket }).code === "MARKET_BUSY",
+    `code=${t._canOpenNew({ log: false, market: blockedMarket }).code}`);
+  check("a DIFFERENT market is still openable despite the blocked position",
+    t._canOpenNew({ log: false, market: { marketSymbol: "USDT/USDC", poolAddr: "0x7dF706Db7F8dbb7C32A3e0D6F4d488383522a335", managerAddr: "0xE21255b1cbb5" } }).ok === true,
+    `code=${t._canOpenNew({ log: false, market: { marketSymbol: "USDT/USDC" } }).code}`);
   // legacy mode (continuous off) — closeBlocked still counts, max from config
   const leg = makeTrader({ continuousTradingEnabled: false, maxOpenPositions: 3 });
   const p1 = rec(811, "LONG", { closeBlocked: true });
@@ -668,11 +677,19 @@ section("R2: failed CLOSE — record kept, CLOSE_RETRY logged, cycle not complet
   check("pending close → state kept + CLOSE_RETRY (never treated as closed)",
     r3.blocked === false && t3._positions().includes(p3) && t3._logText().includes("[CLOSE_RETRY]"),
     `code=${r3.code}`);
-  // blocked position occupies the open slot → no duplicate open
-  const gate = t._canOpenNew({ log: false });
-  check("blocked position occupies the slot → _canOpenNew=MAX_OPEN_POSITIONS (dup protection)",
-    gate.code === "MAX_OPEN_POSITIONS",
-    `code=${gate.code} count=${gate.count}`);
+  // blocked position: global slot free, but its OWN market stays busy (per-market dup protection)
+  const gateGlobal = t._canOpenNew({ log: false });
+  check("blocked position frees the global slot (dead pool must not deadlock healthy markets)",
+    gateGlobal.ok === true,
+    `code=${gateGlobal.code} count=${gateGlobal.count}`);
+  const gateSame = t._canOpenNew({ log: false, market: { marketSymbol: "USDT/USDC", poolAddr: POOL_A, managerAddr: MGR_A } });
+  check("blocked position still occupies its OWN market → MARKET_BUSY (dup protection)",
+    gateSame.ok === false && gateSame.code === "MARKET_BUSY",
+    `code=${gateSame.code}`);
+  const gateOther = t._canOpenNew({ log: false, market: { marketSymbol: "LINK/USDT", poolAddr: "0x12d24Fec79A8Fc7D542d527bFAB7b46Bd0be435b", managerAddr: "0x4067cEdc" } });
+  check("a different market is openable despite the blocked position",
+    gateOther.ok === true,
+    `code=${gateOther.code}`);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -804,13 +821,17 @@ section("R6: restart recovery — stale OPEN_FAILED halt cleared, dup-position p
   check("legacy mode: pendingOpen blocks a duplicate open (OPEN_PENDING)",
     gate3b.ok === false && gate3b.code === "OPEN_PENDING",
     `code=${gate3b.code}`);
-  // blocked (closeBlocked) tracked position → no duplicate open (MAX_OPEN_POSITIONS)
+  // blocked (closeBlocked) tracked position → global slot free, own market busy
   const t4 = makeTrader({}, { keepActive: true });
   t4.state.activePositions = [rec(1711, "SHORT", { closeBlocked: true })];
-  const gate4 = t4._canOpenNew({ log: false });
-  check("closeBlocked tracked position blocks a duplicate open (MAX_OPEN_POSITIONS)",
-    gate4.ok === false && gate4.code === "MAX_OPEN_POSITIONS",
-    `code=${gate4.code}`);
+  const gate4Global = t4._canOpenNew({ log: false });
+  check("closeBlocked tracked position frees the global slot (MAX_OPEN_POSITIONS gone)",
+    gate4Global.ok === true,
+    `code=${gate4Global.code}`);
+  const gate4Same = t4._canOpenNew({ log: false, market: { marketSymbol: "USDT/USDC", poolAddr: POOL_A, managerAddr: MGR_A } });
+  check("closeBlocked tracked position still blocks its OWN market (MARKET_BUSY)",
+    gate4Same.ok === false && gate4Same.code === "MARKET_BUSY",
+    `code=${gate4Same.code}`);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

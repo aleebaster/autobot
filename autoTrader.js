@@ -2917,12 +2917,20 @@ export class AutoTrader {
       if (log) this.log(`[LIMIT] maxTradesPerRun=${Number(this.config.maxTradesPerRun || 0)} reached (opens this run=${this._opensThisRun}) — OPEN skipped`, "warn");
       return { ok: false, code: "TRADE_CAP", count: this._activeCount() };
     }
-    // CONTINUOUS MODE — sequential by definition: one open slot. A blocked
-    // close (pool cannot absorb any safe exit) OCCUPIES that slot — no new
-    // OPEN is stacked on top of a position that cannot yet be closed
-    // (requirement: continue safe SWAPs, retry CLOSE, never double-up).
+    // CONTINUOUS MODE — sequential by definition: one open slot. A position
+    // whose CLOSE is currently blocked (pool cannot absorb any safe exit)
+    // does NOT occupy that slot: the six permanently-uncloseable dust positions
+    // on the three dead NLP pools (verified on-chain: all active/healthy, but
+    // previewClosePosition reverts MAM_CloseAmountTooSmall at low bps and
+    // MAM_InsufficientLiquidity at every bps >= 5) would otherwise deadlock
+    // EVERY market forever. Blocked positions remain TRACKED and still
+    // re-attempted for close each cycle; the per-market slot check below
+    // (_marketHasPosition) independently prevents any new position from
+    // stacking on the same blocked pool — so healthy markets stay tradable
+    // while blocked ones stay blocked.
+    const liveCount = this._positions().filter(p => !p?.closeBlocked).length;
     const count = Number.isFinite(effectiveCount) ? effectiveCount
-      : this._activeCount();
+      : continuous ? liveCount : this._activeCount();
     const max = continuous ? 1 : Math.max(1, Number(this.config.maxOpenPositions) || 1);
     if (count >= max) {
       if (log) this.log(`[LIMIT] maxOpenPositions=${max} reached (tracked=${this._activeCount()}${count !== this._activeCount() ? ` effective=${count}` : ""}) — OPEN skipped`, "warn");
@@ -6355,14 +6363,16 @@ export class AutoTrader {
       if (closeResult.clearState === false) {
         const d = this._noteCloseFailure(pos, sig, closeResult.code || "FAILED");
         // CLOSE-EXIT BLOCKED — the pool cannot absorb any safe exit slice. The
-        // position stays tracked and retried every cycle and OCCUPIES the
-        // sequential open slot (no new OPEN is stacked on top of it); only safe
-        // SWAPs (protected-pool filtered) continue meanwhile.
+        // position stays tracked and retried every cycle; the per-market slot
+        // (_marketHasPosition) prevents any new OPEN on the SAME pool, while
+        // the global sequential slot ignores closeBlocked so healthy markets
+        // stay tradable. Only safe SWAPs (protected-pool filtered) continue
+        // meanwhile.
         const INFEASIBLE = ["CLOSE_NO_FEASIBLE_WINDOW", "CLOSE_BPS_NOT_FOUND", "CLOSE_AMOUNT_TOO_SMALL"];
         if (pos && INFEASIBLE.includes(closeResult.code)) {
           if (!pos.closeBlocked) {
             pos.closeBlocked = true;
-            this.log(`[POSITION_BLOCKED] #${id} marked closeBlocked (exit window infeasible — pool cannot absorb a safe slice) — kept tracked, retried each cycle, occupies the open slot`, "warn");
+            this.log(`[POSITION_BLOCKED] #${id} marked closeBlocked (exit window infeasible — pool cannot absorb a safe slice) — kept tracked, retried each cycle, own market stays busy, global slot stays free`, "warn");
           }
         } else if (pos?.closeBlocked) {
           pos.closeBlocked = false;
