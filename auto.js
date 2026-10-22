@@ -257,7 +257,11 @@ async function main() {
   // Build AutoTrader dependencies
   const autoConfig = {
     defaultLeverage: leverage,
-    maxLeverage: Number(config.maxLeverage ?? 5),
+    // CRITICAL: maxLeverage is the hard ceiling openPosition() enforces.
+    // Falling back only to `config.maxLeverage ?? 5` IGNORES a raised
+    // leverageMax — the two keys must stay consistent, so also consult
+    // leverageMax. config.json now sets both explicitly.
+    maxLeverage: Number(config.maxLeverage ?? config.leverageMax ?? 5),
     // Leverage window + per-market overrides (read-only from config.json):
     // resolveLeverageForOpen() clamps contractBounds ∩ [leverageMin..leverageMax]
     // ∩ marketLeverage[symbol] and probes previewOpenPosition per candidate.
@@ -280,6 +284,14 @@ async function main() {
     targetCollateralUSDT: config.targetCollateralUSDT || "10",
     targetCollateralWETH: config.targetCollateralWETH || "0.002",
     targetCollateralGeneric: config.targetCollateralGeneric || "10",
+    // Per-SIDE override — when set (non-empty), wins for that side over the
+    // per-token defaults above. null keeps legacy behaviour.
+    targetCollateralLong: config.targetCollateralLong ?? null,
+    targetCollateralShort: config.targetCollateralShort ?? null,
+    // Risk caps ("0" = disabled). maxTotalCollateral is per collateral token;
+    // maxDailyLoss counts stable-collateral realized losses per UTC day.
+    maxTotalCollateral: config.maxTotalCollateral ?? "0",
+    maxDailyLoss: config.maxDailyLoss ?? "0",
     maxCollateralTargetShort: config.maxCollateralTargetShort || "10000",
     targetReserveUSDT: config.targetReserveUSDT || "20",
     targetReserveWETH: config.targetReserveWETH || "0.004",

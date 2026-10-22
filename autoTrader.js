@@ -564,7 +564,15 @@ function pairTokensOfMarket(market) {
   return { token0, token1, risky };
 }
 
-function collateralTargetStr(config, collateralToken) {
+function collateralTargetStr(config, collateralToken, side = null) {
+  // PER-SIDE OVERRIDE — config.targetCollateralLong / targetCollateralShort (human
+  // units in the collateral token the contract actually accepts) win when set;
+  // otherwise the historical per-token targets apply unchanged (2x behaviour).
+  const sideKey = side === "LONG" ? "targetCollateralLong"
+    : side === "SHORT" ? "targetCollateralShort" : null;
+  if (sideKey && config[sideKey] != null && String(config[sideKey]).trim() !== "") {
+    return String(config[sideKey]);
+  }
   const t = (collateralToken || "").toLowerCase();
   const dep = getActiveDeployment?.().tokens || {};
   if (t === (dep.WETH || dep.ETH || WETH).toLowerCase()) return config.targetCollateralWETH || "0.002";
@@ -1019,6 +1027,21 @@ const DEFAULT_AUTO_CONFIG = {
   targetCollateralUSDT: "10",
   targetCollateralWETH: "0.002",
   targetCollateralGeneric: "10",
+  // Per-SIDE collateral override — human units in the collateral token the
+  // contract actually accepts. When set (non-empty string) it wins for that
+  // side; null / "" keeps the historical per-token targets above unchanged.
+  targetCollateralLong: null,
+  targetCollateralShort: null,
+  // Risk cap: sum of collateralAmount (raw) across tracked positions that
+  // share the NEW position's collateralToken, plus the new amount, must not
+  // exceed this. Parsed in THAT token's decimals (no cross-token valuation).
+  // "0" = disabled. Mixed-token books are checked per token independently.
+  maxTotalCollateral: "0",
+  // Risk cap: cumulative negative realizedPnl from verified closes within the
+  // current UTC day (stable USDT/USDC collateral only, 6-decimal units) must
+  // not exceed this. "0" = disabled. Non-stable realized losses are logged
+  // but not counted (no reliable USD conversion is available).
+  maxDailyLoss: "0",
   // SHORT-only ceiling, in THIS candidate's collateral token decimals.
   // SHORT sizing = max(configuredTarget, measuredPoolMinimum), but never above this:
   // a pool whose minimum is higher is SKIPPED (never inflated) with POOL_MIN_EXCEEDS_CAP.
@@ -1212,10 +1235,11 @@ function loadState() {
     if (fs.existsSync(STATE_FILE)) state = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
   } catch {}
   if (!state || typeof state !== "object" || Array.isArray(state)) {
-    state = { activePositions: [], sessionStats: { opens: 0, closes: 0 }, lastCycleTime: 0, lastSide: null };
+    state = { activePositions: [], sessionStats: { opens: 0, closes: 0, dailyLoss: null }, lastCycleTime: 0, lastSide: null };
   }
   migrateStateShape(state);
-  if (!state.sessionStats) state.sessionStats = { opens: 0, closes: 0 };
+  if (!state.sessionStats) state.sessionStats = { opens: 0, closes: 0, dailyLoss: null };
+  if (state.sessionStats && !("dailyLoss" in state.sessionStats)) state.sessionStats.dailyLoss = null;
   for (const p of state.activePositions) {
     if (p && typeof p === "object" && p.closeAttempts === undefined) p.closeAttempts = 0;
   }
@@ -1906,13 +1930,10 @@ async function openPosition({ wallet, provider, managerAddr, poolAddr, side, col
     log(`[BLOCKED] openPosition: collateralToken missing (side=${side})`, "error");
     return null;
   }
-  // decimals + symbol ALWAYS read from the collateral token contract
-  const collateralMeta = await tokenMetaOnChain(provider, collateralToken);
-  const decimals = collateralMeta.decimals;
-  const collSym = collateralMeta.symbol;
-  const leverageX10 = BigInt(leverage * 10);
-
-  // Validate leverage
+  // Validate leverage FIRST — cheapest, no RPC. A leverage the operator never
+  // asked to raise (config.maxLeverage) must be refused before any token meta
+  // read, oracle probe, or calldata is built, so the TX can never carry a
+  // leverage the menu/config did not authorize.
   if (leverage < 1 || leverage > config.maxLeverage) {
     log(`[BLOCKED] Leverage ${leverage}x exceeds max ${config.maxLeverage}x`, "error");
     return null;
@@ -1924,6 +1945,12 @@ async function openPosition({ wallet, provider, managerAddr, poolAddr, side, col
     log(`[BLOCKED] Manager ${short(managerAddr)} has no code`, "error");
     return null;
   }
+  // decimals + symbol ALWAYS read from the collateral token contract — done
+  // AFTER the leverage ceiling so an over-max request never touches the chain.
+  const collateralMeta = await tokenMetaOnChain(provider, collateralToken);
+  const decimals = collateralMeta.decimals;
+  const collSym = collateralMeta.symbol;
+  const leverageX10 = BigInt(leverage * 10);
 
   // STEP 1: Oracle checkpoint (fixes 0x56e7f09d)
   // Read-only mode must never send a TX: checkpointOracle() is a real transaction,
@@ -2543,6 +2570,7 @@ async function attemptPartialClose({ wallet, provider, managerAddr, positionId, 
         ok: true, closed: true, partial: true, rounds: round, verified: true,
         txHash, gasUsed: receipt.gasUsed, blockNumber: receipt.blockNumber,
         closeBps, amountOut, onChain: after,
+        realizedPnl: quote?.realizedPnl !== undefined ? String(quote.realizedPnl) : null,
       };
     }
     if (targetCloseBps !== null && targetCloseBps !== undefined) {
@@ -2555,6 +2583,7 @@ async function attemptPartialClose({ wallet, provider, managerAddr, positionId, 
         ok: true, closed: false, targetDone: true, partial: true, rounds: round, verified: true,
         txHash, gasUsed: receipt.gasUsed, blockNumber: receipt.blockNumber,
         closeBps, amountOut, onChain: after,
+        realizedPnl: quote?.realizedPnl !== undefined ? String(quote.realizedPnl) : null,
       };
     }
     log(`[VERIFY] position #${positionId} STILL ACTIVE after partial close: collateral=${after.collateralAmount} debt=${after.currentDebt} (round ${round}/${maxRounds})`, "warn");
@@ -2755,6 +2784,10 @@ async function closePositionFn({ wallet, provider, managerAddr, positionId, conf
   return {
     ok: true, closed: true, verified: true, onChain: after,
     txHash, gasUsed: receipt.gasUsed, blockNumber: receipt.blockNumber,
+    // Realized PnL from the FRESH pre-sign preview (collateral-token units) —
+    // feeds maxDailyLoss accounting. Preview-based (not post-exec oracle) on
+    // purpose: the position is gone after the close, no authoritative re-read.
+    realizedPnl: fresh.quote?.realizedPnl !== undefined ? String(fresh.quote.realizedPnl) : null,
   };
 }
 
@@ -2917,6 +2950,10 @@ export class AutoTrader {
       if (log) this.log(`[LIMIT] maxTradesPerRun=${Number(this.config.maxTradesPerRun || 0)} reached (opens this run=${this._opensThisRun}) — OPEN skipped`, "warn");
       return { ok: false, code: "TRADE_CAP", count: this._activeCount() };
     }
+    if (this._dailyLossExceeded()) {
+      if (log) this.log(`[LIMIT] maxDailyLoss=${this.config.maxDailyLoss} USDT reached today (${this.state.sessionStats?.dailyLoss?.lossRaw || "0"} raw) — OPEN skipped until UTC day rolls`, "error");
+      return { ok: false, code: "DAILY_LOSS_CAP", count: this._activeCount() };
+    }
     // CONTINUOUS MODE — sequential by definition: one open slot. A position
     // whose CLOSE is currently blocked (pool cannot absorb any safe exit)
     // does NOT occupy that slot: the six permanently-uncloseable dust positions
@@ -2953,6 +2990,89 @@ export class AutoTrader {
     return this._continuousEnabled?.() === true
       ? 1
       : Math.max(1, Number(this.config.maxOpenPositions) || 1);
+  }
+
+  /**
+   * Track a verified close's realized PnL toward the daily-loss budget.
+   * Only NEGATIVE realizedPnl (a loss) accumulates; only stable-collateral
+   * positions (USDT/USDC, 6 decimals ≈ USD) count toward the USD cap —
+   * non-stable losses are logged and skipped (no reliable conversion).
+   * The bucket resets automatically when the UTC day rolls over.
+   */
+  _noteRealizedPnl(closeResult, pos = null) {
+    try {
+      const pnl = closeResult?.realizedPnl;
+      if (pnl === null || pnl === undefined || pnl === "") return;
+      let pnlRaw;
+      try { pnlRaw = BigInt(pnl); } catch { return; }
+      if (!(pnlRaw < 0n)) return; // profits / zero never count
+      const depTokens = getActiveDeployment?.().tokens || {};
+      const t = String(pos?.collateralToken || "").toLowerCase();
+      const stables = [depTokens.USDT, depTokens.USDC].filter(Boolean)
+        .map(a => String(a).toLowerCase());
+      if (!stables.includes(t)) {
+        this.log(`[RISK] close #${pos?.positionId ?? "?"} realizedPnl=${pnlRaw} in non-stable collateral ${t} — NOT counted toward maxDailyLoss (USD-peg only)`, "info");
+        return;
+      }
+      const today = new Date().toISOString().slice(0, 10);
+      if (!this.state.sessionStats.dailyLoss || this.state.sessionStats.dailyLoss.day !== today) {
+        this.state.sessionStats.dailyLoss = { day: today, lossRaw: "0" };
+      }
+      const prev = BigInt(this.state.sessionStats.dailyLoss.lossRaw || "0");
+      const next = prev + (-pnlRaw);
+      this.state.sessionStats.dailyLoss.lossRaw = String(next);
+      this.log(`[RISK] realized loss ${ethers.formatUnits(-pnlRaw, 6)} USDT → dailyLoss ${ethers.formatUnits(next, 6)} (maxDailyLoss=${this.config.maxDailyLoss || "0"})`, "warn");
+      saveState(this.state);
+    } catch (e) {
+      this.log(`[RISK] daily-loss tracking failed: ${String(e?.message || e).slice(0, 120)}`, "warn");
+    }
+  }
+
+  /** True when today's accumulated stable realized losses ≥ maxDailyLoss. */
+  _dailyLossExceeded() {
+    const capStr = String(this.config.maxDailyLoss ?? "0").trim();
+    if (!capStr || capStr === "0") return false;
+    let capRaw;
+    try { capRaw = ethers.parseUnits(capStr, 6); } catch { return false; }
+    if (!(capRaw > 0n)) return false;
+    const dl = this.state.sessionStats?.dailyLoss;
+    if (!dl) return false;
+    const today = new Date().toISOString().slice(0, 10);
+    if (dl.day !== today) return false;
+    let loss;
+    try { loss = BigInt(dl.lossRaw || "0"); } catch { return false; }
+    return loss >= capRaw;
+  }
+
+  /**
+   * Per-token exposure gate: sum tracked positions that share the NEW
+   * position's collateralToken (raw collateralAmount) + the new amount,
+   * compared against maxTotalCollateral parsed in THAT token's decimals.
+   * No cross-token valuation is invented; mixed books are checked per token.
+   */
+  _exposureGate(ctx) {
+    const capStr = String(this.config.maxTotalCollateral ?? "0").trim();
+    if (!capStr || capStr === "0") return { ok: true };
+    let capRaw;
+    try { capRaw = ethers.parseUnits(capStr, ctx.collateralDecimals); } catch { return { ok: true }; }
+    if (!(capRaw > 0n)) return { ok: true };
+    const key = String(ctx.collateralToken).toLowerCase();
+    let used = 0n;
+    for (const p of this._positions()) {
+      if (!p || p.pendingOpen) continue;
+      if (String(p.collateralToken || "").toLowerCase() !== key) continue;
+      try { used += BigInt(p.collateralAmount || "0"); } catch {}
+    }
+    let newAmt;
+    try { newAmt = BigInt(ctx.collateralAmount); } catch { return { ok: true }; }
+    const total = used + newAmt;
+    if (total > capRaw) {
+      return {
+        ok: false, code: "MAX_TOTAL_COLLATERAL",
+        reason: `total ${ctx.collateralSym || "collateral"} exposure ${ethers.formatUnits(total, ctx.collateralDecimals)} > cap ${capStr} (open ${ethers.formatUnits(used, ctx.collateralDecimals)} + new ${ethers.formatUnits(newAmt, ctx.collateralDecimals)})`,
+      };
+    }
+    return { ok: true };
   }
 
   /**
@@ -3362,7 +3482,7 @@ export class AutoTrader {
       let capRaw, configuredRaw;
       try {
         capRaw = ethers.parseUnits(capStr, decimals);
-        configuredRaw = ethers.parseUnits(collateralTargetStr(this.config, collateralToken), decimals);
+        configuredRaw = ethers.parseUnits(collateralTargetStr(this.config, collateralToken, "SHORT"), decimals);
       } catch { return true; }
       if (!(capRaw > 0n) || !(configuredRaw > 0n)) return true;
       const s = await resolveShortCollateralAmount(provider, {
@@ -3603,6 +3723,16 @@ export class AutoTrader {
         // a global one: other markets stay fully tradable.
         if (this._marketHasPosition(candidate)) {
           this.log(`[SKIP] ${candidate.symbol} ${side}: market already has a tracked position — trying next candidate`, "warn");
+          this._rotMarketSkip(candidate.symbol, side);
+          continue;
+        }
+
+        // EXPOSURE CAP — sum of same-collateralToken tracked collateral + the
+        // new amount must stay within maxTotalCollateral (per-token, no
+        // cross-token valuation). Over cap → SKIPPED with reason.
+        const exp = this._exposureGate(ctx);
+        if (!exp.ok) {
+          this.log(`[SKIP] ${candidate.symbol} ${side}: ${exp.code} — ${exp.reason} — trying next candidate`, "warn");
           this._rotMarketSkip(candidate.symbol, side);
           continue;
         }
@@ -6391,6 +6521,7 @@ export class AutoTrader {
     // by the caller via _syncActivePositionFromChain).
     if (closeResult.ok && closeResult.targetDone && closeResult.closed === false) {
       this.log(`[CLOSE] partial target done — position #${id} reduced on-chain, record KEPT`, "success");
+      this._noteRealizedPnl(closeResult, pos);
       return { ok: true, blocked: false, continueCycle: CONTINUE, code: null, targetDone: true };
     }
     if (closeResult.closed === false) {
@@ -6400,6 +6531,7 @@ export class AutoTrader {
     }
     const part = closeResult.partial ? ` (partial closeBps=${closeResult.closeBps})` : "";
     this.log(`[CLOSE] #${id} SUCCESS TX: ${closeResult.txHash || "dry-run"}${part} — verified on-chain`, "success");
+    this._noteRealizedPnl(closeResult, pos);
     this._clearPosition(pos, "verified close");
     return { ok: true, blocked: false, continueCycle: CONTINUE, code: null };
   }
@@ -6574,7 +6706,7 @@ export class AutoTrader {
       return null;
     }
 
-    const configuredTargetStr = collateralTargetStr(this.config, collateralToken);
+    const configuredTargetStr = collateralTargetStr(this.config, collateralToken, side);
     let collateralAmount = ethers.parseUnits(configuredTargetStr, collateralDecimals);
     const targetReserve = ethers.parseUnits(reserveTargetStr(this.config, collateralToken), collateralDecimals);
     if (collateralAmount <= 0n) {
@@ -7034,6 +7166,14 @@ export class AutoTrader {
       // a global one: other markets stay fully tradable.
       if (this._marketHasPosition(candidate)) {
         this.log(`[SKIP] ${candidate.symbol} ${side}: market already has a tracked position — trying next candidate`, "warn");
+        this._rotMarketSkip(candidate.symbol, side);
+        continue;
+      }
+
+      // EXPOSURE CAP — per-token collateral budget (maxTotalCollateral).
+      const exp = this._exposureGate(ctx);
+      if (!exp.ok) {
+        this.log(`[SKIP] ${candidate.symbol} ${side}: ${exp.code} — ${exp.reason} — trying next candidate`, "warn");
         this._rotMarketSkip(candidate.symbol, side);
         continue;
       }
@@ -7720,5 +7860,7 @@ export {
   // Open-event positionId extraction (topics layout proven on reference TX)
   extractPositionIdFromLogs, MAM_POSITION_CREATED_TOPIC, MARGIN_FEE_ASSESSED_TOPIC,
   CLOSE_POSITION_SELECTOR, MAX_PARTIAL_CLOSE_BPS,
+  // Per-side collateral target resolution (test-visible for override logic)
+  collateralTargetStr,
 };
 export default AutoTrader;

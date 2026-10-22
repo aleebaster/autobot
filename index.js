@@ -51,6 +51,58 @@ function loadConfig() {
   try { return JSON.parse(fs.readFileSync(CONFIG_FILE, "utf8")); } catch { return {}; }
 }
 
+/** Persist a partial patch into config.json (merges over existing keys). */
+function saveConfig(patch) {
+  const cfg = loadConfig();
+  Object.assign(cfg, patch);
+  fs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2));
+  return cfg;
+}
+
+/**
+ * Push changed keys into a RUNNING autoTrader.config so the next cycle
+ * picks them up without a restart. Safe no-op when auto is not running.
+ */
+function applyLiveConfig(patch) {
+  if (!autoTrader || !autoRunning) return;
+  const c = autoTrader.config;
+  if ("leverage" in patch) c.defaultLeverage = Number(patch.leverage);
+  if ("leverageMin" in patch) c.leverageMin = Number(patch.leverageMin);
+  if ("leverageMax" in patch) c.leverageMax = Number(patch.leverageMax);
+  if ("maxLeverage" in patch) c.maxLeverage = Number(patch.maxLeverage);
+  if ("leverageAutoStep" in patch) c.leverageAutoStep = patch.leverageAutoStep;
+  if ("targetCollateralLong" in patch) c.targetCollateralLong = patch.targetCollateralLong;
+  if ("targetCollateralShort" in patch) c.targetCollateralShort = patch.targetCollateralShort;
+  if ("maxOpenPositions" in patch) c.maxOpenPositions = Number(patch.maxOpenPositions);
+  if ("maxTotalCollateral" in patch) c.maxTotalCollateral = patch.maxTotalCollateral;
+  if ("maxDailyLoss" in patch) c.maxDailyLoss = patch.maxDailyLoss;
+}
+
+/** Small modal text prompt (blessed.prompt) for Config submenu values. */
+function promptConfigValue(title, currentValue, onValue) {
+  const prompt = blessed.prompt({
+    parent: screen,
+    label: ` ${title} `,
+    tags: true,
+    border: { type: "line" },
+    style: { fg: "yellow", border: { fg: "yellow" }, label: { fg: "yellow", bold: true } },
+    width: 70,
+    height: 7,
+    top: "center",
+    left: "center",
+    keys: true,
+    vi: true,
+  });
+  screen.focusPush(prompt);
+  safeRender();
+  prompt.input(`${title}:`, String(currentValue ?? ""), (err, value) => {
+    try { prompt.destroy(); } catch {}
+    safeRender();
+    if (err) return;
+    onValue(String(value ?? "").trim());
+  });
+}
+
 function loadAccounts() {
   try {
     const cfg = loadConfig();
@@ -77,6 +129,8 @@ let accounts = [];
 let proxies = [];
 let selectedWalletIndex = 0;
 let autoTrader = null;
+// Menu mode: "main" = trading actions; "config" = risk/leverage/collateral submenu.
+let menuMode = "main";
 
 let walletInfo = {
   address: "N/A",
@@ -431,6 +485,28 @@ function updateAutoStatus() {
 }
 
 function updateMenu() {
+  if (menuMode === "config") {
+    const cfg = loadConfig();
+    const lev = Number(cfg.leverage ?? 2);
+    const levStr = lev === 20 ? "20x" : `${lev}x`;
+    const tLong = cfg.targetCollateralLong != null && String(cfg.targetCollateralLong).trim() !== ""
+      ? String(cfg.targetCollateralLong) : "auto (per-token)";
+    const tShort = cfg.targetCollateralShort != null && String(cfg.targetCollateralShort).trim() !== ""
+      ? String(cfg.targetCollateralShort) : "auto (per-token)";
+    const items = [
+      `[L] Leverage: ${levStr}`,
+      `[C] Collateral LONG: ${tLong}`,
+      `[S] Collateral SHORT: ${tShort}`,
+      `[M] Max Open Positions: ${Number(cfg.maxOpenPositions ?? 1)}`,
+      `[T] Max Total Collateral: ${cfg.maxTotalCollateral ?? "0"}`,
+      `[D] Max Daily Loss: ${cfg.maxDailyLoss ?? "0"} (USDT)`,
+      "[B] Back to Main Menu",
+    ];
+    menuBox.setItems(items);
+    menuBox.select(0);
+    safeRender();
+    return;
+  }
   const items = autoRunning
     ? [
         "[1] Stop Full Auto",
@@ -438,6 +514,7 @@ function updateMenu() {
         "[3] Open SHORT Now",
         "[4] Close Position",
         "[5] Refresh Wallet",
+        "[7] Config",
         "[6] Exit",
       ]
     : [
@@ -446,6 +523,7 @@ function updateMenu() {
         "[3] Open SHORT Now",
         "[4] Close Position",
         "[5] Refresh Wallet",
+        "[7] Config",
         "[6] Exit",
       ];
   menuBox.setItems(items);
@@ -570,9 +648,14 @@ async function openManual(side) {
     // decimals/symbol ALWAYS from token contract — never hardcoded
     const decimals = market.decimals ?? await tokenDecimalsOnChain(provider, collateralToken);
     const collSym = market.collateralSym ?? await tokenSymbolOnChain(provider, collateralToken);
-    const targetStr = collSym === "WETH" || collateralToken.toLowerCase() === WETH_ADDRESS.toLowerCase()
-      ? (config.targetCollateralWETH || "0.002")
-      : (config.targetCollateralUSDT || "10");
+    // Per-SIDE override wins when set (human units in THIS market's collateral
+    // token); otherwise the historical per-token defaults apply unchanged.
+    const sideOverride = side === "LONG" ? config.targetCollateralLong : config.targetCollateralShort;
+    const targetStr = (sideOverride != null && String(sideOverride).trim() !== "")
+      ? String(sideOverride)
+      : (collSym === "WETH" || collateralToken.toLowerCase() === WETH_ADDRESS.toLowerCase()
+        ? (config.targetCollateralWETH || "0.002")
+        : (config.targetCollateralUSDT || "10"));
     const collateralAmount = ethers.parseUnits(targetStr, decimals);
 
     addLog(`Opening ${side} — market=${market.symbol || "?"} collateral: ${targetStr} ${collSym} @ ${collateralToken.slice(0,8)}...`, "warn");
@@ -614,7 +697,7 @@ async function openManual(side) {
       leverage: lev,
       paymentToken: market?.paymentToken,
       config: {
-        maxLeverage: Number(config.maxLeverage ?? 5),
+        maxLeverage: Number(config.maxLeverage ?? config.leverageMax ?? 5),
         deadlineSeconds: 1200,
         ethGuard: { ...DEFAULT_ETH_GUARD },
         dryRun: false,
@@ -727,7 +810,9 @@ async function startAutoTrading() {
 
   const autoConfig = {
     defaultLeverage: config.leverage || 2,
-    maxLeverage: Number(config.maxLeverage ?? 5),
+    // Hard ceiling openPosition() enforces — consult leverageMax too so a
+    // raised leverageMax (e.g. 20x) is not silently clipped back to 5.
+    maxLeverage: Number(config.maxLeverage ?? config.leverageMax ?? 5),
     leverageMin: Number(config.leverageMin ?? 1),
     leverageMax: Number(config.leverageMax ?? config.maxLeverage ?? 5),
     marketLeverage: (config.marketLeverage && typeof config.marketLeverage === "object")
@@ -739,6 +824,10 @@ async function startAutoTrading() {
     targetCollateralUSDT: config.targetCollateralUSDT || "10",
     targetCollateralWETH: config.targetCollateralWETH || "0.002",
     targetCollateralGeneric: config.targetCollateralGeneric || "10",
+    targetCollateralLong: config.targetCollateralLong ?? null,
+    targetCollateralShort: config.targetCollateralShort ?? null,
+    maxTotalCollateral: config.maxTotalCollateral ?? "0",
+    maxDailyLoss: config.maxDailyLoss ?? "0",
     maxCollateralTargetShort: config.maxCollateralTargetShort || "10000",
     targetReserveUSDT: config.targetReserveUSDT || "20",
     targetReserveWETH: config.targetReserveWETH || "0.004",
@@ -798,6 +887,16 @@ async function startAutoTrading() {
     } else if (msg.includes("[QUOTE]")) {
       autoStatus.state = "QUOTE";
       autoStatus.lastAction = "Computing quote...";
+    } else if (msg.includes("[LEVERAGE] resolved")) {
+      // ACTUAL leverage the open will use (after contract∩config clamp/probe).
+      // This is the value that ends up in leverageX10 — show IT, never the
+      // requested value, so the status panel can never claim 20x while the
+      // TX is built with 2x (or vice versa).
+      const m = msg.match(/resolved (\d+)x/);
+      if (m) { autoStatus.leverage = m[1] + "x"; autoStatus.lastAction = `Leverage resolved ${m[1]}x`; }
+    } else if (msg.includes("[PREFLIGHT]") && msg.includes("leverageX10=")) {
+      const m = msg.match(/leverageX10=(\d+)/);
+      if (m) { autoStatus.leverage = (Math.floor(Number(m[1]) / 10)) + "x"; }
     } else if (msg.includes("[OPEN]") && /\bPENDING\b/.test(msg)) {
       // A submitted open is NOT an open: show it as unconfirmed, never as success.
       autoStatus.position = "PENDING";
@@ -910,6 +1009,95 @@ menuBox.on("select", async (item, index) => {
   _menuSelectLock = true;
   setTimeout(() => { _menuSelectLock = false; }, 500);
   const label = item.getText();
+
+  // ── CONFIG SUBMENU ────────────────────────────────────────────────────────
+  if (menuMode === "config") {
+    if (label.includes("Back to Main")) {
+      menuMode = "main";
+      updateMenu();
+      return;
+    }
+    if (label.includes("Leverage:")) {
+      // Toggle 2x ↔ 20x. Writing leverage/leverageMax/maxLeverage together
+      // guarantees the menu value and the TX leverageX10 can never diverge.
+      const cfg = loadConfig();
+      const cur = Number(cfg.leverage ?? 2);
+      const next = cur === 20 ? 2 : 20;
+      const patch = {
+        leverage: next,
+        leverageMin: 2,
+        leverageMax: 20,
+        maxLeverage: 20,
+        // 20x is STRICT: a market that cannot quote exactly 20x is SKIPPED
+        // (leverageAutoStep=false), never silently downgraded to 2x.
+        leverageAutoStep: next !== 20,
+      };
+      saveConfig(patch);
+      applyLiveConfig(patch);
+      autoStatus.leverage = next + "x";
+      addLog(`Leverage set to ${next}x${next === 20 ? " (STRICT — markets unable to quote 20x are skipped)" : " (auto-step restored)"}`, next === 20 ? "warn" : "info");
+      updateMenu();
+      updateAutoStatus();
+      return;
+    }
+    if (label.includes("Collateral LONG:")) {
+      promptConfigValue("Collateral per LONG (token units, empty=auto)", loadConfig().targetCollateralLong ?? "", (val) => {
+        const patch = { targetCollateralLong: val === "" ? null : val };
+        saveConfig(patch);
+        applyLiveConfig(patch);
+        addLog(`Collateral LONG = ${val === "" ? "auto (per-token)" : val}`, "info");
+        updateMenu();
+      });
+      return;
+    }
+    if (label.includes("Collateral SHORT:")) {
+      promptConfigValue("Collateral per SHORT (token units, empty=auto)", loadConfig().targetCollateralShort ?? "", (val) => {
+        const patch = { targetCollateralShort: val === "" ? null : val };
+        saveConfig(patch);
+        applyLiveConfig(patch);
+        addLog(`Collateral SHORT = ${val === "" ? "auto (per-token)" : val}`, "info");
+        updateMenu();
+      });
+      return;
+    }
+    if (label.includes("Max Open Positions:")) {
+      promptConfigValue("Max Open Positions", String(loadConfig().maxOpenPositions ?? 1), (val) => {
+        const n = Number(val);
+        if (!Number.isFinite(n) || n < 1) { addLog(`Invalid maxOpenPositions: ${val}`, "error"); return; }
+        const patch = { maxOpenPositions: Math.floor(n) };
+        saveConfig(patch);
+        applyLiveConfig(patch);
+        addLog(`maxOpenPositions = ${patch.maxOpenPositions}`, "info");
+        updateMenu();
+      });
+      return;
+    }
+    if (label.includes("Max Total Collateral:")) {
+      promptConfigValue("Max Total Collateral (per token, 0=off)", String(loadConfig().maxTotalCollateral ?? "0"), (val) => {
+        if (Number(val) < 0) { addLog(`Invalid maxTotalCollateral: ${val}`, "error"); return; }
+        const patch = { maxTotalCollateral: val };
+        saveConfig(patch);
+        applyLiveConfig(patch);
+        addLog(`maxTotalCollateral = ${val}${val === "0" ? " (disabled)" : ""}`, "info");
+        updateMenu();
+      });
+      return;
+    }
+    if (label.includes("Max Daily Loss:")) {
+      promptConfigValue("Max Daily Loss (USDT, 0=off)", String(loadConfig().maxDailyLoss ?? "0"), (val) => {
+        if (Number(val) < 0) { addLog(`Invalid maxDailyLoss: ${val}`, "error"); return; }
+        const patch = { maxDailyLoss: val };
+        saveConfig(patch);
+        applyLiveConfig(patch);
+        addLog(`maxDailyLoss = ${val}${val === "0" ? " (disabled)" : ""} USDT (stable-collateral realized losses, UTC day)`, "info");
+        updateMenu();
+      });
+      return;
+    }
+    return;
+  }
+
+  // ── MAIN MENU ─────────────────────────────────────────────────────────────
   if (label.includes("Start Full Auto")) {
     await startAutoTrading();
   } else if (label.includes("Stop Full Auto")) {
@@ -922,6 +1110,9 @@ menuBox.on("select", async (item, index) => {
     await closeManual();
   } else if (label.includes("Refresh Wallet")) {
     await refreshWallet();
+  } else if (label.includes("Config")) {
+    menuMode = "config";
+    updateMenu();
   } else if (label.includes("Exit")) {
     if (autoRunning && autoTrader) autoTrader.stop();
     process.exit(0);
