@@ -1785,6 +1785,95 @@ export async function resolveLeverageForOpen(provider, {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
+ * SWAP gas budget — the ONLY place a swap transaction's `gasLimit` is derived.
+ *
+ * Why this exists: the audit of 16 reverted SWAPs showed every single one died
+ * as `Out of gas` inside `pool.swap`, with `receipt.status === 0` and 0 logs.
+ * Two things were wrong with the old `gasEstimate + gasEstimate / 5n`:
+ *
+ *   1. The margin (+20%) was smaller than the real spread. `eth_estimateGas`
+ *      swings ~50% between ADJACENT blocks on byte-identical calldata
+ *      (176 693 → 264 284 observed on `0x4bffbc4f…`), so the sampled number
+ *      and the executed number are often 1.5x apart.
+ *   2. The measurement was taken several RPC round-trips before the broadcast.
+ *
+ * The budget therefore combines the three inputs the audit says matter —
+ * the estimate, the number of hops, and the block gas limit — and NEVER
+ * invents an absolute constant for the route:
+ *
+ *   budget = max(estimate * 2, estimate + 100_000)          required floor
+ *          + (hops - 1) * (estimate / hops)                 one extra hop priced
+ *                                                           as a slice of THIS
+ *                                                           estimate, not a magic
+ *                                                           number
+ *   clamp  = blockGasLimit * 3/4                            never ask the block
+ *                                                           for more than it can
+ *                                                           reasonably carry
+ *
+ * @param {object} o
+ * @param {bigint} o.estimate      — fresh `eth_estimateGas` for the exact calldata
+ * @param {number} [o.hops]        — path.length - 1 (1 = direct route)
+ * @param {bigint|null} [o.blockGasLimit] — latest block's gasLimit; `null` skips the clamp
+ * @returns {bigint|null} the limit to broadcast, or `null` when even the bare
+ *          estimate cannot be funded — the caller MUST NOT send in that case.
+ */
+export function computeSwapGasLimit({ estimate, hops = 1, blockGasLimit = null }) {
+  if (typeof estimate !== "bigint" || estimate <= 0n) return null;
+  const nHops = Number.isFinite(Number(hops)) && Number(hops) >= 1 ? Math.floor(Number(hops)) : 1;
+
+  let budget = estimate * 2n;
+  const floor = estimate + 100_000n;
+  if (floor > budget) budget = floor;
+
+  // Route scaling: `estimate` already prices the WHOLE path, so an extra hop is
+  // budgeted as one more slice of that same measurement — no absolute constant.
+  if (nHops > 1) {
+    const perHop = estimate / BigInt(nHops);
+    budget += perHop * BigInt(nHops - 1);
+  }
+
+  if (budget < estimate) budget = estimate;
+
+  if (typeof blockGasLimit === "bigint" && blockGasLimit > 0n) {
+    const cap = (blockGasLimit * 3n) / 4n;
+    if (estimate > cap) return null;   // the measured cost alone cannot fit
+    if (budget > cap) budget = cap;
+    if (budget < estimate) budget = estimate;
+  }
+  return budget;
+}
+
+/**
+ * Measure gas through a RAW `eth_estimateGas` RPC call.
+ *
+ * WHY RAW: `provider.estimateGas()` in ethers v6 goes through
+ * AbstractProvider's 250 ms duplicate-request cache, so a re-measurement issued
+ * right after the preview estimate silently resolves to the SAME cached
+ * preview value. The whole point of measuring again immediately before the
+ * broadcast is to get a number taken at the broadcast's block, so this helper
+ * deliberately bypasses that cache.
+ *
+ * Read-only: it sends no transaction and changes no state.
+ *
+ * @param {object} provider
+ * @param {{from?: string, to: string, data?: string, value?: bigint}} tx
+ * @returns {Promise<bigint>}
+ */
+export async function rawEstimateGas(provider, tx) {
+  const request = {
+    ...(tx.from ? { from: tx.from } : {}),
+    to: tx.to,
+    data: tx.data ?? "0x",
+    value: ethers.toQuantity(tx.value ?? 0n),
+  };
+  if (typeof provider?.send === "function") {
+    const res = await provider.send("eth_estimateGas", [request]);
+    return BigInt(res);
+  }
+  return BigInt(await provider.estimateGas(tx));
+}
+
+/**
  * Execute a Router swap.
  * @param {string[]} [path] — validated route path (direct [A,B] or multi-hop [A,HUB,B])
  * @param {object} [report] — optional out-param; filled with {ok, code, reason,
@@ -1867,12 +1956,40 @@ async function executeSwap({ wallet, provider, fromToken, toToken, amount, amoun
 
   const ethBalance = await provider.getBalance(walletAddr);
   const feeData = await provider.getFeeData();
-  const gasCost = gasEstimate * (feeData.gasPrice || 0n);
+  const gasPrice = feeData.gasPrice || 0n;
   const gasReserve = ethers.parseEther(String(config.ethGuard?.MIN_ETH_GAS_RESERVE ?? 0.003));
-  log(`[SWAP-DEBUG] ethBalance=${ethers.formatEther(ethBalance)} gasCost=${ethers.formatEther(gasCost)} gasReserve=${ethers.formatEther(gasReserve)}`, "info");
-  if (ethBalance < gasCost + gasReserve) { log(`[SWAP] BLOCKED: ETH < gas reserve`, "error"); return fail("GAS_RESERVE", "ETH balance below the gas reserve"); }
+  log(`[SWAP-DEBUG] ethBalance=${ethers.formatEther(ethBalance)} gasCost=${ethers.formatEther(gasEstimate * gasPrice)} gasReserve=${ethers.formatEther(gasReserve)}`, "info");
 
-  const gasLimit = gasEstimate + gasEstimate / 5n;
+  // ── FINAL BUDGET ──────────────────────────────────────────────────────────
+  // Re-measure gas as the last thing before the broadcast: the preview above
+  // only feeds the debug line and the fail-fast gate, the number we actually
+  // size the transaction with comes from HERE. If the re-measurement fails the
+  // swap is abandoned — we never fall back to a value we could not measure.
+  let finalEstimate;
+  try { finalEstimate = await rawEstimateGas(provider, { from: walletAddr, to: routerAddr, data: calldata, value: 0n }); }
+  catch (e) {
+    log(`[SWAP] Gas re-estimation FAILED — NOT sending`, "error");
+    return fail("PREFLIGHT_REVERT", `gas re-estimation failed: ${String(e?.shortMessage || e?.message || e).slice(0, 80)}`);
+  }
+
+  let blockGasLimit = null;
+  try { const blk = await provider.getBlock("latest"); blockGasLimit = blk?.gasLimit ?? null; } catch { blockGasLimit = null; }
+
+  const hops = Math.max(1, path.length - 1);
+  const gasLimit = computeSwapGasLimit({ estimate: finalEstimate, hops, blockGasLimit });
+  if (gasLimit === null) {
+    log(`[SWAP] BLOCKED: gas budget does not fit the block gas limit — NOT sending`, "error");
+    return fail("GAS_RESERVE", `estimate ${finalEstimate} + margin for a ${hops}-hop route exceeds the block gas limit ${blockGasLimit ?? "unknown"}`);
+  }
+  log(`[SWAP-DEBUG] gasEstimateFinal=${finalEstimate} hops=${hops} blockGasLimit=${blockGasLimit ?? "-"} gasLimit=${gasLimit}`, "info");
+
+  // The gate is evaluated against the transaction we are ABOUT to broadcast,
+  // not against the preview estimate.
+  if (ethBalance < gasLimit * gasPrice + gasReserve) {
+    log(`[SWAP] BLOCKED: ETH < gas reserve`, "error");
+    return fail("GAS_RESERVE", `ETH ${ethers.formatEther(ethBalance)} cannot cover gas ${ethers.formatEther(gasLimit * gasPrice)} + reserve ${ethers.formatEther(gasReserve)}`);
+  }
+
   if (txManager) {
     const r = await txManager.sendAndWait({
       wallet, provider, txType: "SWAP",
@@ -1883,7 +2000,10 @@ async function executeSwap({ wallet, provider, fromToken, toToken, amount, amoun
     if (r.pending) { log(`[SWAP] TX pending — will confirm later`, "warn"); return { ok: true, pending: true, txHash: r.hash || null, approveTxHash }; }
     log(`[SWAP] SUCCESS gas=${r.receipt.gasUsed}`, "success");
     R.ok = true; R.txHash = r.hash; R.blockNumber = r.receipt?.blockNumber ?? null; R.gasUsed = String(r.receipt?.gasUsed ?? "");
-    return { ok: true, txHash: r.hash, blockNumber: r.receipt?.blockNumber ?? null, approveTxHash, path };
+    const txReceipt = r.receipt
+      ? (r.receipt.status === undefined || r.receipt.status === null ? { ...r.receipt, status: r.status } : r.receipt)
+      : null;
+    return { ok: true, txHash: r.hash, blockNumber: r.receipt?.blockNumber ?? null, approveTxHash, path, receipt: txReceipt };
   } else {
     log(`[SWAP] TX_SENT`, "warn");
     const swapTx = await router.swapExactTokensForTokens(amount, amountOutMin, path, walletAddr, deadline, { gasLimit });
@@ -1892,8 +2012,184 @@ async function executeSwap({ wallet, provider, fromToken, toToken, amount, amoun
     if (receipt.status !== 1) { log(`[SWAP] TX FAILED (status=0)`, "error"); return fail("TX_REVERTED", "receipt.status === 0"); }
     log(`[SWAP] SUCCESS gas=${receipt.gasUsed}`, "success");
     R.ok = true; R.txHash = swapTx.hash; R.blockNumber = receipt.blockNumber; R.gasUsed = String(receipt.gasUsed);
-    return { ok: true, txHash: swapTx.hash, blockNumber: receipt.blockNumber, approveTxHash, path };
+    return { ok: true, txHash: swapTx.hash, blockNumber: receipt.blockNumber, approveTxHash, path, receipt };
   }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SWAP POST-CONFIRMATION VERIFICATION — block-pinned reads + Transfer cross-check
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** keccak256("Transfer(address,address,uint256)") */
+const TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+const BALANCE_OF_SELECTOR = "0x70a08231"; // balanceOf(address)
+
+export const SWAP_VERIFY = Object.freeze({ PASS: "pass", FAIL: "fail", INCONCLUSIVE: "inconclusive" });
+
+const addrTopic = (a) => "0x" + String(a).toLowerCase().replace(/^0x/, "").padStart(64, "0");
+const blockHex = (b) => "0x" + BigInt(b).toString(16);
+const defaultSleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * balanceOf() pinned to an EXPLICIT historical block tag.
+ *
+ * ethers v6 can silently ignore a numeric blockTag on `provider.call()` /
+ * contract reads and execute at `latest` instead — which is precisely how the
+ * audit ended up comparing a pre-swap snapshot against a post-swap head and
+ * reporting every successful swap as a MISMATCH. The raw JSON-RPC form with a
+ * hex tag is the only form that is guaranteed to be historical.
+ *
+ * @param {number|bigint} blockTag
+ */
+export async function balanceOfAtBlock(provider, tokenAddr, holderAddr, blockTag) {
+  const data = BALANCE_OF_SELECTOR + String(holderAddr).toLowerCase().replace(/^0x/, "").padStart(64, "0");
+  const tag = blockHex(blockTag);
+  let raw;
+  if (typeof provider?.send === "function") {
+    raw = await provider.send("eth_call", [{ to: tokenAddr, data }, tag]);
+  } else {
+    raw = await provider.call({ to: tokenAddr, data }, tag);
+  }
+  if (raw === null || raw === undefined || raw === "0x") {
+    throw new Error(`balanceOf returned no data for ${tokenAddr} @ ${tag}`);
+  }
+  return BigInt(raw);
+}
+
+/**
+ * Classify a receipt's ERC-20 Transfer logs for one swap.
+ *
+ * A Transfer is only ever used to CORROBORATE a receipt that already reports
+ * `status === 1` and whose `log.address` matches the exact token of that leg —
+ * events alone are never accepted as proof of success.
+ *
+ * @returns {{available:boolean, inCount:number, outCount:number, inSum:bigint, outSum:bigint}}
+ */
+export function summarizeSwapTransfers(receipt, tokenIn, tokenOut, walletAddr) {
+  const logs = Array.isArray(receipt?.logs) ? receipt.logs : null;
+  if (!logs) return { available: false, inCount: 0, outCount: 0, inSum: 0n, outSum: 0n };
+  const wallet = addrTopic(walletAddr);
+  const tIn = String(tokenIn || "").toLowerCase();
+  const tOut = String(tokenOut || "").toLowerCase();
+  let inCount = 0, outCount = 0, inSum = 0n, outSum = 0n;
+  for (const l of logs) {
+    if (!l || !Array.isArray(l.topics) || l.topics.length !== 4) continue;
+    if (String(l.topics[0]).toLowerCase() !== TRANSFER_TOPIC) continue;
+    const addr = String(l.address || "").toLowerCase();
+    let value = 0n;
+    try { value = BigInt(l.data); } catch { continue; }
+    if (addr === tIn && String(l.topics[1]).toLowerCase() === wallet) { outCount++; outSum += value; }
+    if (addr === tOut && String(l.topics[2]).toLowerCase() === wallet) { inCount++; inSum += value; }
+  }
+  return { available: true, inCount, outCount, inSum, outSum };
+}
+
+/**
+ * Decide whether a SWAP really happened, without ever trusting two
+ * consecutive unpinned `balanceOf()` calls (they can land on different
+ * RPC heads and fabricate a zero delta).
+ *
+ * Evidence order:
+ *   1. `receipt.status` — 0 is final, no further evidence matters.
+ *   2. `after` reads pinned to `receipt.blockNumber`, against the caller's
+ *      `before` snapshot taken at a fixed block earlier than the TX.
+ *   3. Transfer logs from the receipt — may EXCULPATE a status-1 receipt whose
+ *      delta check disagrees, and may CONVICT one that moved no tokens at all.
+ *
+ * When the historical state cannot be served at all the verdict is
+ * `inconclusive`, never `fail`: a receipt that mined successfully is not
+ * downgraded because the RPC pruned the block we wanted to read.
+ *
+ * @returns {Promise<{verdict:string, reason:string, inDelta:bigint, outDelta:bigint,
+ *                    afterFrom:bigint|null, afterTo:bigint|null, basis:string|null}>}
+ */
+export async function assessSwapOutcome({
+  provider, walletAddr, tokenIn, tokenOut,
+  beforeFrom = null, beforeTo = null, beforeBlock = null,
+  receipt = null, amountIn = null, amountOutMin = null,
+  retries = 3, retryDelayMs = 500, sleep = defaultSleep,
+}) {
+  const base = { verdict: null, reason: "", inDelta: 0n, outDelta: 0n, afterFrom: null, afterTo: null, basis: null };
+
+  if (receipt && receipt.status !== undefined && receipt.status !== null && Number(receipt.status) !== 1) {
+    return { ...base, verdict: SWAP_VERIFY.FAIL, reason: `receipt.status=${receipt.status}` };
+  }
+
+  const tx = summarizeSwapTransfers(receipt, tokenIn, tokenOut, walletAddr);
+  const logsConfirm = tx.available && tx.outCount > 0 && tx.inCount > 0
+    && (amountOutMin === null || amountOutMin === undefined || tx.inSum >= amountOutMin);
+  const logsContradict = tx.available && tx.inCount === 0 && tx.outCount === 0;
+
+  const logsPass = (why) => ({
+    ...base, verdict: SWAP_VERIFY.PASS, basis: "transfer-logs", reason: why,
+    inDelta: tx.outSum, outDelta: tx.inSum,
+  });
+
+  // ── 1. block-pinned reads against the receipt's own block ────────────────
+  if (receipt && receipt.blockNumber !== undefined && receipt.blockNumber !== null) {
+    const afterBlock = Number(receipt.blockNumber);
+    let lastErr = null;
+    for (let attempt = 1; attempt <= retries; attempt++) {
+      try {
+        const afterFrom = await balanceOfAtBlock(provider, tokenIn, walletAddr, afterBlock);
+        const afterTo = await balanceOfAtBlock(provider, tokenOut, walletAddr, afterBlock);
+        const inDelta = BigInt(beforeFrom ?? 0n) - afterFrom;
+        const outDelta = afterTo - BigInt(beforeTo ?? 0n);
+        const minOk = amountOutMin === null || amountOutMin === undefined ? true : outDelta >= amountOutMin;
+
+        if (inDelta > 0n && outDelta > 0n && minOk) {
+          return { ...base, verdict: SWAP_VERIFY.PASS, basis: "balance-delta", reason: `before@${beforeBlock ?? "?"} → after@${afterBlock}`,
+                   inDelta, outDelta, afterFrom, afterTo };
+        }
+        // Delta disagrees with a receipt that mined successfully. Only
+        // Transfer logs may overrule it — a mismatched delta alone never does.
+        if (logsContradict) {
+          return { ...base, verdict: SWAP_VERIFY.FAIL, basis: "transfer-logs",
+                   reason: `receipt.status=1 but no ${tokenIn}/${tokenOut} Transfer for ${walletAddr}`,
+                   inDelta, outDelta, afterFrom, afterTo };
+        }
+        if (logsConfirm) {
+          return { ...logsPass(`delta check disagreed (inDelta=${inDelta} outDelta=${outDelta}) but receipt.status=1 and Transfer logs confirm in=${tx.inSum} out=${tx.outSum}`),
+                   inDelta, outDelta, afterFrom, afterTo, basis: "transfer-logs" };
+        }
+        return { ...base, verdict: SWAP_VERIFY.INCONCLUSIVE, basis: "balance-delta",
+                 reason: `verification-inconclusive: delta mismatch (inDelta=${inDelta} outDelta=${outDelta}) and Transfer logs ambiguous`,
+                 inDelta, outDelta, afterFrom, afterTo };
+      } catch (e) {
+        lastErr = e;
+        if (attempt < retries) await sleep(retryDelayMs);
+      }
+    }
+    // Historical state unavailable for the whole retry budget.
+    if (logsConfirm) return logsPass(`verification-inconclusive history: receipt.status=1 and Transfer logs confirm in=${tx.inSum} out=${tx.outSum}`);
+    if (logsContradict) {
+      return { ...base, verdict: SWAP_VERIFY.FAIL, basis: "transfer-logs",
+               reason: `receipt.status=1 but no ${tokenIn}/${tokenOut} Transfer for ${walletAddr}` };
+    }
+    return { ...base, verdict: SWAP_VERIFY.INCONCLUSIVE,
+             reason: `verification-inconclusive: historical state unavailable: ${String(lastErr?.message || lastErr || "unknown").slice(0, 140)}` };
+  }
+
+  // ── 2. no receipt: legacy delta check for callers/tests that only supply
+  //      the before-snapshot (nothing to pin `after` to). ───────────────────
+  let afterFrom, afterTo;
+  try {
+    afterFrom = await new ethers.Contract(tokenIn, ERC20_ABI, provider).balanceOf(walletAddr);
+    afterTo = await new ethers.Contract(tokenOut, ERC20_ABI, provider).balanceOf(walletAddr);
+  } catch (e) {
+    return { ...base, verdict: SWAP_VERIFY.INCONCLUSIVE,
+             reason: `verification-inconclusive: balanceOf failed: ${String(e?.message || e).slice(0, 120)}` };
+  }
+  const inDelta = BigInt(beforeFrom ?? 0n) - afterFrom;
+  const outDelta = afterTo - BigInt(beforeTo ?? 0n);
+  const minOk = amountOutMin === null || amountOutMin === undefined ? true : outDelta >= amountOutMin;
+  if (inDelta > 0n && outDelta > 0n && minOk) {
+    return { ...base, verdict: SWAP_VERIFY.PASS, basis: "balance-delta", reason: "no receipt supplied — unpinned delta check",
+             inDelta, outDelta, afterFrom, afterTo };
+  }
+  return { ...base, verdict: SWAP_VERIFY.FAIL, basis: "balance-delta",
+           reason: `inDelta=${inDelta} outDelta=${outDelta} amountOutMin=${amountOutMin ?? "-"}`,
+           inDelta, outDelta, afterFrom, afterTo };
 }
 
 /**
@@ -1903,20 +2199,30 @@ async function executeSwap({ wallet, provider, fromToken, toToken, amount, amoun
  * swap actually moved value in the requested direction. Works identically for
  * A→B and B→A — nothing here is direction-specific.
  *
- * @returns {Promise<{ok:boolean, inDelta:bigint, outDelta:bigint}>}
+ * @param {object} [o.beforeBlock] — the fixed block the before-snapshot was read at
+ * @param {object} [o.receipt]     — the swap receipt; enables block-pinned `after`
+ *        reads and the Transfer cross-check
+ * @returns {Promise<{ok:boolean, verdict:string, inconclusive:boolean,
+ *                    inDelta:bigint, outDelta:bigint, afterFrom:bigint|null,
+ *                    afterTo:bigint|null, reason:string, basis:string|null}>}
  */
-async function verifySwapBalances({ provider, walletAddr, pair, beforeFrom, beforeTo, amountIn, amountOutMin, log = () => {} }) {
-  const afterFrom = await new ethers.Contract(pair.fromAddr, ERC20_ABI, provider).balanceOf(walletAddr);
-  const afterTo = await new ethers.Contract(pair.toAddr, ERC20_ABI, provider).balanceOf(walletAddr);
-  const inDelta = beforeFrom - afterFrom;
-  const outDelta = afterTo - beforeTo;
-  const minOk = amountOutMin === null || amountOutMin === undefined ? true : outDelta >= amountOutMin;
-  const ok = inDelta > 0n && outDelta > 0n && minOk;
+async function verifySwapBalances({ provider, walletAddr, pair, beforeFrom, beforeTo, beforeBlock = null, receipt = null, amountIn, amountOutMin, log = () => {}, retries = 3, retryDelayMs = 500 }) {
+  const a = await assessSwapOutcome({
+    provider, walletAddr, tokenIn: pair.fromAddr, tokenOut: pair.toAddr,
+    beforeFrom, beforeTo, beforeBlock, receipt, amountIn, amountOutMin, retries, retryDelayMs,
+  });
+  const ok = a.verdict === SWAP_VERIFY.PASS;
+  const tag = ok ? "PASS" : a.verdict === SWAP_VERIFY.INCONCLUSIVE ? "INCONCLUSIVE" : "FAIL";
   log(
-    `[VERIFY-SWAP] ${pair.from}→${pair.to} inDelta=${inDelta} (amountIn=${amountIn}) outDelta=${outDelta} (amountOutMin=${amountOutMin}) => ${ok ? "PASS" : "FAIL"}`,
-    ok ? "success" : "error",
+    `[VERIFY-SWAP] ${pair.from}→${pair.to} inDelta=${a.inDelta} (amountIn=${amountIn}) outDelta=${a.outDelta} (amountOutMin=${amountOutMin}) basis=${a.basis ?? "-"} => ${tag}` +
+    (a.reason ? ` (${a.reason})` : ""),
+    ok ? "success" : a.verdict === SWAP_VERIFY.INCONCLUSIVE ? "warn" : "error",
   );
-  return { ok, inDelta, outDelta, afterFrom, afterTo };
+  return {
+    ok, verdict: a.verdict, inconclusive: a.verdict === SWAP_VERIFY.INCONCLUSIVE,
+    inDelta: a.inDelta, outDelta: a.outDelta, afterFrom: a.afterFrom, afterTo: a.afterTo,
+    reason: a.reason, basis: a.basis,
+  };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -4161,7 +4467,7 @@ export class AutoTrader {
   async doRandomSwaps(options = {}) {
     const autoSwapConfig = this.config.autoSwap || {};
     const forcePair = options.forcePair || null;
-    const summary = { attempted: 0, verified: 0, failed: 0, results: [] };
+    const summary = { attempted: 0, verified: 0, failed: 0, inconclusive: 0, results: [] };
     if (!autoSwapConfig.enabled && !forcePair) return summary;
 
     await this.ensureMarkets();
@@ -4212,15 +4518,23 @@ export class AutoTrader {
 
       try {
         const freshBalances = {};
+        // ONE explicit block for the whole snapshot. Two unpinned balanceOf()
+        // calls can land on different RPC heads — that race is what turned
+        // successful swaps into CONFIRMED_STATE_MISMATCH in the audit.
+        let freshBlock = null;
+        try { freshBlock = await provider.getBlockNumber(); } catch { freshBlock = null; }
         for (const [sym, addr] of Object.entries(tokenAddrs)) {
           try {
             let dec = decimalsMap[sym];
             if (dec === null || dec === undefined) dec = await tokenDecimalsOnChain(provider, addr);
             decimalsMap[sym] = dec;
-            const c = new ethers.Contract(addr, ERC20_ABI, provider);
-            const bal = await c.balanceOf(walletAddr);
-            freshBalances[sym] = { raw: bal, float: parseFloat(ethers.formatUnits(bal, dec)) };
-          } catch { freshBalances[sym] = { raw: 0n, float: 0 }; }
+            let bal = null, at = null;
+            if (freshBlock !== null) {
+              try { bal = await balanceOfAtBlock(provider, addr, walletAddr, freshBlock); at = freshBlock; } catch { bal = null; }
+            }
+            if (bal === null) bal = await new ethers.Contract(addr, ERC20_ABI, provider).balanceOf(walletAddr);
+            freshBalances[sym] = { raw: bal, float: parseFloat(ethers.formatUnits(bal, dec)), block: at };
+          } catch { freshBalances[sym] = { raw: 0n, float: 0, block: null }; }
         }
 
         if (forcePair) {
@@ -4335,19 +4649,33 @@ export class AutoTrader {
           continue;
         }
 
-        // POST-SWAP ON-CHAIN VERIFICATION (both directions use the same check)
+        // POST-SWAP ON-CHAIN VERIFICATION (both directions use the same check).
+        // `before*` comes from the block-pinned snapshot taken above; `after*`
+        // is pinned to the receipt's own block, so the two sides can never be
+        // read from different RPC heads.
+        const snapFrom = freshBalances[pair.from];
+        const snapTo = freshBalances[pair.to];
+        const beforeBlock = (snapFrom?.block != null && snapFrom.block === snapTo?.block) ? snapFrom.block : null;
         const v = await verifySwapBalances({
           provider, walletAddr, pair,
-          beforeFrom: freshBalances[pair.from].raw,
-          beforeTo: freshBalances[pair.to].raw,
+          beforeFrom: snapFrom.raw,
+          beforeTo: snapTo.raw,
+          beforeBlock,
+          receipt: swapResult.receipt || null,
           amountIn: amountRaw, amountOutMin, log: this.log.bind(this),
         });
-        if (!v.ok) {
+        if (!v.ok && !v.inconclusive) {
           this.log(`[SWAP] ${pair.from}→${pair.to} VERIFICATION FAILED — not recording`, "error");
           summary.failed++;
-          summary.results.push({ direction: `${pair.from}→${pair.to}`, ok: false, reason: "VERIFY_FAILED", amountIn: String(amountRaw), amountOutMin: String(amountOutMin), path, inDelta: String(v.inDelta), outDelta: String(v.outDelta) });
+          summary.results.push({ direction: `${pair.from}→${pair.to}`, ok: false, reason: "VERIFY_FAILED", verification: v.verdict, detail: v.reason || null, amountIn: String(amountRaw), amountOutMin: String(amountOutMin), path, inDelta: String(v.inDelta), outDelta: String(v.outDelta) });
           if (rejectPair()) break;
           continue;
+        }
+        if (v.inconclusive) {
+          // receipt.status === 1 — the swap DID execute. Only the balance
+          // evidence is missing (pruned/unservable history), so the swap is
+          // recorded but explicitly not counted as verified.
+          this.log(`[SWAP VERIFY-INCONCLUSIVE] ${pair.from}→${pair.to} tx=${swapResult.txHash || "-"} — ${v.reason}`, "warn");
         }
 
         this.swapJournal.record({ from: pair.from, to: pair.to, amount: amountResult.amountFloat });
@@ -4356,9 +4684,9 @@ export class AutoTrader {
         saveState(this.state);
         samePairFails = 0;
         lastFailKey = null;
-        summary.verified++;
-        summary.results.push({ direction: `${pair.from}→${pair.to}`, ok: true, txHash: swapResult.txHash || null, approveTxHash: swapResult.approveTxHash || null, amountIn: String(amountRaw), expectedOut: String(expectedOut), amountOutMin: String(amountOutMin), inDelta: String(v.inDelta), outDelta: String(v.outDelta), path, hops: best.type });
-        this.log(`[SWAP] SUCCESS ${pair.from}→${pair.to}`, "success");
+        if (v.inconclusive) summary.inconclusive++; else summary.verified++;
+        summary.results.push({ direction: `${pair.from}→${pair.to}`, ok: true, verification: v.verdict, txHash: swapResult.txHash || null, approveTxHash: swapResult.approveTxHash || null, amountIn: String(amountRaw), expectedOut: String(expectedOut), amountOutMin: String(amountOutMin), inDelta: String(v.inDelta), outDelta: String(v.outDelta), path, hops: best.type });
+        this.log(`[SWAP] SUCCESS ${pair.from}→${pair.to}${v.inconclusive ? " (verification-inconclusive)" : ""}`, "success");
 
         if (i < swapCount - 1) {
           await this.sleep(this.randomDelay(5000, 15000));
@@ -4668,9 +4996,27 @@ export class AutoTrader {
     // 4. balance + per-token reserve → available
     let balance = 0n;
     let beforeTo = 0n;
+    let beforeBlock = null;
     try {
-      balance = await new ethers.Contract(dir.fromAddr, ERC20_ABI, provider).balanceOf(walletAddr);
-      beforeTo = await new ethers.Contract(dir.toAddr, ERC20_ABI, provider).balanceOf(walletAddr);
+      // Both reads pinned to ONE explicit block before the TX. Two consecutive
+      // unpinned balanceOf() calls can land on different RPC heads — the exact
+      // race that produced every CONFIRMED_STATE_MISMATCH in the audit.
+      try { beforeBlock = await provider.getBlockNumber(); } catch { beforeBlock = null; }
+      if (beforeBlock !== null) {
+        try {
+          balance = await balanceOfAtBlock(provider, dir.fromAddr, walletAddr, beforeBlock);
+          beforeTo = await balanceOfAtBlock(provider, dir.toAddr, walletAddr, beforeBlock);
+        } catch {
+          // Node cannot serve that exact block — fall back to the current head
+          // and forget the pin rather than mislabel the snapshot.
+          beforeBlock = null;
+          balance = await new ethers.Contract(dir.fromAddr, ERC20_ABI, provider).balanceOf(walletAddr);
+          beforeTo = await new ethers.Contract(dir.toAddr, ERC20_ABI, provider).balanceOf(walletAddr);
+        }
+      } else {
+        balance = await new ethers.Contract(dir.fromAddr, ERC20_ABI, provider).balanceOf(walletAddr);
+        beforeTo = await new ethers.Contract(dir.toAddr, ERC20_ABI, provider).balanceOf(walletAddr);
+      }
     } catch (e) {
       return skip("INSUFFICIENT_BALANCE", `balanceOf reverted: ${String(e?.message || e).slice(0, 60)}`);
     }
@@ -5003,24 +5349,47 @@ export class AutoTrader {
       if (settled.status !== 1) return fail("TX_REVERTED", `receipt.status=${settled.status}`);
       res.blockNumber = settled.blockNumber;
       res.gasUsed = String(settled.gasUsed);
+      res.receipt = settled;
     }
 
-    // 8 + 9. receipt.status === 1 (guaranteed above) + real ERC20 balance deltas
-    const afterFrom = await new ethers.Contract(dir.fromAddr, ERC20_ABI, provider).balanceOf(walletAddr);
-    const afterTo = await new ethers.Contract(dir.toAddr, ERC20_ABI, provider).balanceOf(walletAddr);
-    const inDelta = balance - afterFrom;
-    const outDelta = afterTo - beforeTo;
-    const ok = inDelta > 0n && outDelta > 0n && outDelta >= amountOutMin;
-    this.log(
-      `[SWAP ${ok ? "CONFIRMED" : "MISMATCH"}] direction=${direction} tx=${res.txHash} block=${res.blockNumber ?? "-"} gas=${res.gasUsed ?? "-"} ` +
-      `inDelta=${inDelta} outDelta=${outDelta} amountIn=${finalAmountRaw} amountOutMin=${amountOutMin}`,
-      ok ? "success" : "error");
-    if (!ok) {
-      // Receipt is CONFIRMED but the balance deltas contradict the expectation.
+    // 8 + 9. receipt.status === 1 (guaranteed above) + real ERC20 balance deltas.
+    // `after` is pinned to the receipt's own block and `before` to the fixed
+    // block captured in step 4, so the two sides can never come from different
+    // RPC heads. Transfer logs corroborate a status-1 receipt; a mismatched
+    // delta on its own NEVER turns a mined swap into a failure — it becomes
+    // `verification-inconclusive` instead.
+    const assess = await assessSwapOutcome({
+      provider, walletAddr,
+      tokenIn: dir.fromAddr, tokenOut: dir.toAddr,
+      beforeFrom: balance, beforeTo, beforeBlock,
+      receipt: res.receipt || null,
+      amountIn: finalAmountRaw, amountOutMin,
+      retries: 3,
+    });
+    const inDelta = assess.inDelta;
+    const outDelta = assess.outDelta;
+
+    if (assess.verdict === SWAP_VERIFY.FAIL) {
+      this.log(
+        `[SWAP MISMATCH] direction=${direction} tx=${res.txHash} block=${res.blockNumber ?? "-"} gas=${res.gasUsed ?? "-"} ` +
+        `inDelta=${inDelta} outDelta=${outDelta} amountIn=${finalAmountRaw} amountOutMin=${amountOutMin} reason=${assess.reason}`,
+        "error");
+      // Receipt is CONFIRMED but the on-chain evidence contradicts the swap.
       this.txManager?.journal?.transition(res.txHash, TX_STATE.CONFIRMED_STATE_MISMATCH, {
         reason: `inDelta=${inDelta} outDelta=${outDelta} amountOutMin=${amountOutMin}`,
       });
       return fail("VERIFY_FAILED", `inDelta=${inDelta} outDelta=${outDelta} amountOutMin=${amountOutMin}`);
+    }
+    if (assess.verdict === SWAP_VERIFY.INCONCLUSIVE) {
+      this.log(
+        `[SWAP VERIFY-INCONCLUSIVE] direction=${direction} tx=${res.txHash} block=${res.blockNumber ?? "-"} ` +
+        `inDelta=${inDelta} outDelta=${outDelta} — receipt.status=1, swap counted as executed; ${assess.reason}`,
+        "warn");
+    } else {
+      this.log(
+        `[SWAP CONFIRMED] direction=${direction} tx=${res.txHash} block=${res.blockNumber ?? "-"} gas=${res.gasUsed ?? "-"} ` +
+        `inDelta=${inDelta} outDelta=${outDelta} amountIn=${finalAmountRaw} amountOutMin=${amountOutMin} basis=${assess.basis}`,
+        "success");
     }
     // 10. record the successful pair — runSwapRotationQueue() then advances the
     // rotation queue, so the NEXT pass starts on a different direction.
@@ -5031,7 +5400,10 @@ export class AutoTrader {
       status: "ok",
       direction,
       state: SWAP_DIRECTION_STATES.CONFIRMED, recoverable: false,
-      recommendedAction: "none — swap confirmed and verified",
+      verification: assess.verdict,
+      recommendedAction: assess.verdict === SWAP_VERIFY.INCONCLUSIVE
+        ? "none — swap receipt confirmed; balance verification inconclusive (historical state unavailable)"
+        : "none — swap confirmed and verified",
       txHash: res.txHash, blockNumber: res.blockNumber ?? null, gasUsed: res.gasUsed ?? null,
       approveTxHash: res.approveTxHash || approveTxHash || null,
       amountIn: String(finalAmountRaw), quoteOut: String(best.amountOut), amountOutMin: String(amountOutMin),

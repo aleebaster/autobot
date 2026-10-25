@@ -387,7 +387,13 @@ section("8. static guards — success text and counters");
   const idx = fs.readFileSync(path.join(REPO, "index.js"), "utf8");
 
   check("8.1 no `[SWAP SUCCESS]` string anywhere", !src.includes("[SWAP SUCCESS]"));
-  check("8.2 swap verify failure uses a MISMATCH label", src.includes("[SWAP ${ok ? \"CONFIRMED\" : \"MISMATCH\"}]"));
+  // Guards the BEHAVIOUR, not one template literal: the verdict is now a
+  // three-way pass / fail / inconclusive, so the label comes from an explicit
+  // branch and `verification-inconclusive` must NEVER print MISMATCH (that was
+  // the false-mismatch defect). Both labels and the journal transition are
+  // required, so a silent verify failure still fails this check.
+  check("8.2 swap verify failure uses a MISMATCH label",
+    src.includes("[SWAP MISMATCH]") && src.includes("[SWAP CONFIRMED]") && src.includes("CONFIRMED_STATE_MISMATCH"));
 
   const opens = (src.match(/sessionStats\.opens\+\+/g) || []).length;
   check("8.3 opens++ centralized to 2 sites (_trackOpenedPosition + settle)", opens === 2, `found ${opens}`);

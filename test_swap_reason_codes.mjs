@@ -134,6 +134,7 @@ class FakeProvider extends ethers.JsonRpcProvider {
   constructor(w) {
     super("http://127.0.0.1:9", 11155111, { staticNetwork: true });
     this.world = w;
+    this._settled = new Set();
   }
   async getBalance() { return this.world.ethBalance; }
   async getCode(addr) { return this.world.code[String(addr).toLowerCase()] || "0x"; }
@@ -158,19 +159,32 @@ class FakeProvider extends ethers.JsonRpcProvider {
     const w = this.world;
     // The fake chain "settles" a swap exactly where a real one would: at gas
     // estimation, AFTER preflight passed and BEFORE the broadcast.
+    //
+    // A real chain applies a state change ONCE per transaction — not once per
+    // measurement. autoTrader now measures gas twice (preview, then a raw
+    // re-measurement immediately before the broadcast), so the identical
+    // calldata must settle only on the first sighting; otherwise the fake
+    // wallet would be debited twice and `estimateSwapsApplied` would count
+    // measurements instead of swaps.
     try {
       if (String(tx?.to || "").toLowerCase() === ROUTER.toLowerCase() && tx.data && tx.data !== "0x") {
         const p = ROUTER_IFACE.parseTransaction({ data: tx.data });
         if (p?.name === "swapExactTokensForTokens") {
-          const amountIn = BigInt(p.args[0]);
-          const pathArr = [...p.args[2]]; // (amountIn, amountOutMin, path, to, deadline)
-          const amounts = amountsOut(w, amountIn, pathArr);
-          const out = amounts[amounts.length - 1];
-          const from = String(pathArr[0]).toLowerCase();
-          const to = String(pathArr[pathArr.length - 1]).toLowerCase();
-          w.balances[WALLET][from] = (w.balances[WALLET][from] ?? 0n) - amountIn;
-          w.balances[WALLET][to] = (w.balances[WALLET][to] ?? 0n) + out;
-          w.estimateSwapsApplied++;
+          // Key EXCLUDES the deadline: preview and re-measurement can straddle a
+          // clock second, which would otherwise look like two different swaps.
+          const key = p.args.slice(0, 4).map(String).join("|");
+          if (!this._settled.has(key)) {
+            this._settled.add(key);
+            const amountIn = BigInt(p.args[0]);
+            const pathArr = [...p.args[2]]; // (amountIn, amountOutMin, path, to, deadline)
+            const amounts = amountsOut(w, amountIn, pathArr);
+            const out = amounts[amounts.length - 1];
+            const from = String(pathArr[0]).toLowerCase();
+            const to = String(pathArr[pathArr.length - 1]).toLowerCase();
+            w.balances[WALLET][from] = (w.balances[WALLET][from] ?? 0n) - amountIn;
+            w.balances[WALLET][to] = (w.balances[WALLET][to] ?? 0n) + out;
+            w.estimateSwapsApplied++;
+          }
         }
       }
     } catch (e) { /* estimation revert */ throw new Error("execution reverted: ESTIMATE: " + (e?.message || e)); }

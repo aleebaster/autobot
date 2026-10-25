@@ -16,6 +16,11 @@ if (process.env.NEMESIS_ALLOW_LIVE_TX !== "SEND LIVE TRANSACTIONS") {
   process.exit(0);
 }
 
+// Same budget function the bot itself uses (measured estimate + hop allowance,
+// clamped to the block gas limit). This harness used to hardcode
+// estimate + estimate/5 — the exact under-budget that OOGed every bot swap.
+const { computeSwapGasLimit } = await import("./autoTrader.js");
+
 const WETH  = "0x7b79995e5f793A07Bc00c21412e50Ecae098E7f9";
 const USDT  = "0x5f2E83cCDEa73D60aF400e03F1Cd8Fb9eaB07b20";
 const USDC  = "0x5dcf1Db10F87CB7839640F9B85C4ECfA29b56e80";
@@ -267,7 +272,13 @@ async function main() {
       const usdtBefore = await new ethers.Contract(USDT, ERC20_ABI, provider).balanceOf(wallet.address);
       const srcBefore = await new ethers.Contract(sourceToken, ERC20_ABI, provider).balanceOf(wallet.address);
 
-      const gasLimit = gasEstimate + gasEstimate / 5n;
+      const swapBlock = await provider.getBlock("latest").catch(() => null);
+      const gasLimit = computeSwapGasLimit({
+        estimate: gasEstimate,
+        hops: Math.max(1, path.length - 1),
+        blockGasLimit: swapBlock?.gasLimit ?? null,
+      });
+      if (gasLimit === null) { log(`[SWAP] BLOCKED: gas budget does not fit the block gas limit — skipping`, "error"); continue; }
       log(`[SWAP] TX_SENT`, "warn");
       const swapTx = await fromRouter.swapExactTokensForTokens(safeSwapAmount, amountOutMin, path, wallet.address, deadline, { gasLimit });
       log(`[SWAP] TX hash=${swapTx.hash}`, "info");
